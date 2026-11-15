@@ -74,14 +74,13 @@ pub(crate) fn preamble_ranges(root: &SyntaxNode, source_len: usize) -> Vec<Range
                     name.to_owned(),
                 ))
             }
-            Some(name @ ("endpreamble" | "endpostamble")) => {
+            Some(name @ ("endpreamble" | "endpostamble"))
                 if open
                     .as_ref()
-                    .is_some_and(|(_, begin)| name.strip_prefix("end") == Some(begin.as_str()))
-                {
-                    let (start, _) = open.take().expect("matching installation preamble");
-                    ranges.push(start..usize::from(command.syntax().text_range().end()));
-                }
+                    .is_some_and(|(_, begin)| name.strip_prefix("end") == Some(begin.as_str())) =>
+            {
+                let (start, _) = open.take().expect("matching installation preamble");
+                ranges.push(start..usize::from(command.syntax().text_range().end()));
             }
             _ => {}
         }

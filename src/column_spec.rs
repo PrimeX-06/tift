@@ -234,7 +234,7 @@ fn parse_for_environment(
     // Other environments may use the same letter for an external definition.
     declared.columns.insert(b'Q');
     if name != "tabulary" {
-        declared.columns.extend([b'L', b'C', b'R']);
+        declared.columns.extend(*b"LCR");
     }
     if !matches!(
         name,
