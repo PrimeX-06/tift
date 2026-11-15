@@ -23,7 +23,7 @@ pub enum Stage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct WrapConfig {
-    /// `preserve`, `wrap`, or `unwrap`.
+    /// `preserve`, `wrap`, `unwrap`, or `rewrap` (join then wrap).
     pub mode: String,
     pub columns: usize,
     pub when: Stage,
@@ -165,8 +165,11 @@ pub struct CompiledText {
 }
 
 pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<CompiledText, String> {
-    if !matches!(wrap.mode.as_str(), "preserve" | "wrap" | "unwrap") {
-        return Err("wrap.mode must be preserve, wrap, or unwrap".into());
+    if !matches!(
+        wrap.mode.as_str(),
+        "preserve" | "wrap" | "unwrap" | "rewrap"
+    ) {
+        return Err("wrap.mode must be preserve, wrap, unwrap, or rewrap".into());
     }
     if wrap.columns == 0 || wrap.columns > 1_000_000 {
         return Err("wrap.columns must be between 1 and 1000000".into());
@@ -189,7 +192,7 @@ pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<Compiled
     }
     let mut text_commands = HashSet::new();
     let selected = wrap.text_commands.as_deref().unwrap_or_else(|| {
-        if wrap.mode == "wrap" {
+        if matches!(wrap.mode.as_str(), "wrap" | "rewrap") {
             default_text_commands()
         } else {
             &[]
@@ -338,6 +341,20 @@ pub fn format_text(
     config: &crate::CompiledConfig,
     stage: Stage,
 ) -> Result<String, crate::FormatError> {
+    format_text_with_context(
+        source,
+        config,
+        stage,
+        &mut crate::parse_context::ParseContext::new(config),
+    )
+}
+
+pub(crate) fn format_text_with_context(
+    source: &str,
+    config: &crate::CompiledConfig,
+    stage: Stage,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, crate::FormatError> {
     let wrap_here = config.config.wrap.mode != "preserve" && config.config.wrap.when == stage;
     let sentences_here = config.config.sentences.enabled && config.config.sentences.when == stage;
     if !wrap_here && !sentences_here {
@@ -355,21 +372,31 @@ pub fn format_text(
             && config.config.sentences.when == Stage::Before
             && config.config.sentences.enabled);
     let preserve_lines = wrap_active && config.config.wrap.mode == "wrap"
-        || sentences_active && config.config.sentences.preserve_line_breaks;
-    let mut opaque = crate::syntax::protected_ranges(source, &config.config)?;
-    let environments = if config.config.syntax.environment_pattern.is_some()
+        || sentences_active
+            && config.config.sentences.preserve_line_breaks
+            && !(wrap_active && config.config.wrap.mode == "rewrap");
+    let needs_environments = config.config.syntax.environment_pattern.is_some()
         || source.contains("\\begin")
-        || source.contains("\\end")
-    {
-        let tokens =
-            crate::syntax::lex_with_ranges(source, &config.config, &config.syntax, &opaque)?;
-        crate::syntax::environment_ranges_with_tokens(source, &tokens, &opaque, &config.config)?
+        || source.contains("\\end");
+    let parsed = parsing.snapshot(source, needs_environments, false)?;
+    let mut opaque = parsed.protected.clone();
+    let environments = if needs_environments {
+        crate::syntax::environment_ranges_with_tokens(
+            source,
+            parsed.tokens.as_deref().expect("environment tokens"),
+            &opaque,
+            &config.config,
+        )?
     } else {
         Vec::new()
     };
-    let definitions = crate::syntax::macro_definitions_with_ranges(source, &opaque);
-    let declared_commands =
-        crate::syntax::declared_command_names_with_ranges(source, &opaque, &definitions);
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let declared_commands = analysis.declared_commands()?;
     add_inline_atoms(source, &mut opaque, &config.config, &declared_commands);
     for environment in environments {
         if is_non_prose_environment(&environment.name, config) {
@@ -545,7 +572,7 @@ pub fn format_text(
                     && next_body[..prefix_len].trim_end_matches([' ', '\t']) == marker
             });
             if !source[text_start..content_end].trim().is_empty()
-                && (config.config.wrap.mode == "unwrap"
+                && (matches!(config.config.wrap.mode.as_str(), "unwrap" | "rewrap")
                     || continues
                     || display_width(content, 0, config.config.indent.width)
                         > config.config.wrap.columns)
@@ -592,13 +619,13 @@ pub fn format_text(
                         .trim_matches([' ', '\t'])
                         .is_empty()
                     || ends_control_word(prefix)
+                    || !(preserve_lines
+                        || matches!(config.config.wrap.mode.as_str(), "unwrap" | "rewrap")
+                        || config.config.wrap.separator.starts_with('%')
+                        || config.config.wrap.huge == "break"
+                        || custom_break)
                     || (!preserve_lines
-                        && config.config.wrap.mode != "unwrap"
-                        && !(config.config.wrap.separator.starts_with('%')
-                            || config.config.wrap.huge == "break"
-                            || custom_break))
-                    || (!preserve_lines
-                        && config.config.wrap.mode != "unwrap"
+                        && !matches!(config.config.wrap.mode.as_str(), "unwrap" | "rewrap")
                         && !prefix.ends_with([' ', '\t'])
                         && config.config.wrap.huge != "break"
                         && !custom_break)
@@ -747,8 +774,11 @@ pub fn format_text(
         sentences_active,
         &mut output,
     )?;
-    if wrap_active && config.config.wrap.mode == "wrap" && !config.text.text_commands.is_empty() {
-        format_text_arguments(&output, config)
+    if wrap_active
+        && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap")
+        && !config.text.text_commands.is_empty()
+    {
+        format_text_arguments(&output, config, parsing)
     } else {
         Ok(output)
     }
@@ -1008,6 +1038,7 @@ fn safe_text_body(
 fn format_text_arguments(
     source: &str,
     config: &crate::CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, crate::FormatError> {
     // Custom grammar can assign these tokens another role or alter the group
     // ownership used for indentation. Preserve text arguments in that case.
@@ -1028,12 +1059,12 @@ fn format_text_arguments(
     }) {
         return Ok(source.to_owned());
     }
-    let mut protected = crate::syntax::protected_ranges(source, &config.config)?;
-    let Ok((_, blocks)) = crate::syntax::shared_blocks_with_ranges(source, config, &protected)
-    else {
+    let mut protected = parsing.snapshot(source, false, false)?.protected.clone();
+    let Ok(parsed) = parsing.snapshot(source, true, true) else {
         return Ok(source.to_owned());
     };
-    for block in &blocks {
+    let blocks = parsed.blocks.as_deref().expect("text argument structure");
+    for block in blocks {
         if block.kind == crate::syntax::BlockKind::Environment
             && is_non_prose_environment(&block.name, config)
         {
@@ -1115,7 +1146,7 @@ fn format_text_arguments(
                         pending
                     ))
                 };
-                let continuation = argument_continuation(source, body.start, &blocks, config);
+                let continuation = argument_continuation(source, body.start, blocks, config);
                 let replacement = wrap_text_argument(
                     source,
                     body.clone(),
@@ -1232,6 +1263,16 @@ fn wrap_text_argument(
     } else {
         "\n"
     };
+    if config.config.wrap.mode == "rewrap" {
+        return rewrap_text_argument(
+            original,
+            &atoms,
+            header,
+            continuation,
+            fallback_newline,
+            config,
+        );
+    }
     let mut output = String::with_capacity(original.len());
     let mut offset = 0;
     for (index, line) in original.split_inclusive('\n').enumerate() {
@@ -1286,6 +1327,87 @@ fn wrap_text_argument(
         output.push_str(&content[trailing..]);
         output.push_str(ending);
         offset += line.len();
+    }
+    output
+}
+
+fn rewrap_text_argument(
+    original: &str,
+    atoms: &[Range<usize>],
+    header: &str,
+    continuation: &str,
+    newline: &str,
+    config: &crate::CompiledConfig,
+) -> String {
+    let mut output = String::with_capacity(original.len());
+    let mut lines = original.split_inclusive('\n').peekable();
+    let mut offset = 0;
+    while let Some(line) = lines.next() {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content.trim_matches([' ', '\t']).is_empty() {
+            output.push_str(line);
+            offset += line.len();
+            continue;
+        }
+        let first = offset;
+        let leading = content.len() - content.trim_start_matches([' ', '\t']).len();
+        let external = if first == 0 { header } else { "" };
+        let prefix = format!("{}{}", external, &content[..leading]);
+        let mut regions = Vec::new();
+        let mut current = line;
+        let (trailing, ending) = loop {
+            let content = current.trim_end_matches(['\r', '\n']);
+            let leading = content.len() - content.trim_start_matches([' ', '\t']).len();
+            let end = content.trim_end_matches([' ', '\t']).len();
+            regions.push(Region {
+                range: offset + leading..offset + end,
+                space_before: !regions.is_empty(),
+                newline_before: None,
+            });
+            offset += current.len();
+            if lines
+                .peek()
+                .is_some_and(|next| !next.trim_matches([' ', '\t', '\r', '\n']).is_empty())
+            {
+                current = lines.next().expect("peeked argument line");
+            } else {
+                break (&content[end..], line_ending(current).unwrap_or(""));
+            }
+        };
+        let mut canonical = canonicalize(
+            original,
+            &regions,
+            atoms,
+            config.config.wrap.collapse_spaces,
+        );
+        // Argument layout changes existing whitespace only; non-ASCII words
+        // remain indivisible even when prose can break at a CJK boundary.
+        let mut word_start = 0;
+        for (position, character) in canonical
+            .text
+            .char_indices()
+            .chain(std::iter::once((canonical.text.len(), ' ')))
+        {
+            if matches!(character, ' ' | '\t') {
+                if word_start < position && !canonical.text[word_start..position].is_ascii() {
+                    canonical.opaque.push(word_start..position);
+                }
+                word_start = position + character.len_utf8();
+            }
+        }
+        merge_ranges(&mut canonical.opaque);
+        let mut formatted = String::new();
+        emit_argument_layout(
+            &canonical,
+            &prefix,
+            continuation,
+            newline,
+            config,
+            &mut formatted,
+        );
+        output.push_str(&formatted[external.len()..]);
+        output.push_str(trailing);
+        output.push_str(ending);
     }
     output
 }
@@ -1366,7 +1488,8 @@ fn flush(
         || sentences_active
             && !paragraph.comment
             && !sentence_excluded
-            && config.config.sentences.preserve_line_breaks;
+            && config.config.sentences.preserve_line_breaks
+            && !(wrap_active && config.config.wrap.mode == "rewrap");
     let sentence_prefix = (sentences.len() > 1).then(|| {
         format!(
             "{}{}",
@@ -1413,7 +1536,7 @@ fn flush(
             } else {
                 &config.config.wrap.separator
             },
-            wrap_active && config.config.wrap.mode == "wrap",
+            wrap_active && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap"),
             preserve_lines,
             paragraph.comment,
             config,

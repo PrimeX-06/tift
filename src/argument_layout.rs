@@ -111,8 +111,9 @@ fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> 
     let base = &config.config.arguments;
     let unstarred = name.trim_end_matches('*');
     let rule = base.rules.get(name).or_else(|| base.rules.get(unstarred));
-    let default_optional =
-        rule.is_none() && config.config.wrap.mode == "wrap" && unstarred == "includegraphics";
+    let default_optional = rule.is_none()
+        && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap")
+        && unstarred == "includegraphics";
     if rule.is_none()
         && !default_optional
         && !base
@@ -126,7 +127,10 @@ fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> 
     let width = rule
         .and_then(|r| r.line_width)
         .or(base.line_width)
-        .or_else(|| (config.config.wrap.mode == "wrap").then_some(config.config.wrap.columns));
+        .or_else(|| {
+            (matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap"))
+                .then_some(config.config.wrap.columns)
+        });
     (mode != "preserve" && (mode == "expand" || width.is_some())).then_some(Settings {
         mode,
         width,
@@ -832,12 +836,32 @@ pub(crate) fn format_arguments_for_kind(
     config: &CompiledConfig,
     kind: crate::FileKind,
 ) -> Result<String, FormatError> {
+    format_arguments_with_context(
+        source,
+        config,
+        kind,
+        &mut crate::parse_context::ParseContext::new(config),
+    )
+}
+
+pub(crate) fn format_arguments_with_context(
+    source: &str,
+    config: &CompiledConfig,
+    kind: crate::FileKind,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, FormatError> {
     if !is_active(config) {
         return Ok(source.into());
     }
-    let mut protected = syntax::protected_ranges(source, &config.config)?;
-    let analysis = crate::source_analysis::SourceAnalysis::new(source, &config.config, &protected);
-    let declared = analysis.declared_commands()?.into_owned();
+    let parsed = parsing.snapshot(source, false, false)?;
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let declared = analysis.declared_commands()?;
+    let mut protected = parsed.protected.clone();
     let literal = literal_argument_ranges(source, config, &protected, &declared);
     merge_ranges(&mut protected, literal);
     let mut candidates: Vec<Candidate<'_>> = Vec::new();
@@ -989,7 +1013,7 @@ pub(crate) fn format_arguments_for_kind(
     }
     output.push_str(&source[copied..]);
     if changed {
-        crate::layout::indent_after_arguments(&output, config, kind, &changed_groups)
+        crate::layout::indent_after_arguments(&output, config, kind, parsing, &changed_groups)
     } else {
         Ok(output)
     }

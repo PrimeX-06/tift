@@ -508,7 +508,12 @@ impl ProjectContext {
         source: Arc<String>,
         config: Arc<CompiledConfig>,
     ) -> Result<Arc<CompiledConfig>, String> {
-        if config.config.replacement_only || FileKind::from_path(path) == Some(FileKind::Bibtex) {
+        if config.config.replacement_only
+            || matches!(
+                FileKind::from_path(path),
+                Some(FileKind::Bibtex | FileKind::Dtx | FileKind::Ins)
+            )
+        {
             return Ok(config);
         }
         let path = if self.sources.contains_key(path) {
@@ -870,7 +875,7 @@ impl ProjectContext {
                 if !entry.file_type().is_some_and(|kind| kind.is_file())
                     || !matches!(
                         FileKind::from_path(entry.path()),
-                        Some(FileKind::Tex | FileKind::Style | FileKind::Class)
+                        Some(FileKind::Tex | FileKind::Tikz | FileKind::Style | FileKind::Class)
                     )
                 {
                     continue;

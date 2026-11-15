@@ -6,6 +6,8 @@
 
 pub(crate) const ALIGNMENT_ENVIRONMENTS: &[&str] = &[
     "tabular",
+    "tabu",
+    "longtabu",
     "tabular*",
     "array",
     "+array",
@@ -36,8 +38,8 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
         // array.sty: \@array[#1]#2; longtable.sty: \LT@array[#1]#2.
         // xtab/supertabular likewise read a placement option before columns.
-        "tabular" | "array" | "longtable" | "xtabular" | "mpxtabular" | "supertabular"
-        | "mpsupertabular" => "om",
+        "tabular" | "tabu" | "longtabu" | "array" | "longtable" | "xtabular" | "mpxtabular"
+        | "supertabular" | "mpsupertabular" => "om",
         // Width precedes the placement option and column preamble.
         "tabular*" | "tabularx" | "tabulary" | "xtabular*" | "mpxtabular*" | "supertabular*"
         | "mpsupertabular*" => "mom",
@@ -59,6 +61,27 @@ pub(crate) fn is_table(name: &str) -> bool {
     header_signature(name).is_some()
 }
 
+/// These environments use tabularray's ordered inner cell/row/column keys.
+pub(crate) fn is_tabularray(name: &str) -> bool {
+    matches!(
+        name,
+        "tblr"
+            | "longtblr"
+            | "talltblr"
+            | "booktabs"
+            | "longtabs"
+            | "talltabs"
+            | "+array"
+            | "+matrix"
+            | "+bmatrix"
+            | "+Bmatrix"
+            | "+pmatrix"
+            | "+vmatrix"
+            | "+Vmatrix"
+            | "+cases"
+    )
+}
+
 /// Tables whose surrounding paragraph may require adjacent box boundaries.
 /// The mathematical array has its own math-context boundary handling.
 pub(crate) fn is_box(name: &str) -> bool {
@@ -70,6 +93,113 @@ pub(crate) fn is_box(name: &str) -> bool {
 /// In these table signatures it is always the last mandatory argument.
 pub(crate) fn column_spec_slot(name: &str) -> Option<usize> {
     header_signature(name)?.rfind('m')
+}
+
+/// tabu.sty:639--670 reads a TeX dimension after `to`/`spread`, then
+/// placement and the braced preamble. Width expressions remain opaque;
+/// expansion-dependent arguments or missing terminators have no safe extent.
+pub(crate) fn tabu_column_spec(
+    source: &str,
+    body: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let skip = |cursor| crate::trivia::skip_until(source, cursor, body.end);
+    let mut cursor = skip(body.start);
+    let tail = &source[cursor..body.end];
+    if tail.starts_with("to") || tail.starts_with("spread") {
+        cursor += if tail.starts_with("to") { 2 } else { 6 };
+        cursor = skip(cursor);
+        cursor = tabu_dimension_end(source, cursor, body.end)?;
+        cursor = skip(cursor);
+    }
+    if source.as_bytes().get(cursor) == Some(&b'[') {
+        cursor = crate::syntax::balanced_end(source, cursor, b'[', b']')?;
+        if cursor > body.end {
+            return None;
+        }
+        cursor = skip(cursor);
+    }
+    let end = crate::syntax::balanced_end(source, cursor, b'{', b'}')?;
+    (end <= body.end).then_some(cursor..end)
+}
+
+fn tabu_dimension_end(source: &str, start: usize, limit: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if let Some(("dimexpr", end)) = crate::syntax::command_at(source, start) {
+        let mut cursor = end;
+        while cursor < limit && cursor - start <= 1024 {
+            cursor = crate::trivia::skip_until(source, cursor, limit);
+            if let Some((command, end)) = crate::syntax::command_at(source, cursor) {
+                if command == "relax" {
+                    return Some(end);
+                }
+                if !command.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                    return None;
+                }
+                cursor = end;
+            } else if bytes
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || b".+-*/()".contains(byte))
+            {
+                cursor += 1;
+            } else {
+                return None;
+            }
+        }
+        return None;
+    }
+    let mut cursor = start;
+    if bytes.get(cursor).is_some_and(|byte| b"+-".contains(byte)) {
+        cursor += 1;
+    }
+    let number_start = cursor;
+    let mut point = false;
+    while cursor < limit {
+        match bytes[cursor] {
+            b'0'..=b'9' => cursor += 1,
+            b'.' | b',' if !point => {
+                point = true;
+                cursor += 1;
+            }
+            _ => break,
+        }
+    }
+    let number = source[number_start..cursor]
+        .bytes()
+        .any(|byte| byte.is_ascii_digit());
+    cursor = crate::trivia::skip_until(source, cursor, limit);
+    if let Some((command, end)) = crate::syntax::command_at(source, cursor) {
+        return (matches!(
+            command,
+            "linewidth"
+                | "textwidth"
+                | "columnwidth"
+                | "hsize"
+                | "vsize"
+                | "textheight"
+                | "paperwidth"
+                | "paperheight"
+                | "columnsep"
+                | "tabcolsep"
+                | "arraycolsep"
+                | "baselineskip"
+                | "linegoal"
+        ) && end <= limit)
+            .then_some(end);
+    }
+    if !number {
+        return None;
+    }
+    let unit_end = cursor.checked_add(2)?;
+    if unit_end <= limit
+        && matches!(
+            &bytes[cursor..unit_end],
+            b"pt" | b"pc" | b"in" | b"bp" | b"cm" | b"mm" | b"dd" | b"cc" | b"sp" | b"ex" | b"em"
+        )
+    {
+        Some(unit_end)
+    } else {
+        None
+    }
 }
 
 

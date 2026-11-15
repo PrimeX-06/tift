@@ -15,6 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{CompiledConfig, FormatError};
 
+#[path = "column_spec.rs"]
+mod column_spec;
+
 const DEFAULT_ENVIRONMENTS: &[&str] = &[
     "tabu",
     "matrix",
@@ -96,6 +99,9 @@ pub enum Justification {
     #[default]
     Left,
     Right,
+    Center,
+    /// Read horizontal alignment from each literal table column specification.
+    Columns,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -182,7 +188,7 @@ impl Default for AlignmentConfig {
             format_children: true,
             multicolumn: false,
             short_rows: ShortRows::Align,
-            justification: Justification::Left,
+            justification: Justification::Columns,
             delimiter_justification: Justification::Left,
             dont_measure: Vec::new(),
             dont_measure_rows: Vec::new(),
@@ -302,6 +308,11 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
 }
 
 fn compile_rule(settings: AlignmentConfig, name: &str) -> Result<CompiledRule, String> {
+    if settings.delimiter_justification == Justification::Columns {
+        return Err(format!(
+            "alignment {name:?}: delimiter-justification must be left, right, or center"
+        ));
+    }
     for (key, value) in [
         ("spaces-before", settings.spaces_before),
         ("spaces-after", settings.spaces_after),
@@ -542,6 +553,16 @@ fn format_alignment_with_context(
         std::rc::Rc::clone(&parsed.metadata),
     );
     let cached_tokens = parsed.tokens.as_deref().expect("parsed tokens");
+    let declared_column_types = if config
+        .alignment
+        .rules
+        .values()
+        .any(|rule| rule.settings.justification == Justification::Columns)
+    {
+        column_spec::declared_types(source, cached_tokens)
+    } else {
+        column_spec::DeclaredTypes::default()
+    };
     let environments = crate::syntax::environment_ranges_with_tokens(
         source,
         cached_tokens,
@@ -556,6 +577,20 @@ fn format_alignment_with_context(
         analysis.declared_environments()?
     } else {
         Default::default()
+    };
+    let declared_ray_commands = if environments
+        .iter()
+        .any(|environment| crate::package_tables::is_tabularray(&environment.name))
+    {
+        analysis
+            .declared_commands()?
+            .iter()
+            .any(|name| column_spec::TABULARRAY_STYLE_COMMANDS.contains(&name.as_str()))
+            || column_spec::TABULARRAY_STYLE_COMMANDS
+                .iter()
+                .any(|name| config.config.syntax.commands.contains_key(*name))
+    } else {
+        false
     };
     let mut all_environment_ranges = environments
         .iter()
@@ -802,14 +837,42 @@ fn format_alignment_with_context(
             &opaque,
             &block.name,
         )?;
+        let columns = if rule.settings.justification == Justification::Columns
+            && block.environment
+            && !declared_defaults.contains(&block.name)
+            && !config
+                .config
+                .syntax
+                .environment_arguments
+                .contains_key(&block.name)
+            && (!crate::package_tables::is_tabularray(&block.name)
+                || !declared_ray_commands
+                    && column_spec::tabularray_body_supported(
+                        source,
+                        content_start..block.body.end,
+                        cached_tokens,
+                    )) {
+            column_spec::for_environment(
+                &block.name,
+                &source[block.body.start..content_start],
+                &declared_column_types,
+            )
+        } else {
+            None
+        };
         let formatted = format_rows(
             source,
             rows,
             rule,
             &children,
             &opaque,
-            freshly_indented,
-            config.config.indent.width,
+            RowLayoutContext {
+                freshly_indented,
+                tab_width: config.config.indent.width,
+                column_spec: columns.as_ref(),
+                column_environment: block.environment.then_some(block.name.as_str()),
+                declared_column_types: &declared_column_types,
+            },
         )?;
         let formatted = if let Some(indent) = &block.markup_indent {
             indent_markup_body(&formatted, indent, config)?
@@ -1374,6 +1437,7 @@ struct MeasuredCell<'a> {
     span: usize,
     width: usize,
     measure: bool,
+    justification: Option<Justification>,
 }
 
 struct MeasuredRow<'a> {
@@ -1387,6 +1451,112 @@ struct MeasuredRow<'a> {
     delimiters: Vec<&'a str>,
     columns: usize,
     eligible: bool,
+    data_row: bool,
+}
+
+struct RowLayoutContext<'a> {
+    freshly_indented: bool,
+    tab_width: usize,
+    column_spec: Option<&'a column_spec::TableSpec>,
+    column_environment: Option<&'a str>,
+    declared_column_types: &'a column_spec::DeclaredTypes,
+}
+
+fn apply_column_spec(
+    rows: &mut [MeasuredRow<'_>],
+    spec: &column_spec::TableSpec,
+    settings: &AlignmentConfig,
+) {
+    let row_count = rows.iter().filter(|row| row.data_row).count();
+    let column_count = rows
+        .iter()
+        .filter(|row| row.data_row)
+        .map(|row| row.columns)
+        .max()
+        .unwrap_or(0)
+        .max(spec.column_count());
+    let mut omitted: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut logical_row = 0;
+    for row in rows {
+        if !row.data_row {
+            continue;
+        }
+        logical_row += 1;
+        if !row.eligible {
+            continue;
+        }
+        // Obsolete multicolumn calls in tabularray do not share SetCell's
+        // physical-placeholder grammar. Retain the earlier conservative path.
+        if spec.is_tabularray() && row.cells.iter().any(|cell| cell.span != 1) {
+            continue;
+        }
+        let mut index = 0;
+        let mut column = 1;
+        while index < row.cells.len() {
+            let covered =
+                omitted
+                    .iter()
+                    .any(|&(first_row, last_row, first_column, last_column)| {
+                        (first_row..=last_row).contains(&logical_row)
+                            && (first_column..=last_column).contains(&column)
+                            && (logical_row != first_row || column != first_column)
+                    });
+            if covered {
+                row.cells[index].measure = false;
+                row.cells[index].justification = Some(Justification::Left);
+                column += row.cells[index].span;
+                index += 1;
+                continue;
+            }
+            let mut style = spec.style(logical_row, column, row_count, column_count);
+            let Ok(local) = spec.local_style(&row.cells[index].text) else {
+                row.eligible = false;
+                break;
+            };
+            style.justification = local.justification.or(style.justification);
+            style.colspan = local.colspan.or(style.colspan);
+            style.rowspan = local.rowspan.or(style.rowspan);
+            row.cells[index].justification = row.cells[index].justification.or(style.justification);
+            let span = if spec.is_tabularray() {
+                style.colspan.unwrap_or(1)
+            } else {
+                row.cells[index].span
+            };
+            if spec.is_tabularray() && span > 1 {
+                if span > row.cells.len() - index
+                    || row.cells[index + 1..index + span]
+                        .iter()
+                        .any(|cell| !cell.text.is_empty())
+                {
+                    row.eligible = false;
+                    break;
+                }
+                let mut text = row.cells[index].text.to_string();
+                for offset in 0..span - 1 {
+                    text.extend(std::iter::repeat_n(' ', settings.spaces_before));
+                    text.push_str(row.delimiters[index + offset]);
+                    text.extend(std::iter::repeat_n(' ', settings.spaces_after));
+                }
+                row.cells[index].width = measure_width(&text, settings.width);
+                row.cells[index].text = Cow::Owned(text);
+                row.cells[index].span = span;
+                row.cells.drain(index + 1..index + span);
+                row.delimiters.drain(index..index + span - 1);
+            }
+            if spec.is_tabularray() && (span > 1 || style.rowspan.unwrap_or(1) > 1) {
+                omitted.push((
+                    logical_row,
+                    logical_row
+                        .saturating_add(style.rowspan.unwrap_or(1) - 1)
+                        .min(row_count),
+                    column,
+                    column + span - 1,
+                ));
+            }
+            column += row.cells[index].span;
+            index += 1;
+        }
+    }
 }
 
 fn format_rows(
@@ -1395,9 +1565,15 @@ fn format_rows(
     rule: &CompiledRule,
     children: &[(Range<usize>, &str)],
     opaque: &[Range<usize>],
-    freshly_indented: bool,
-    tab_width: usize,
+    context: RowLayoutContext<'_>,
 ) -> Result<String, FormatError> {
+    let RowLayoutContext {
+        freshly_indented,
+        tab_width,
+        column_spec,
+        column_environment,
+        declared_column_types,
+    } = context;
     let settings = &rule.settings;
     let mut measured = rows
         .into_iter()
@@ -1451,7 +1627,20 @@ fn format_rows(
                             Cow::Owned(value)
                         }
                     };
-                    let span = if settings.multicolumn {
+                    let override_column = (settings.justification == Justification::Columns)
+                        .then(|| {
+                            column_spec::multicolumn(
+                                &text,
+                                declared_column_types,
+                                column_environment,
+                            )
+                        })
+                        .flatten();
+                    let span = if let Some((span, _)) = override_column {
+                        span
+                    } else if settings.multicolumn
+                        || settings.justification == Justification::Columns
+                    {
                         multicolumn_span(&text).unwrap_or(1)
                     } else {
                         1
@@ -1468,6 +1657,7 @@ fn format_rows(
                         span,
                         width,
                         measure,
+                        justification: override_column.map(|(_, align)| align),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1487,11 +1677,11 @@ fn format_rows(
                     suffix
                 }
             };
-            let eligible = !row.standalone
-                && !unsafe_comment
+            let data_row = !row.standalone
                 && (has_row_break
                     || !row.delimiters.is_empty()
                     || cells.iter().any(|cell| !cell.text.is_empty()));
+            let eligible = data_row && !unsafe_comment;
             Ok::<_, FormatError>(MeasuredRow {
                 original: row.full,
                 prefix: prefix.into(),
@@ -1503,9 +1693,15 @@ fn format_rows(
                 delimiters: row.delimiters.iter().map(|r| &source[r.clone()]).collect(),
                 columns,
                 eligible,
+                data_row,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if settings.justification == Justification::Columns
+        && let Some(spec) = column_spec
+    {
+        apply_column_spec(&mut measured, spec, settings);
+    }
     let columns = measured
         .iter()
         .filter(|r| r.eligible)
@@ -1525,6 +1721,23 @@ fn format_rows(
             }
         }
     }
+    let justification = |_column: usize, cell: &MeasuredCell<'_>| {
+        if settings.justification == Justification::Columns {
+            cell.justification.unwrap_or(Justification::Left)
+        } else {
+            settings.justification
+        }
+    };
+    let first_column_has_leading_padding = measured
+        .iter()
+        .filter(|row| row.eligible)
+        .filter_map(|row| row.cells.first())
+        .any(|cell| {
+            matches!(
+                justification(0, cell),
+                Justification::Right | Justification::Center
+            )
+        });
     // Leading whitespace in an empty first cell includes alignment padding.
     // Same-line logical rows have no indentation prefix. Physical rows recover
     // their indentation from a row whose first cell contains actual content.
@@ -1553,7 +1766,7 @@ fn format_rows(
                     .any(|row| row.eligible && row.starts_physical_line)
         })
         .map(|row| {
-            let prefix = if settings.justification == Justification::Right
+            let prefix = if first_column_has_leading_padding
                 || row.cells.first().is_some_and(|cell| cell.text.is_empty())
             {
                 0
@@ -1600,7 +1813,7 @@ fn format_rows(
     }
     // Right padding in the first column shares the physical indentation prefix.
     // Recover the common base indentation so reformatting does not accumulate it.
-    if settings.justification == Justification::Right {
+    if first_column_has_leading_padding {
         let base = measured
             .iter()
             .filter(|r| r.eligible && r.starts_physical_line)
@@ -1695,18 +1908,31 @@ fn format_rows(
                 && (Some(row_index) != last_data
                     || settings.align_final_double_backslash
                     || settings.align_content_after_row_break);
-            let pad_cell = !preserve_empty_prefix && (i < row.delimiters.len() || align_last);
+            let cell_justification = justification(column, cell);
+            let pad_cell = !preserve_empty_prefix
+                && (i < row.delimiters.len()
+                    || align_last
+                    || settings.justification == Justification::Columns
+                        && cell_justification != Justification::Left);
             if align_last && i + 1 == row.cells.len() && row.columns < columns {
                 target +=
                     widths[row.columns..].iter().sum::<usize>() + gap * (columns - row.columns);
             }
             let pad = target.saturating_sub(cell.width);
-            if pad_cell && settings.justification == Justification::Right {
-                output.extend(std::iter::repeat_n(' ', pad));
+            let (before_pad, after_pad) = match cell_justification {
+                Justification::Right => (pad, 0),
+                Justification::Center => (pad / 2, pad - pad / 2),
+                _ => (0, pad),
+            };
+            if pad_cell {
+                output.extend(std::iter::repeat_n(' ', before_pad));
             }
             output.push_str(&cell.text);
-            if pad_cell && settings.justification == Justification::Left {
-                output.extend(std::iter::repeat_n(' ', pad));
+            // A final cell without an aligned row terminator has no following
+            // delimiter to position. Preserve its existing suffix without
+            // adding center padding that would grow again on the next pass.
+            if pad_cell && (i < row.delimiters.len() || align_last) {
+                output.extend(std::iter::repeat_n(' ', after_pad));
             }
             if let Some(delimiter) = row.delimiters.get(i) {
                 let before = if preserve_empty_prefix {
@@ -1719,13 +1945,14 @@ fn format_rows(
                 output.extend(std::iter::repeat_n(' ', before));
                 let delimiter_pad =
                     delimiter_width.saturating_sub(measure_width(delimiter, settings.width));
-                if settings.delimiter_justification == Justification::Right {
-                    output.extend(std::iter::repeat_n(' ', delimiter_pad));
-                }
+                let (before_pad, after_pad) = match settings.delimiter_justification {
+                    Justification::Right => (delimiter_pad, 0),
+                    Justification::Center => (delimiter_pad / 2, delimiter_pad - delimiter_pad / 2),
+                    _ => (0, delimiter_pad),
+                };
+                output.extend(std::iter::repeat_n(' ', before_pad));
                 output.push_str(delimiter);
-                if settings.delimiter_justification == Justification::Left {
-                    output.extend(std::iter::repeat_n(' ', delimiter_pad));
-                }
+                output.extend(std::iter::repeat_n(' ', after_pad));
                 output.extend(std::iter::repeat_n(' ', settings.spaces_after));
             } else if row.has_row_break {
                 output.extend(std::iter::repeat_n(' ', settings.spaces_before_row_break));

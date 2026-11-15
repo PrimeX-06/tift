@@ -184,6 +184,12 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
     (cursor > end).then_some(cursor)
 }
 
+/// ocg-p.sty reads the column preamble before database and listings options.
+/// Its listings-read table body retains the package's verbatim protection.
+pub(crate) fn column_spec_slot(name: &str) -> Option<usize> {
+    (name == "ocgtabular").then_some(1)
+}
+
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
         // ocgx2.sty:180,254; ocg-p.sty:64,180; animate.sty:2101.

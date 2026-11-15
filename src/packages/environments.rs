@@ -221,6 +221,7 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 /// Column templates may contain definitions and conditional tokens.
 pub(crate) fn column_spec_slot(name: &str) -> Option<usize> {
     Some(match name {
+        "+matrix" | "+bmatrix" | "+Bmatrix" | "+pmatrix" | "+vmatrix" | "+Vmatrix" | "+cases" => 0,
         "subarray" | "crampedsubarray" => 0,
         "NiceArrayWithDelims" => 3,
         "NiceArray"

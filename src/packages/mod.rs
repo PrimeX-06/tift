@@ -85,7 +85,9 @@ pub(crate) fn has_scoped_command_data(name: &str) -> bool {
 }
 
 pub(crate) fn column_spec_slot(name: &str) -> Option<usize> {
-    tables::column_spec_slot(name).or_else(|| environments::column_spec_slot(name))
+    tables::column_spec_slot(name)
+        .or_else(|| environments::column_spec_slot(name))
+        .or_else(|| visual_science::column_spec_slot(name))
 }
 
 pub(crate) fn alignment_environments() -> impl Iterator<Item = &'static str> {

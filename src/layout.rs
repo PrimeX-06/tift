@@ -138,6 +138,29 @@ fn format_document_inner(
             text = stage("bibtex", &text, &mut trace, &mut details, config, || {
                 crate::bibtex::format_bibtex(&text, config)
             })?;
+        } else if matches!(kind, FileKind::Dtx | FileKind::Ins) {
+            text = stage("docstrip", &text, &mut trace, &mut details, config, || {
+                crate::docstrip::format_docstrip(&text, kind, config)
+            })?;
+            let math_active = crate::math_layout::is_active(&text, config);
+            optional_stage(
+                "math",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                math_active,
+                |text| crate::math_layout::format_math(text, kind, config),
+            )?;
+            optional_stage(
+                "docstrip-text",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                kind == FileKind::Dtx && crate::docstrip::documentation_is_active(config),
+                |text| crate::docstrip::format_documentation(text, config),
+            )?;
         } else {
             if config.config.whitespace.before_processing {
                 text = stage(
@@ -172,14 +195,33 @@ fn format_document_inner(
                 macro_active,
                 |text| syntax::format_macro_definitions(text, config),
             )?;
+            // Formula spacing contributes to the width of text arguments and
+            // prose, so normalize math before either text stage measures it.
+            let math_active = crate::math_layout::is_active(&text, config);
             let mut needs_cleanup = optional_stage(
+                "math",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                math_active,
+                |text| crate::math_layout::format_math(text, kind, config),
+            )?;
+            needs_cleanup |= optional_stage(
                 "arguments",
                 &mut text,
                 &mut trace,
                 &mut details,
                 config,
                 crate::argument_layout::is_active(config),
-                |text| crate::argument_layout::format_arguments_for_kind(text, config, kind),
+                |text| {
+                    crate::argument_layout::format_arguments_with_context(
+                        text,
+                        config,
+                        kind,
+                        &mut parsing,
+                    )
+                },
             )?;
             // Resolve structure first so wrapping always measures final indentation.
             needs_cleanup |= optional_stage(
@@ -189,7 +231,14 @@ fn format_document_inner(
                 &mut details,
                 config,
                 crate::wrap::is_active(config, crate::wrap::Stage::Before),
-                |text| crate::wrap::format_text(text, config, crate::wrap::Stage::Before),
+                |text| {
+                    crate::wrap::format_text_with_context(
+                        text,
+                        config,
+                        crate::wrap::Stage::Before,
+                        &mut parsing,
+                    )
+                },
             )?;
             let processed = stage("alignment", &text, &mut trace, &mut details, config, || {
                 crate::alignment::format_alignment_after_indent(&text, config, &mut parsing)
@@ -203,7 +252,14 @@ fn format_document_inner(
                 &mut details,
                 config,
                 crate::wrap::is_active(config, crate::wrap::Stage::After),
-                |text| crate::wrap::format_text(text, config, crate::wrap::Stage::After),
+                |text| {
+                    crate::wrap::format_text_with_context(
+                        text,
+                        config,
+                        crate::wrap::Stage::After,
+                        &mut parsing,
+                    )
+                },
             )?;
             if needs_cleanup {
                 text = stage(
@@ -215,6 +271,28 @@ fn format_document_inner(
                     || clean_whitespace(&text, config, &mut parsing),
                 )?;
             }
+            let code_active = crate::code_layout::is_active(&text, config);
+            let code_changed = optional_stage(
+                "code",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                code_active,
+                |text| crate::code_layout::format_code(text, kind, config),
+            )?;
+            // Code layout can move a formula to a differently indented line.
+            // Re-evaluate math only when that final surrounding layout changed.
+            let math_active = code_changed && crate::math_layout::is_active(&text, config);
+            optional_stage(
+                "math-final",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                math_active,
+                |text| crate::math_layout::format_math(text, kind, config),
+            )?;
         }
     }
     optional_stage(
@@ -278,7 +356,7 @@ fn format_document_inner(
         ("\\obeylines", "line-sensitive region preserved"),
     ] {
         let enabled = if command == "\\ExplSyntaxOn" {
-            config.config.protect.expl3
+            config.config.protect.expl3 && !config.config.code.expl3
         } else {
             config.config.protect.dynamic_catcodes
         };
@@ -446,15 +524,10 @@ pub(crate) fn indent_after_arguments(
     source: &str,
     config: &CompiledConfig,
     kind: FileKind,
+    parsing: &mut ParseContext<'_>,
     arguments: &[Range<usize>],
 ) -> Result<String, FormatError> {
-    indent_with_argument_ranges(
-        source,
-        kind,
-        config,
-        &mut ParseContext::new(config),
-        arguments,
-    )
+    indent_with_argument_ranges(source, kind, config, parsing, arguments)
 }
 
 fn indent(
@@ -567,19 +640,20 @@ fn indent_with_argument_ranges(
         }
     }
     events.sort_unstable_by_key(|e| (e.pos, e.start));
-    let preamble_end = if kind == FileKind::Tex && !config.config.indent.preamble {
-        blocks
-            .iter()
-            .filter(|b| {
-                b.kind == BlockKind::Environment
-                    && b.name == "document"
-                    && !has_filecontents_ancestor(b, blocks, config)
-            })
-            .map(|b| b.begin.start)
-            .min()
-    } else {
-        None
-    };
+    let preamble_end =
+        if matches!(kind, FileKind::Tex | FileKind::Tikz) && !config.config.indent.preamble {
+            blocks
+                .iter()
+                .filter(|b| {
+                    b.kind == BlockKind::Environment
+                        && b.name == "document"
+                        && !has_filecontents_ancestor(b, blocks, config)
+                })
+                .map(|b| b.begin.start)
+                .min()
+        } else {
+            None
+        };
     let mut filecontents: Vec<Range<usize>> = blocks
         .iter()
         .filter(|b| {
@@ -1171,6 +1245,10 @@ pub(crate) fn environment_header_end(
                     })
                     .or(Some(signature))
             });
+        if signature.is_some() && matches!(name, "tabu" | "longtabu") {
+            return crate::package_tables::tabu_column_spec(source, body.clone())
+                .map_or(body.start, |range| range.end);
+        }
         for slot in signature.unwrap_or("o").bytes() {
             match next_argument(cursor, slot) {
                 Some(end) => cursor = end,
@@ -1587,6 +1665,11 @@ fn apply_breaks(
         .filter_map(|block| paragraph_command_end(source, block))
         .collect();
     let ending = preferred_ending(source, config);
+    // New boundaries on a mixed-ending line inherit that line's ending. This
+    // also keeps rewrap stable when it rejoins a command split in this stage.
+    let local_newlines = (config.config.whitespace.line_ending == LineEnding::Preserve
+        && source.contains("\r\n"))
+    .then(|| memchr::memchr_iter(b'\n', source.as_bytes()).collect::<Vec<_>>());
     let mut boundaries: BTreeMap<usize, Boundary> = BTreeMap::new();
     let mut preserved_path_begins = std::collections::HashSet::new();
     let mut record = |pos, mode, before| {
@@ -1824,6 +1907,25 @@ fn apply_breaks(
                 continue;
             }
             let whitespace = &source[start..end];
+            let ending = local_newlines
+                .as_ref()
+                .and_then(|positions| {
+                    memchr::memchr(b'\n', whitespace.as_bytes())
+                        .map(|offset| start + offset)
+                        .or_else(|| {
+                            positions
+                                .get(positions.partition_point(|&pos| pos < boundary.pos))
+                                .or_else(|| positions.last())
+                                .copied()
+                        })
+                })
+                .map_or(ending, |pos| {
+                    if pos > 0 && source.as_bytes()[pos - 1] == b'\r' {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    }
+                });
             let replacement = match mode {
                 BreakMode::Preserve => unreachable!(),
                 BreakMode::Join => {

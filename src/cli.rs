@@ -88,10 +88,13 @@ struct Args {
     #[arg(long)]
     tabs: bool,
     /// Wrap prose using the configured column width.
-    #[arg(long, conflicts_with = "no_wrap")]
+    #[arg(long, conflicts_with_all = ["no_wrap", "rewrap"])]
     wrap: bool,
+    /// Join existing prose lines and wrap paragraphs to the configured width.
+    #[arg(long, conflicts_with_all = ["wrap", "no_wrap"])]
+    rewrap: bool,
     /// Preserve prose line breaks.
-    #[arg(long, alias = "nowrap")]
+    #[arg(long, alias = "nowrap", conflicts_with = "rewrap")]
     no_wrap: bool,
     /// Target column width for prose wrapping.
     #[arg(long, value_parser = parse_positive, value_name = "N")]
@@ -172,6 +175,9 @@ impl Args {
         let mut wrap = toml::Table::new();
         if self.wrap {
             wrap.insert("mode".into(), toml::Value::String("wrap".into()));
+        }
+        if self.rewrap {
+            wrap.insert("mode".into(), toml::Value::String("rewrap".into()));
         }
         if self.no_wrap {
             wrap.insert("mode".into(), toml::Value::String("preserve".into()));

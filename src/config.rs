@@ -6,9 +6,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Tex,
+    Tikz,
     Style,
     Class,
     Bibtex,
+    Dtx,
+    Ins,
 }
 
 impl FileKind {
@@ -16,12 +19,18 @@ impl FileKind {
         let extension = path.extension()?.to_str()?;
         if extension.eq_ignore_ascii_case("tex") {
             Some(Self::Tex)
+        } else if extension.eq_ignore_ascii_case("tikz") {
+            Some(Self::Tikz)
         } else if extension.eq_ignore_ascii_case("sty") {
             Some(Self::Style)
         } else if extension.eq_ignore_ascii_case("cls") {
             Some(Self::Class)
         } else if extension.eq_ignore_ascii_case("bib") {
             Some(Self::Bibtex)
+        } else if extension.eq_ignore_ascii_case("dtx") {
+            Some(Self::Dtx)
+        } else if extension.eq_ignore_ascii_case("ins") {
+            Some(Self::Ins)
         } else {
             None
         }
@@ -34,6 +43,9 @@ pub struct Config {
     pub cache: CacheConfig,
     pub indent: IndentConfig,
     pub alignment: crate::alignment::AlignmentConfig,
+    pub bibtex: crate::bibtex::BibtexConfig,
+    pub code: crate::code_layout::CodeConfig,
+    pub math: crate::math_layout::MathConfig,
     pub arguments: crate::argument_layout::ArgumentLayoutConfig,
     pub wrap: crate::wrap::WrapConfig,
     pub sentences: crate::wrap::SentenceConfig,
@@ -112,6 +124,7 @@ impl CompiledConfig {
             }
         }
         validate_environment_arguments(&config)?;
+        crate::bibtex::validate(&config.bibtex).map_err(ConfigError)?;
         crate::argument_layout::validate(&config.arguments).map_err(ConfigError)?;
         Ok(Self {
             replacements: Arc::new(

@@ -24,6 +24,7 @@ pub enum TraceAction {
     Whitespace,
     FileBoundary,
     Bibtex,
+    Math,
     Selection,
     Other,
 }
@@ -41,6 +42,7 @@ impl fmt::Display for TraceAction {
             Self::Whitespace => "whitespace cleanup",
             Self::FileBoundary => "file boundaries",
             Self::Bibtex => "BibTeX layout",
+            Self::Math => "math layout",
             Self::Selection => "selected line edits",
             Self::Other => "source edit",
         })
@@ -73,7 +75,8 @@ fn action(stage: &str) -> TraceAction {
         "indentation" => TraceAction::Indentation,
         "alignment" => TraceAction::Alignment,
         "arguments" => TraceAction::Arguments,
-        "text-before" | "text-after" => TraceAction::Text,
+        "text-before" | "text-after" | "docstrip-text" => TraceAction::Text,
+        "math" | "math-final" => TraceAction::Math,
         "macro-bodies" => TraceAction::MacroBody,
         "replacements-before" | "replacements-after" => TraceAction::Replacement,
         "whitespace-before" | "whitespace-after" => TraceAction::Whitespace,
@@ -130,6 +133,7 @@ fn context(block: &Block) -> String {
 fn rule(stage: &str, block: Option<&Block>, config: &CompiledConfig) -> Option<String> {
     let name = block.map(|block| block.name.trim_end_matches('*'));
     match stage {
+        "math" | "math-final" => Some("math.enabled / wrap.columns".into()),
         "structure" => Some(name.map_or_else(
             || "breaks".into(),
             |name| {

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  RUST_MIN_STACK: "67108864"
+
+jobs:
+  rust:
+    name: Rust / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check public file list
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          allowed = {
+              ".gitignore", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md",
+              "rust-toolchain.toml", ".github/workflows/ci.yml",
+              ".github/workflows/release.yml", "examples/conform.lua",
+              "examples/latex-workshop.json", "examples/pre-commit-config.yaml",
+              "examples/print_config.rs", "examples/tift.toml",
+          }
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          for name in filter(None, files):
+              source = name.startswith("src/") and name.endswith(".rs")
+              if name not in allowed and not source:
+                  raise SystemExit("A file outside the public source list is tracked")
+              if name.endswith(".rs"):
+                  text = Path(name).read_text(encoding="utf-8")
+                  if re.search(r"#\s*\[\s*(?:test\b|cfg\s*\(\s*test\b)", text):
+                      raise SystemExit("Private test code is present in a public source file")
+          PY
+      - name: Formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Clippy
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+      - name: Release build
+        run: cargo +stable build --release --locked
+      - name: API documentation
+        run: cargo +stable doc --no-deps --locked
+
+  msrv:
+    name: Minimum Rust / 1.90.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt, clippy
+      - name: Formatting
+        run: cargo +1.90.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.90.0 clippy --all-targets --all-features --locked -- -D warnings
+      - name: Release build
+        run: cargo +1.90.0 build --release --locked

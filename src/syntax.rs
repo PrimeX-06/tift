@@ -722,9 +722,10 @@ fn primitive_condition(name: &str) -> bool {
     )
 }
 
-/// Whether a command opens a primitive or explicitly configured TeX condition.
+/// Whether a command opens a primitive, known package, or configured condition.
 pub fn is_condition_command(name: &str, config: &Config) -> bool {
     primitive_condition(name)
+        || crate::code_package_syntax::is_condition(name)
         || config
             .syntax
             .conditions
@@ -849,6 +850,9 @@ fn math_optional_argument_end(source: &str, start: usize) -> Option<usize> {
 }
 
 fn column_specification(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
+    if matches!(name, "tabu" | "longtabu") {
+        return crate::package_tables::tabu_column_spec(source, end..source.len());
+    }
     let signature = crate::packages::header_signature(name)?;
     let target = crate::packages::column_spec_slot(name)?;
     let mut cursor = end;
@@ -3515,7 +3519,11 @@ fn protected_ranges_with_inferred_environments(
                     pos = end;
                     continue;
                 }
-                if begin && let Some(range) = column_specification(source, name, finish) {
+                if begin
+                    && !config.syntax.environment_arguments.contains_key(name)
+                    && !visual_overrides.contains(name)
+                    && let Some(range) = column_specification(source, name, finish)
+                {
                     macro_ranges.push(range);
                 }
                 if begin {

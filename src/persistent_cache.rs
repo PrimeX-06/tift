@@ -134,6 +134,9 @@ impl PersistentCache {
             FileKind::Style => 1,
             FileKind::Class => 2,
             FileKind::Bibtex => 3,
+            FileKind::Dtx => 4,
+            FileKind::Ins => 5,
+            FileKind::Tikz => 6,
         };
         let mut hash = blake3::Hasher::new();
         hash.update(b"tift-result-cache-v2");

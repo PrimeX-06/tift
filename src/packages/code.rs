@@ -18,6 +18,70 @@ pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
 
 pub(crate) const INLINE_CODE_COMMANDS: &[&str] = &["Verb", "SaveVerb"];
 
+/// Exact switch names assigned by listings.sty/lstmisc.sty through `\let`
+/// or `\lstKV@SetIf`. Their current runtime truth value remains unknown.
+pub(crate) fn is_condition(name: &str) -> bool {
+    matches!(
+        name,
+        "lst@if"
+            | "lst@ifLmode"
+            | "lst@ifactivechars"
+            | "lst@ifbox"
+            | "lst@ifconsecutivenumbers"
+            | "lst@ifdisplaystyle"
+            | "lst@ifdraft"
+            | "lst@ifdropinput"
+            | "lst@ifec"
+            | "lst@iffancyvrb"
+            | "lst@ifflexible"
+            | "lst@iffontadjust"
+            | "lst@ifgobbledws"
+            | "lst@ifkeepspaces"
+            | "lst@ifletter"
+            | "lst@ifmode"
+            | "lst@ifnewline"
+            | "lst@ifnolol"
+            | "lst@ifnumberbychapter"
+            | "lst@ifprint"
+            | "lst@ifsavemem"
+            | "lst@ifshowlines"
+            | "lst@ifshowspaces"
+            | "lst@ifshowtabs"
+            | "lst@ifupquote"
+            | "lst@ifwhitespace"
+            | "lst@ifbreakatwhitespace"
+            | "lst@ifbreakautoindent"
+            | "lst@ifbreaklines"
+            | "lst@ifbstring"
+            | "lst@ifexcomments"
+            | "lst@ifexstrings"
+            | "lst@ifextags"
+            | "lst@iffirstintag"
+            | "lst@ifframeround"
+            | "lst@ifindexproc"
+            | "lst@ifkeywords"
+            | "lst@ifmakekey"
+            | "lst@ifmakemacrouse"
+            | "lst@ifmarkfirstintag"
+            | "lst@ifmathescape"
+            | "lst@ifnotag"
+            | "lst@ifnumberblanklines"
+            | "lst@ifnumberfirstline"
+            | "lst@ifpodcomment"
+            | "lst@ifprintpod"
+            | "lst@ifprocname"
+            | "lst@ifresetmargins"
+            | "lst@ifsensitive"
+            | "lst@ifsensitivedefed"
+            | "lst@ifshowstringspaces"
+            | "lst@iftexcl"
+            | "lst@iftexcsincludebs"
+            | "lst@ifusekeysintag"
+            | "lst@ifpreservenumber"
+            | "lst@BDOifnewline"
+    )
+}
+
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
         "Verbatim" | "Verbatim*" | "BVerbatim" | "BVerbatim*" | "LVerbatim" | "LVerbatim*"

@@ -31,12 +31,12 @@ align-content-after-row-break = false
 format-children = true
 multicolumn = true
 short-rows = "align"
-justification = "left"
+justification = "columns" # Follow recognized l/c/r specifications; "left" uses uniform left alignment.
 regex-engine = "enhanced"
 backtrack-limit = 1000000
 
 [alignment.rules.tabular]
-justification = "left"
+justification = "columns" # Override this to "left", "right", or "center" for uniform alignment.
 dont-measure = ['\\phantom\{[^}]*\}']
 
 [alignment.rules.align]
@@ -50,7 +50,7 @@ spaces-after = 1
 # enabled = false
 
 [wrap]
-mode = "preserve" # "wrap" keeps old boundaries and folds long lines; "unwrap" joins prose.
+mode = "preserve" # "wrap" folds long lines; "rewrap" joins then folds; "unwrap" joins prose.
 columns = 88
 when = "after"
 comments = false
@@ -62,7 +62,7 @@ huge = "overflow" # "break" allows grapheme-safe splitting of long plain words.
 # comments = true # Also reflow long trailing comments.
 
 # Arguments expand only with an active width, or explicit mode = "expand".
-# "wrap" supplies wrap.columns when line-width is omitted.
+# "wrap" and "rewrap" supply wrap.columns when line-width is omitted.
 [arguments]
 mode = "auto"
 split-commas = true
@@ -165,6 +165,22 @@ indent = false
 # end = '\EndIf'
 # middle = ['\ElsIf', '\Else']
 # nested = true
+
+[bibtex]
+normalize = true # Lowercase entry types/field names and normalize field assignments.
+align-fields = true # Applied during normalization.
+value-delimiters = "preserve" # "preserve", "braces", or "quotes".
+field-order = [] # Keep source order; ["canonical"], ["alphabetical"], or field names.
+sort = false # Enable to order movable entry groups by citation key.
+sort-by = ["key"] # For example ["author", "-year", "title", "key"].
+case-sensitive = false
+
+[code]
+algorithm2e = true # Expand braced control flow and separate algorithm2e statements.
+expl3 = true # Format explicit or package-declared expl3 regions.
+
+[math]
+enabled = true # Set false to retain formula-internal spacing and line breaks.
 
 [protect]
 # Package raw environments and literal code factories receive protection.

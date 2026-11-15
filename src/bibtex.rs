@@ -1,12 +1,53 @@
 //! BibTeX layout with a dedicated value lexer.
 //!
-//! Field order and the source of every value expression are preserved. Braced
+//! Defaults normalize names and assignments while preserving field order and
+//! the source of every value expression. Braced
 //! and quoted values, concatenation, macros, string definitions, and preambles
 //! are parsed without applying LaTeX whitespace transformations inside values.
 
 use crate::syntax::{self, FormatDirectiveState};
 use crate::{CompiledConfig, FormatError};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
+
+mod normalization;
+
+/// Configurable normalization and stable ordering of BibTeX and BibLaTeX data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct BibtexConfig {
+    /// Lowercase entry types and regular field names; align assignments when enabled.
+    pub normalize: bool,
+    /// Align regular field assignments while normalizing.
+    pub align_fields: bool,
+    /// `preserve`, `braces`, or `quotes`; applies only to safe literal value pieces.
+    pub value_delimiters: String,
+    /// Empty preserves order; `canonical`, `alphabetical`, or a list of field names.
+    pub field_order: Vec<String>,
+    /// Sort consecutive regular entries without crossing definitions or comments.
+    pub sort: bool,
+    /// Citation `key` or field names; a leading `-` reverses that criterion.
+    pub sort_by: Vec<String>,
+    pub case_sensitive: bool,
+}
+
+impl Default for BibtexConfig {
+    fn default() -> Self {
+        Self {
+            normalize: true,
+            align_fields: true,
+            value_delimiters: "preserve".into(),
+            field_order: Vec::new(),
+            sort: false,
+            sort_by: vec!["key".into()],
+            case_sensitive: false,
+        }
+    }
+}
+
+pub fn validate(config: &BibtexConfig) -> Result<(), String> {
+    normalization::validate(config)
+}
 
 pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
     let protected = protected_ranges(source)?;
@@ -89,7 +130,14 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
         let base = entry_indent(source, entry_start);
         let indent = format!("{base}{}", config.config.indent.unit("bibtex", kind));
         let body_start = open + 1;
-        let opening = format!("@{kind}{}", char::from(bytes[open]));
+        let normalized_kind;
+        let printed_kind = if config.config.bibtex.normalize {
+            normalized_kind = kind.to_ascii_lowercase();
+            normalized_kind.as_str()
+        } else {
+            kind
+        };
+        let opening = format!("@{printed_kind}{}", char::from(bytes[open]));
         let closing = &source[close..close + 1];
         if kind.eq_ignore_ascii_case("preamble") {
             output.push_str(&format_preamble(
@@ -106,6 +154,7 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                 &indent,
                 newline,
                 kind.eq_ignore_ascii_case("string"),
+                &config.config.bibtex,
             )?);
         }
         copy_start = cursor;
@@ -117,7 +166,11 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
         maximum_blank_lines,
         &protected,
     );
-    Ok(output)
+    if config.config.bibtex.sort {
+        normalization::sort_entries(&output, &config.config.bibtex)
+    } else {
+        Ok(output)
+    }
 }
 
 fn write_outside_protected(
@@ -466,7 +519,17 @@ fn format_fields(
     indent: &str,
     newline: &str,
     string_definition: bool,
+    config: &BibtexConfig,
 ) -> Result<String, FormatError> {
+    if !string_definition
+        && (config.normalize
+            || !config.field_order.is_empty()
+            || config.value_delimiters != "preserve")
+    {
+        return normalization::format_fields(
+            source, start, end, opening, closing, base, indent, newline, config,
+        );
+    }
     let mut output = opening.to_string();
     let mut cursor = start;
     let mut initial_comments = Vec::new();
