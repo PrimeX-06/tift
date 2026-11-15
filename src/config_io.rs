@@ -44,6 +44,7 @@ pub struct Loader {
     documents: HashMap<PathBuf, Arc<Document>>,
     discovered: HashMap<PathBuf, Option<PathBuf>>,
     compiled: HashMap<(Option<PathBuf>, Vec<usize>), CachedConfig>,
+    matching_parents: HashMap<PathBuf, Option<PathBuf>>,
     global: Option<Option<PathBuf>>,
 }
 
@@ -66,6 +67,7 @@ impl Loader {
             documents: HashMap::new(),
             discovered: HashMap::new(),
             compiled: HashMap::new(),
+            matching_parents: HashMap::new(),
             global: None,
         };
         if let Some(path) = loader.explicit.clone() {
@@ -103,7 +105,8 @@ impl Loader {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, rule)| {
-                        matches_path(&rule.matcher, &absolute).then_some(index)
+                        matches_path(&rule.matcher, &absolute, &mut self.matching_parents)
+                            .then_some(index)
                     })
                     .collect()
             })
@@ -113,7 +116,7 @@ impl Loader {
         if let Some(cached) = self.compiled.get(&key) {
             return Ok(EffectiveConfig {
                 config: Arc::clone(&cached.config),
-                excluded: matches_path(&cached.excludes, &absolute),
+                excluded: matches_path(&cached.excludes, &absolute, &mut self.matching_parents),
                 sources: document
                     .as_ref()
                     .map_or_else(Vec::new, |doc| doc.sources.clone()),
@@ -154,7 +157,7 @@ impl Loader {
             );
             let effective = EffectiveConfig {
                 config: Arc::clone(&config),
-                excluded: matches_path(&excludes, &absolute),
+                excluded: matches_path(&excludes, &absolute, &mut self.matching_parents),
                 sources: document
                     .as_ref()
                     .map_or_else(Vec::new, |doc| doc.sources.clone()),
@@ -458,16 +461,39 @@ fn matcher(root: &Path, patterns: &[String]) -> Result<Gitignore, String> {
     builder.build().map_err(|e| e.to_string())
 }
 
-fn matches_path(matcher: &Gitignore, path: &Path) -> bool {
+fn matches_path(
+    matcher: &Gitignore,
+    path: &Path,
+    parents: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> bool {
     // Explicit configurations may live outside the input directory. Patterns
     // only address descendants of their declaring configuration's directory.
-    path.strip_prefix(matcher.path())
-        .ok()
-        .is_some_and(|relative| {
-            matcher
-                .matched_path_or_any_parents(relative, false)
-                .is_ignore()
-        })
+    if let Ok(relative) = path.strip_prefix(matcher.path()) {
+        return matcher
+            .matched_path_or_any_parents(relative, false)
+            .is_ignore();
+    }
+    let (Some(parent), Some(filename)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    // Directory aliases must share the configuration's canonical root, while
+    // a symlinked file keeps its input name for relative pattern matching.
+    let canonical = parents.entry(parent.to_path_buf()).or_insert_with(|| {
+        fs::canonicalize(parent)
+            .ok()
+            .map(|canonical| absolute(&canonical, parent))
+    });
+    canonical.as_ref().is_some_and(|parent| {
+        parent
+            .join(filename)
+            .strip_prefix(matcher.path())
+            .ok()
+            .is_some_and(|relative| {
+                matcher
+                    .matched_path_or_any_parents(relative, false)
+                    .is_ignore()
+            })
+    })
 }
 
 pub fn absolute(path: &Path, cwd: &Path) -> PathBuf {
