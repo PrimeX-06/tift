@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: tift
+        name: tift
+        entry: tift --check
+        language: system
+        types: [file]
+        files: '\.(tex|sty|cls|bib)$'

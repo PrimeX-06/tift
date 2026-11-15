@@ -1,0 +1,47 @@
+[package]
+autotests = false
+autobenches = false
+name = "tift"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A configurable, fast LaTeX source formatter"
+license = "MIT"
+repository = "https://github.com/PrimeX-06/tift"
+documentation = "https://github.com/PrimeX-06/tift/wiki"
+readme = "README.md"
+include = ["/src/**/*.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+keywords = ["latex", "formatter", "tex", "bibtex"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+regex = "1"
+fancy-regex = "0.17"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+memchr = "2"
+ignore = "0.4"
+rayon = "1"
+similar = "2"
+tempfile = "3"
+blake3 = "1"
+serde_json = "1"
+thiserror = "2"
+fs2 = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[[bin]]
+name = "tift"
+path = "src/main.rs"

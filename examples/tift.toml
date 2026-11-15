@@ -1,0 +1,211 @@
+# Enable only the layout changes appropriate for your project.
+[indent]
+style = "spaces"
+width = 4
+preamble = false
+maximum = 40
+
+[indent.rules.document]
+additional = false
+
+[indent.rules.item]
+width = 4
+
+[indent.rules.quote]
+additional = true
+
+[indent.categories.loop]
+width = 4 # Each recognized \foreach loop contributes one level.
+
+# Default alignment includes package table/math environments and TikZ \matrix.
+# Complete headers and column templates stay separate from measured cells.
+[alignment]
+enabled = true
+width = "graphemes" # "display" measures Unicode terminal columns.
+spaces-before = 1
+spaces-after = 1
+align-double-backslash = true
+# The default row regex also recognizes \tabularnewline and its modifiers.
+align-last-row-break = true
+align-content-after-row-break = false
+format-children = true
+multicolumn = true
+short-rows = "align"
+justification = "left"
+regex-engine = "enhanced"
+backtrack-limit = 1000000
+
+[alignment.rules.tabular]
+justification = "left"
+dont-measure = ['\\phantom\{[^}]*\}']
+
+[alignment.rules.align]
+spaces-before = 1
+spaces-after = 1
+
+# Disable selected default alignment rules:
+# [alignment.rules.matrix]
+# enabled = false
+# [alignment.rules.'tabular*']
+# enabled = false
+
+[wrap]
+mode = "preserve" # "wrap" keeps old boundaries and folds long lines; "unwrap" joins prose.
+columns = 88
+when = "after"
+comments = false
+collapse-spaces = true
+huge = "overflow" # "break" allows grapheme-safe splitting of long plain words.
+# prose-commands = ['mytext'] # Permit custom commands at prose line starts.
+# text-commands = ['caption', 'footnote'] # Limit safe standard text parameters; [] disables them.
+# break-chars = ['-'] # Width-triggered tight breaks retain TeX spacing using %.
+# comments = true # Also reflow long trailing comments.
+
+# Arguments expand only with an active width, or explicit mode = "expand".
+# "wrap" supplies wrap.columns when line-width is omitted.
+[arguments]
+mode = "auto"
+split-commas = true
+split-equals = false
+# line-width = 88
+# [arguments.rules.customkeys]
+# argument = 1 # Select the second mandatory brace group.
+# line-width = 60
+# [arguments.rules.includegraphics]
+# optional-argument = 0 # Keep selecting options when overriding the automatic rule.
+# line-width = 60
+
+[sentences]
+enabled = false
+preserve-line-breaks = true
+when = "after"
+indent = ""
+
+[whitespace]
+remove-trailing = true
+before-processing = false
+preserve-blank-lines = true
+max-blank-lines = 2
+line-ending = "preserve"
+final-newline = "preserve"
+
+[breaks]
+enabled = true # Environment/loop boundaries, table rules and eligible captions receive lines.
+
+# Preserve selected boundaries instead of using the environment defaults:
+# [breaks.rules.quote]
+# body = "preserve"
+# end = "preserve"
+
+# Preserve recognized loop boundaries:
+# [breaks.categories.loop]
+# begin = "preserve"
+# body = "preserve"
+# end = "preserve"
+# after = "preserve"
+
+# Table rules inherit the containing environment's row policy.
+# Preserve their boundaries independently:
+# [breaks.categories.table-rule]
+# begin = "preserve"
+# after = "preserve"
+# Override one complete rule:
+# [breaks.rules.cmidrule]
+# begin = "line"
+# after = "line"
+
+# Optional condition boundary changes:
+# [breaks.categories.condition]
+# else-begin = "line"
+# else-after = "line"
+# or-begin = "line"
+# or-after = "line"
+
+# Custom environment header: one optional argument followed by two mandatory ones.
+# [syntax.environment-arguments.custom]
+# optional-arguments = true
+# arguments = 2
+
+# Ordered mandatory / optional / mandatory header:
+# [syntax.environment-arguments.mytable]
+# signature = 'mom'
+
+# Override a custom tcolorbox header with one optional and one mandatory parameter.
+# Literal fixed-arity ordinary tcolorbox factories infer this signature automatically.
+# [syntax.environment-arguments.custombox]
+# optional-arguments = true
+# arguments = 1
+
+[syntax.commands.raw]
+arguments = 1
+optional-arguments = false
+preserve-body = true
+
+[syntax]
+infer-list-environments = true
+foreach = true # Set false to disable dedicated loop recognition.
+
+[syntax.headings.section]
+level = 3
+indent = false
+
+# Custom specials conservatively disable ordinary-text parameter wrapping.
+# [[syntax.special]]
+# name = "custom"
+# begin = '<BEGIN>'
+# end = '<END>'
+# regex = false
+# nested = true
+# verbatim = true
+
+# Algorithm branches return to their matching block's indentation.
+# [[syntax.special]]
+# name = 'algorithmIf'
+# begin = '\If'
+# end = '\EndIf'
+# middle = ['\ElsIf', '\Else']
+# nested = true
+
+[protect]
+# Package raw environments and literal code factories receive protection.
+# Physics delimited matrix arguments stay opaque to outer row/column scans.
+expl3 = true
+dynamic-catcodes = true
+macro-bodies = true
+format-macro-bodies = true
+inactive-branches = true
+
+[[replacements]]
+find = 'TODO'
+replace = 'TODO'
+regex = false
+when = "before"
+scope = "unprotected"
+enabled = false
+
+[[replacements]]
+find = '(?<=\b)colour\b'
+replace = 'color'
+regex = true
+engine = "enhanced"
+when = "after"
+scope = "unprotected"
+count = 1
+backtrack-limit = 1000000
+enabled = false
+
+[files]
+exclude = ["generated/", "vendor/", "*.generated.tex"]
+
+[[overrides]]
+files = ["slides/**/*.tex"]
+
+[overrides.indent]
+width = 2
+
+[overrides.wrap]
+mode = "preserve"
+
+[cache]
+# Disable optional performance caches with false or CLI --no-cache.
+enabled = true

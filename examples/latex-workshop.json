@@ -1,0 +1,8 @@
+{
+    "latex-workshop.formatting.latex": "latexindent",
+    "latex-workshop.formatting.latexindent.path": "tift",
+    "latex-workshop.formatting.latexindent.args": [
+        "--print",
+        "%TMPFILE%"
+    ]
+}
