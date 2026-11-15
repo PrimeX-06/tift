@@ -4,5 +4,9 @@
     "latex-workshop.formatting.latexindent.args": [
         "--print",
         "%TMPFILE%"
-    ]
+    ],
+    "[latex]": {
+        "editor.defaultFormatter": "James-Yu.latex-workshop",
+        "editor.formatOnSave": true
+    }
 }
