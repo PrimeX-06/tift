@@ -247,6 +247,21 @@ impl Printer {
                         break;
                     }
                 }
+                // Keep a source-line comment attached to its statement. Moving
+                // it to column zero would turn code comments into DTX prose on
+                // the next pass and change their prefix again.
+                let mut comment = finish;
+                while matches!(source.as_bytes().get(comment), Some(b' ' | b'\t')) {
+                    comment += 1;
+                }
+                if source.as_bytes().get(comment) == Some(&b'%') {
+                    let end = source[comment..]
+                        .find('\n')
+                        .map_or(source.len(), |n| comment + n);
+                    self.append(" ");
+                    self.append(&source[comment..end]);
+                    finish = end + usize::from(end < source.len());
+                }
                 self.newline();
                 cursor = finish;
                 text = cursor;

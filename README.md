@@ -1,6 +1,6 @@
 # tift — A fast LaTeX and BibTeX formatter
 
-[![Rust 1.90+](https://img.shields.io/badge/Rust-1.90%2B-orange)](https://www.rust-lang.org/)
+[![Rust 1.99.1+](https://img.shields.io/badge/Rust-1.99.1%2B-orange)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents consistently indented, align tables and equations, and format bibliographies from the command line or your editor. Available on Windows, Linux, and macOS.
@@ -47,7 +47,7 @@ Label&Value\\Longer label&42\\
 
 - Indent LaTeX environments, lists, and nested structures.
 - Align table columns, equations, and matrices, and format math spacing.
-- Format BibTeX and BibLaTeX entries, with optional bibliography sorting.
+- Format, sort, and optionally clean up BibTeX and BibLaTeX bibliographies.
 - Wrap long prose and captions to a chosen line width.
 - Support common LaTeX packages and CJK documents.
 - Preserve verbatim content and allow local formatting controls.
@@ -57,7 +57,7 @@ Label&Value\\Longer label&42\\
 
 Download an archive for your platform from [GitHub Releases](https://github.com/PrimeX-06/tift/releases), extract the executable, and add its directory to `PATH`.
 
-Or install with Cargo using **Rust 1.90 or later**:
+Or install with Cargo using **Rust 1.99.1 or later**:
 
 ```sh
 cargo install tift --locked --registry crates-io
@@ -74,6 +74,7 @@ tift main.tex                       # format a file in place
 tift .                              # format a project recursively
 tift --check .                      # check formatting in CI
 tift --wrap --wrap-width 88 main.tex # wrap long prose
+tift --dump-config > tift.toml      # create a project configuration
 ```
 
 Formatting preserves prose line breaks by default. Add `--backup` to keep a copy of each file before formatting.
@@ -94,6 +95,8 @@ columns = 88
 ```
 
 tift discovers project settings automatically. The [configuration guide](https://github.com/PrimeX-06/tift/wiki/Configuration-Guide) explains setup; the [reference](https://github.com/PrimeX-06/tift/wiki/Configuration) lists all options.
+
+Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
 
 ## Editor
 

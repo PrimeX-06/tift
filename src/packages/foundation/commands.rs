@@ -236,6 +236,9 @@ fn separated_star(source: &str, name: &str, end: usize) -> bool {
 
 /// Ordered citation notes and delayed macro-patching arguments.
 pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    if let Some(shape) = stored_kernel_signature(name) {
+        return Some(shape);
+    }
     let separated = separated_star(source, name, end);
     Some(match name.trim_end_matches('*') {
         "citet" | "citep" | "citeauthor" | "citeyear" => {
@@ -251,20 +254,66 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
         "ifpatchable" if separated => "mmmm",
         "ifpatchable" if name.ends_with('*') => "mmm",
         "ifpatchable" => "mmmm",
+        // etoolbox.sty:130ff: one tested token/name, then two branch arguments.
+        "ifundef" | "ifcsundef" | "ifdef" | "ifcsdef" | "ifdefvoid" | "ifcsvoid" | "ifdefempty"
+        | "ifcsempty" | "ifblank" | "ifstrempty" | "iftoggle" | "ifbool" => "mmm",
+        "ifstrequal" | "ifdefequal" | "ifcsequal" | "ifdefstring" | "ifcsstring" => "mmmm",
+        "ifnumcomp" | "ifdimcomp" => "mmmmm",
+        // KOMA-Script TOC hooks; titling.sty title/author/date hooks.
+        "BeforeStartingTOC" | "AfterStartingTOC" => "om",
+        "pretitle" | "posttitle" | "preauthor" | "postauthor" | "predate" | "postdate" => "m",
+        // doc.sty:380--388 reads a comma list of control-sequence names.
+        "regexp" | "dirname" | "DoNotIndex" => "m",
+        "lily" | "lilypond" => "om",
+        // lyluatex.sty:254--280 stores the display wrappers as source data;
+        // lyenv only changes optional-argument dispatch for a literal name.
+        "lysetverbenv" => "mm",
+        "lyenv" => "m",
         _ => return subcaption_command_signature(source, name, end),
     })
 }
 
 pub(crate) fn is_metadata_command(name: &str) -> bool {
-    matches!(
-        name.trim_end_matches('*'),
-        "patchcmd" | "apptocmd" | "pretocmd" | "appto" | "preto" | "ifpatchable"
-    )
+    stored_kernel_signature(name).is_some()
+        || matches!(
+            name.trim_end_matches('*'),
+            "patchcmd"
+                | "apptocmd"
+                | "pretocmd"
+                | "appto"
+                | "preto"
+                | "ifpatchable"
+                | "BeforeStartingTOC"
+                | "AfterStartingTOC"
+                | "pretitle"
+                | "posttitle"
+                | "preauthor"
+                | "postauthor"
+                | "predate"
+                | "postdate"
+                | "regexp"
+                | "dirname"
+                | "DoNotIndex"
+                | "lily"
+                | "lilypond"
+                | "lysetverbenv"
+                | "lyenv"
+        )
+}
+
+/// Recording sinks consume source data without executing a supplied TeX body.
+/// Deferred hooks and patches have a different effect even though their stored
+/// arguments are opaque while the registration command itself is parsed.
+pub(crate) fn is_recording_command(name: &str) -> bool {
+    matches!(name, "lily" | "lilypond")
 }
 
 /// Search/replacement tokens and appended code retain their source bytes.
 /// Immediate success/failure branches remain available for nested formatting.
 pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if let Some(shape) = stored_kernel_signature(name) {
+        return crate::syntax::arguments::signature_end(source, end, shape);
+    }
     let shape = match name.trim_end_matches('*') {
         "patchcmd" => "ommm",
         "apptocmd" | "pretocmd" => "omm",
@@ -272,11 +321,25 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
         "ifpatchable" if separated_star(source, name, end) => "mm",
         "ifpatchable" if name.ends_with('*') => "m",
         "ifpatchable" => "mm",
+        "BeforeStartingTOC" | "AfterStartingTOC" => "om",
+        "pretitle" | "posttitle" | "preauthor" | "postauthor" | "predate" | "postdate"
+        | "regexp" | "dirname" | "DoNotIndex" => "m",
+        "lily" | "lilypond" => "om",
+        "lysetverbenv" => "mm",
+        "lyenv" => "m",
         _ => return subcaption_command_header_end(source, name, end),
     };
     // Incomplete calls do not establish a metadata boundary.
     crate::syntax::arguments::signature_end(source, end, command_signature(source, name, end)?)?;
     crate::syntax::arguments::signature_end(source, end, shape).filter(|&finish| finish > end)
+}
+
+fn stored_kernel_signature(name: &str) -> Option<&'static str> {
+    match name {
+        // The kernel stores this control-sequence name in its preamble list.
+        "@onlypreamble" => Some("m"),
+        _ => None,
+    }
 }
 
 fn mandatory_argument_end(source: &str, start: usize) -> Option<usize> {

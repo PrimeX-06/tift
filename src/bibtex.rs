@@ -6,18 +6,20 @@
 //! are parsed without applying LaTeX whitespace transformations inside values.
 
 use crate::syntax::{self, FormatDirectiveState};
-use crate::{CompiledConfig, FormatError};
+use crate::{CompiledConfig, Diagnostic, FormatError, FormatOutput, Severity};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::ops::Range;
 
+mod cleanup;
 mod normalization;
+pub use cleanup::CleanupConfig;
 
-/// Configurable normalization and stable ordering of BibTeX and BibLaTeX data.
+/// BibTeX layout and sorting, with optional data edits in `cleanup`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BibtexConfig {
-    /// Normalize assignment layout; align assignments when enabled.
+    /// Normalize assignment layout. Field alignment also requires `align_fields`.
     pub normalize: bool,
     /// `preserve`, `lower`, or `upper` for entry types and regular field names.
     pub name_case: String,
@@ -31,7 +33,10 @@ pub struct BibtexConfig {
     pub sort: bool,
     /// Citation `key` or field names; a leading `-` reverses that criterion.
     pub sort_by: Vec<String>,
+    /// Compare bibliography sort values case sensitively when sorting is enabled.
     pub case_sensitive: bool,
+    /// Optional data transformations, disabled by default.
+    pub cleanup: CleanupConfig,
 }
 
 impl Default for BibtexConfig {
@@ -45,6 +50,7 @@ impl Default for BibtexConfig {
             sort: false,
             sort_by: vec!["key".into()],
             case_sensitive: false,
+            cleanup: CleanupConfig::default(),
         }
     }
 }
@@ -60,12 +66,99 @@ impl BibtexConfig {
 }
 
 pub fn validate(config: &BibtexConfig) -> Result<(), String> {
-    normalization::validate(config)
+    normalization::validate(config)?;
+    cleanup::validate(&config.cleanup)
 }
 
 pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
-    let protected = protected_ranges(source)?;
+    format_bibtex_inner(source, config).map(|output| output.text)
+}
+
+/// Format bibliography data and report source offsets for unsafe or malformed
+/// constructs. Syntax errors preserve the complete original input.
+pub fn format_bibtex_detailed(
+    source: &str,
+    config: &CompiledConfig,
+) -> Result<FormatOutput, FormatError> {
+    match format_bibtex_inner(source, config) {
+        Ok(output) => Ok(output),
+        Err(FormatError::Syntax(message)) => {
+            // A failed transformed document must still refer to the caller's
+            // original offsets. Recheck only this error path without cleanup.
+            let message = if config.config.bibtex.cleanup.enabled {
+                match format_bibtex_layout(source, config) {
+                    Err(FormatError::Syntax(original)) => original,
+                    _ => message,
+                }
+            } else {
+                message
+            };
+            let (offset, description) = message
+                .strip_prefix("BibTeX at byte ")
+                .and_then(|rest| rest.split_once(": "))
+                .and_then(|(offset, description)| {
+                    offset
+                        .parse::<usize>()
+                        .ok()
+                        .map(|offset| (offset, description))
+                })
+                .unwrap_or((0, message.as_str()));
+            let mut start = offset.min(source.len());
+            while !source.is_char_boundary(start) {
+                start -= 1;
+            }
+            let end = source[start..]
+                .chars()
+                .next()
+                .map_or(start, |character| start + character.len_utf8());
+            Ok(FormatOutput {
+                text: source.to_owned(),
+                diagnostics: vec![Diagnostic {
+                    severity: Severity::Error,
+                    message: description.to_owned(),
+                    span: start..end,
+                }],
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn format_bibtex_inner(source: &str, config: &CompiledConfig) -> Result<FormatOutput, FormatError> {
+    let prepared = cleanup::prepare(source, &config.config.bibtex.cleanup)?;
+    let (entries, mut diagnostics, protected) = prepared.map_or_else(
+        || (Vec::new(), Vec::new(), None),
+        |prepared| {
+            (
+                prepared.entries,
+                prepared.diagnostics,
+                Some(prepared.protected),
+            )
+        },
+    );
+    let text = format_bibtex_prepared(source, config, entries, protected, &mut diagnostics)?;
+    Ok(FormatOutput { text, diagnostics })
+}
+
+fn format_bibtex_layout(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
+    format_bibtex_prepared(source, config, Vec::new(), None, &mut Vec::new())
+}
+
+fn format_bibtex_prepared(
+    source: &str,
+    config: &CompiledConfig,
+    prepared: Vec<cleanup::Entry<'_>>,
+    protected: Option<Vec<Range<usize>>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<String, FormatError> {
+    let mut prepared = prepared.into_iter().peekable();
+    let protected = match protected {
+        Some(ranges) => ranges,
+        None => protected_ranges(source)?,
+    };
     let mut output = String::with_capacity(source.len());
+    let mut outside_blanks = 0;
+    let mut source_map = Vec::new();
     let maximum_blank_lines = if config.config.whitespace.preserve_blank_lines {
         config.config.whitespace.max_blank_lines
     } else {
@@ -90,7 +183,8 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
             continue;
         }
         if bytes[cursor] != b'@' {
-            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+            cursor = memchr::memchr2(b'@', b'%', &bytes[cursor + 1..])
+                .map_or(source.len(), |offset| cursor + 1 + offset);
             continue;
         }
         let entry_start = cursor;
@@ -115,10 +209,12 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                     copy_start..entry_start,
                     maximum_blank_lines,
                     &protected,
+                    &mut outside_blanks,
                 );
                 output.push('@');
                 output.push_str(&config.config.bibtex.name(kind));
                 output.push_str(&source[type_start + kind.len()..cursor]);
+                outside_blanks = 0;
                 copy_start = cursor;
                 continue;
             }
@@ -127,7 +223,17 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                 "expected '{' or '(' after BibTeX entry type",
             ));
         }
-        let close = if kind.eq_ignore_ascii_case("comment") {
+        let prepared_entry = if prepared
+            .peek()
+            .is_some_and(|entry| entry.span.start == entry_start)
+        {
+            prepared.next()
+        } else {
+            None
+        };
+        let close = if let Some(entry) = &prepared_entry {
+            entry.span.end - 1
+        } else if kind.eq_ignore_ascii_case("comment") {
             find_comment_end(source, open)?
         } else {
             find_entry_end(source, open)?
@@ -140,10 +246,12 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                 copy_start..entry_start,
                 maximum_blank_lines,
                 &protected,
+                &mut outside_blanks,
             );
             output.push('@');
             output.push_str(&config.config.bibtex.name(kind));
             output.push_str(&source[type_start + kind.len()..cursor]);
+            outside_blanks = 0;
             copy_start = cursor;
             continue;
         }
@@ -153,14 +261,32 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
             copy_start..entry_start,
             maximum_blank_lines,
             &protected,
+            &mut outside_blanks,
         );
+        if prepared_entry.as_ref().is_some_and(|entry| entry.removed) {
+            copy_start = cursor;
+            continue;
+        }
         let base = entry_indent(source, entry_start);
         let indent = format!("{base}{}", config.config.indent.unit("bibtex", kind));
         let body_start = open + 1;
         let printed_kind = config.config.bibtex.name(kind);
         let opening = format!("@{printed_kind}{}", char::from(bytes[open]));
         let closing = &source[close..close + 1];
-        if kind.eq_ignore_ascii_case("preamble") {
+        let printed_start = output.len();
+        let mut origins = Vec::new();
+        if let Some(entry) = prepared_entry {
+            output.push_str(&entry.format(
+                source,
+                &opening,
+                closing,
+                &base,
+                &indent,
+                newline,
+                &config.config.bibtex,
+                config.config.bibtex.sort.then_some(&mut origins),
+            ));
+        } else if kind.eq_ignore_ascii_case("preamble") {
             output.push_str(&format_preamble(
                 source, body_start, close, &opening, closing, &base, &indent, newline,
             )?);
@@ -176,8 +302,18 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                 newline,
                 kind.eq_ignore_ascii_case("string"),
                 &config.config.bibtex,
+                config.config.bibtex.sort.then_some(&mut origins),
             )?);
         }
+        if config.config.bibtex.sort {
+            source_map.extend(origins.into_iter().map(|(printed, original)| {
+                (
+                    printed.start + printed_start..printed.end + printed_start,
+                    original,
+                )
+            }));
+        }
+        outside_blanks = 0;
         copy_start = cursor;
     }
     write_outside_protected(
@@ -186,12 +322,25 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
         copy_start..source.len(),
         maximum_blank_lines,
         &protected,
+        &mut outside_blanks,
     );
-    if config.config.bibtex.sort {
-        normalization::sort_entries(&output, &config.config.bibtex)
+    let text = if config.config.bibtex.sort {
+        let (text, mut warnings) = normalization::sort_entries(&output, &config.config.bibtex)?;
+        for warning in &mut warnings {
+            let entry =
+                source_map.partition_point(|(printed, _)| printed.end <= warning.span.start);
+            if let Some((_, original)) = source_map.get(entry).filter(|(printed, _)| {
+                printed.start <= warning.span.start && warning.span.end <= printed.end
+            }) {
+                warning.span = original.clone();
+            }
+        }
+        diagnostics.extend(warnings);
+        text
     } else {
-        Ok(output)
-    }
+        output
+    };
+    Ok(text)
 }
 
 fn write_outside_protected(
@@ -200,6 +349,7 @@ fn write_outside_protected(
     span: Range<usize>,
     maximum_blank_lines: Option<usize>,
     protected: &[Range<usize>],
+    blanks: &mut usize,
 ) {
     let mut cursor = span.start;
     for range in protected[protected.partition_point(|range| range.end <= span.start)..]
@@ -208,11 +358,17 @@ fn write_outside_protected(
     {
         let start = range.start.max(span.start);
         let end = range.end.min(span.end);
-        write_outside(output, &source[cursor..start], maximum_blank_lines);
+        write_outside(output, &source[cursor..start], maximum_blank_lines, blanks);
         output.push_str(&source[start..end]);
+        *blanks = 0;
         cursor = end;
     }
-    write_outside(output, &source[cursor..span.end], maximum_blank_lines);
+    write_outside(
+        output,
+        &source[cursor..span.end],
+        maximum_blank_lines,
+        blanks,
+    );
 }
 
 fn physical_line_start(source: &str, cursor: usize) -> usize {
@@ -338,22 +494,26 @@ pub(crate) fn protected_ranges(source: &str) -> Result<Vec<Range<usize>>, Format
     Ok(ranges)
 }
 
-fn write_outside(output: &mut String, text: &str, maximum_blank_lines: Option<usize>) {
+fn write_outside(
+    output: &mut String,
+    text: &str,
+    maximum_blank_lines: Option<usize>,
+    blanks: &mut usize,
+) {
     let Some(maximum) = maximum_blank_lines else {
         output.push_str(text);
         return;
     };
     let mut line_start = output.is_empty() || output.ends_with('\n');
-    let mut blanks = 0usize;
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\r', '\n']);
         if line_start && line.ends_with('\n') && body.trim_matches([' ', '\t']).is_empty() {
-            blanks += 1;
-            if blanks <= maximum {
+            *blanks = blanks.saturating_add(1);
+            if *blanks <= maximum {
                 output.push_str(line);
             }
         } else {
-            blanks = 0;
+            *blanks = 0;
             output.push_str(line);
         }
         line_start = line.ends_with('\n');
@@ -506,7 +666,13 @@ fn scan_entry_end(
                 }
                 cursor = finish;
             }
-            _ => cursor += source[cursor..].chars().next().unwrap().len_utf8(),
+            _ => {
+                let start = cursor + 1;
+                let structural = memchr::memchr3(b'\\', b'{', b'}', &bytes[start..])
+                    .map_or(bytes.len(), |offset| start + offset);
+                cursor = memchr::memchr3(b'"', b'%', b')', &bytes[start..structural])
+                    .map_or(structural, |offset| start + offset);
+            }
         }
     }
     Err(syntax_error(open, "unterminated entry or quoted value"))
@@ -541,6 +707,7 @@ fn format_fields(
     newline: &str,
     string_definition: bool,
     config: &BibtexConfig,
+    mut origins: Option<&mut Vec<(Range<usize>, Range<usize>)>>,
 ) -> Result<String, FormatError> {
     if !string_definition
         && (config.normalize
@@ -549,7 +716,7 @@ fn format_fields(
             || config.value_delimiters != "preserve")
     {
         return normalization::format_fields(
-            source, start, end, opening, closing, base, indent, newline, config,
+            source, start, end, opening, closing, base, indent, newline, config, origins,
         );
     }
     let mut output = opening.to_string();
@@ -625,14 +792,21 @@ fn format_fields(
         cursor = next;
         write_comments(&mut output, &comments, indent, newline);
         let (value, next) = read_expression(source, cursor, end)?;
+        let (next, comments) = skip_trivia(source, next, end);
         output.push_str(indent);
         output.push_str(name);
         output.push_str(" = ");
-        output.push_str(&source[value]);
-        output.push(',');
+        let printed_start = output.len();
+        output.push_str(&source[value.clone()]);
+        if let Some(origins) = &mut origins {
+            origins.push((printed_start..output.len(), value));
+        }
+        // BibTeX string commands accept no automatically added trailing comma.
+        // Preserve an authored comma, including separators between assignments.
+        if !string_definition || source.as_bytes().get(next) == Some(&b',') {
+            output.push(',');
+        }
         output.push_str(newline);
-        cursor = next;
-        let (next, comments) = skip_trivia(source, cursor, end);
         cursor = next;
         write_comments(&mut output, &comments, indent, newline);
         if cursor < end {
@@ -763,7 +937,10 @@ fn braced_value_end(source: &str, start: usize, end: usize) -> Result<usize, For
                     return Ok(cursor);
                 }
             }
-            _ => cursor += source[cursor..].chars().next().unwrap().len_utf8(),
+            _ => {
+                cursor = memchr::memchr3(b'\\', b'{', b'}', &source.as_bytes()[cursor + 1..end])
+                    .map_or(end, |offset| cursor + 1 + offset)
+            }
         }
     }
     Err(syntax_error(start, "unterminated braced value"))
@@ -788,8 +965,15 @@ fn quoted_value_end(source: &str, start: usize, end: usize) -> Result<usize, For
                 braces -= 1;
                 cursor += 1;
             }
+            b'}' => return Err(syntax_error(cursor, "unmatched '}' in quoted value")),
             b'"' if braces == 0 => return Ok(cursor + 1),
-            _ => cursor += source[cursor..].chars().next().unwrap().len_utf8(),
+            _ => {
+                let start = cursor + 1;
+                let structural = memchr::memchr3(b'\\', b'{', b'}', &source.as_bytes()[start..end])
+                    .map_or(end, |offset| start + offset);
+                cursor = memchr::memchr(b'"', &source.as_bytes()[start..structural])
+                    .map_or(structural, |offset| start + offset);
+            }
         }
     }
     Err(syntax_error(start, "unterminated quoted value"))

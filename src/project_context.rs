@@ -46,6 +46,9 @@ struct InputGraph {
     file_ends: HashMap<PathBuf, usize>,
     file_inference_ends: HashMap<PathBuf, usize>,
     file_options: HashMap<PathBuf, Arc<Config>>,
+    alias_events: HashMap<PathBuf, Vec<tift::config::EnvironmentAliasEvent>>,
+    argument_events: HashMap<PathBuf, Vec<tift::config::EnvironmentArgumentEvent>>,
+    package_events: HashMap<PathBuf, Vec<tift::config::PackageLoadEvent>>,
     preamble_end: Option<usize>,
     revision: u64,
     last_options: Option<DeclarationMemo>,
@@ -95,7 +98,36 @@ struct Input {
     span: Range<usize>,
 }
 
+type DeclarationSnapshot = (
+    std::collections::BTreeMap<String, Option<tift::config::EnvironmentAlias>>,
+    std::collections::BTreeMap<String, Option<tift::config::EnvironmentArguments>>,
+    std::collections::BTreeMap<String, bool>,
+);
+
+fn declaration_snapshot(source: &str, config: &Config) -> DeclarationSnapshot {
+    let model = tift::source_model::SourceModel::from_declaration_source(source, config);
+    let aliases = model
+        .exported_aliases()
+        .iter()
+        .map(|(name, alias)| (name.clone(), Some(alias.clone())))
+        .chain(
+            model
+                .exported_unknown_aliases()
+                .iter()
+                .map(|name| (name.clone(), None)),
+        )
+        .collect();
+    (
+        aliases,
+        model.exported_environment_arguments().clone(),
+        model.exported_packages(),
+    )
+}
+
 impl InputGraph {
+    fn declaration_snapshot(&self, config: &Config) -> DeclarationSnapshot {
+        declaration_snapshot(&self.source, config)
+    }
     fn expand_input_name(
         &mut self,
         expression: &str,
@@ -365,12 +397,10 @@ impl InputGraph {
 
         let boundary = if self.boundary_policy_refused {
             syntax::DeclarationReuseBoundary::PolicyRefused
+        } else if self.inference_source.len() == self.source.len() {
+            inferred_boundary
         } else {
-            if self.inference_source.len() == self.source.len() {
-                inferred_boundary
-            } else {
-                syntax::declaration_reuse_boundary_status(&self.source, config)
-            }
+            syntax::declaration_reuse_boundary_status(&self.source, config)
         };
 
         self.boundary_policy_refused |= boundary == syntax::DeclarationReuseBoundary::PolicyRefused;
@@ -679,6 +709,17 @@ impl ProjectContext {
                     )?,
                 )
             };
+            let mut options = options.as_ref().clone();
+            if let Some(events) = graph.alias_events.get(&path) {
+                options.syntax.inferred_environment_aliases.clear();
+                options.syntax.environment_alias_events = events.clone();
+            }
+            if let Some(events) = graph.argument_events.get(&path) {
+                options.syntax.environment_argument_events = events.clone();
+            }
+            if let Some(events) = graph.package_events.get(&path) {
+                options.syntax.package_load_events = events.clone();
+            }
             self.compile_options(&config, &options)?
         } else {
             // Sibling declarations only supply list environment names. With
@@ -766,6 +807,23 @@ impl ProjectContext {
             return Ok(());
         }
         let source = self.read_normalized_source(path)?;
+        let loader_occurrences = tift::source_model::SourceModel::loader_occurrences(&source);
+        let (entry_aliases, entry_arguments, entry_packages) = graph.declaration_snapshot(config);
+        let mut alias_events = vec![tift::config::EnvironmentAliasEvent {
+            at: 0,
+            loader: None,
+            aliases: entry_aliases,
+        }];
+        let mut argument_events = vec![tift::config::EnvironmentArgumentEvent {
+            at: 0,
+            loader: None,
+            arguments: entry_arguments,
+        }];
+        let mut package_events = vec![tift::config::PackageLoadEvent {
+            at: 0,
+            loader: None,
+            packages: entry_packages,
+        }];
         let mut cursor = 0;
         let candidates = input_candidates(&source);
         for input in candidates {
@@ -830,6 +888,10 @@ impl ProjectContext {
                 graph.preamble_end =
                     document_start.map(|start| graph.source.len() + start.saturating_sub(cursor));
             }
+            let mut alias_prefix = graph.source.clone();
+            alias_prefix.push_str(&source[cursor..input.span.start]);
+            let (before_aliases, before_arguments, before_packages) =
+                declaration_snapshot(&alias_prefix, config);
             graph.append_prepared_input(
                 &source[cursor..input.span.start],
                 &source[input.span.clone()],
@@ -846,6 +908,39 @@ impl ProjectContext {
                 }
             }
             graph.append_line("");
+            let (after_aliases, after_arguments, after_packages) =
+                graph.declaration_snapshot(config);
+            let changes = before_aliases
+                .keys()
+                .chain(after_aliases.keys())
+                .filter(|name| before_aliases.get(*name) != after_aliases.get(*name))
+                .map(|name| (name.clone(), after_aliases.get(name).cloned().flatten()))
+                .collect();
+            alias_events.push(tift::config::EnvironmentAliasEvent {
+                at: input.span.end,
+                loader: loader_occurrences.get(&input.span.start).cloned(),
+                aliases: changes,
+            });
+            let changes = before_arguments
+                .keys()
+                .chain(after_arguments.keys())
+                .filter(|name| before_arguments.get(*name) != after_arguments.get(*name))
+                .map(|name| (name.clone(), after_arguments.get(name).cloned().flatten()))
+                .collect();
+            argument_events.push(tift::config::EnvironmentArgumentEvent {
+                at: input.span.end,
+                loader: loader_occurrences.get(&input.span.start).cloned(),
+                arguments: changes,
+            });
+            let packages = after_packages
+                .into_iter()
+                .filter(|(name, state)| before_packages.get(name) != Some(state))
+                .collect();
+            package_events.push(tift::config::PackageLoadEvent {
+                at: input.span.end,
+                loader: loader_occurrences.get(&input.span.start).cloned(),
+                packages,
+            });
             cursor = input.span.end;
         }
         if path == root && graph.preamble_end.is_none() && source.contains("document") {
@@ -858,6 +953,13 @@ impl ProjectContext {
         }
         graph.append_line(&source[cursor..]);
         if !graph.file_ends.contains_key(path) {
+            graph.alias_events.insert(path.to_path_buf(), alias_events);
+            graph
+                .argument_events
+                .insert(path.to_path_buf(), argument_events);
+            graph
+                .package_events
+                .insert(path.to_path_buf(), package_events);
             // Retain the exact first-inclusion state. Incomplete file tails
             // keep lazy restoration; a later source may complete their reader.
             let _ = graph.infer(path, config);

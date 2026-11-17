@@ -26,6 +26,7 @@ pub struct WrapConfig {
     /// `preserve`, `wrap`, `unwrap`, or `rewrap` (join then wrap).
     pub mode: String,
     pub columns: usize,
+    #[serde(rename = "stage")]
     pub when: Stage,
     /// Reflow consecutive comment-only lines and long trailing comments.
     pub comments: bool,
@@ -48,6 +49,7 @@ pub struct WrapConfig {
     /// Inserted wrap separator. Empty chooses the source line ending.
     pub separator: String,
     /// `overflow` keeps words intact; `break` splits plain text at graphemes.
+    #[serde(rename = "long-words")]
     pub huge: String,
 }
 
@@ -77,6 +79,7 @@ pub struct SentenceConfig {
     pub enabled: bool,
     /// Keep existing physical line boundaries inside a sentence.
     pub preserve_line_breaks: bool,
+    #[serde(rename = "stage")]
     pub when: Stage,
     pub abbreviations: Vec<String>,
     /// Optional regex matching the beginning of the following sentence.
@@ -175,7 +178,7 @@ pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<Compiled
         return Err("wrap.columns must be between 1 and 1000000".into());
     }
     if !matches!(wrap.huge.as_str(), "overflow" | "break") {
-        return Err("wrap.huge must be overflow or break".into());
+        return Err("wrap.long-words must be overflow or break".into());
     }
     let mut prose_commands = HashSet::new();
     for name in &wrap.prose_commands {
@@ -2185,8 +2188,8 @@ fn builtin_prose_command(name: &str) -> bool {
 }
 
 fn is_non_prose_environment(name: &str, config: &crate::CompiledConfig) -> bool {
-    crate::packages::visual_science::is_non_prose(name)
-        || crate::packages::tikz_derived::is_non_prose(name)
+    crate::packages::visual_languages::is_non_prose(name)
+        || crate::packages::circuits_timing::is_non_prose(name)
         || crate::packages::tikz_diagrams::is_non_prose(name)
         || crate::tikz_scan::environment(name)
         || matches!(

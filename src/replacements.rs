@@ -31,6 +31,7 @@ pub struct ReplacementConfig {
     pub replace: String,
     pub regex: bool,
     pub engine: Engine,
+    #[serde(rename = "stage")]
     pub when: When,
     pub scope: Scope,
     pub enabled: bool,

@@ -108,13 +108,20 @@ pub(super) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range
     }
     let mut dollar = None;
     let mut cursor = 0;
+    let mut protection_index = 0;
+    let mut absent_closers = [false; 2];
     while cursor < source.len() {
-        if syntax::is_protected(cursor, protected) {
-            cursor = protected
-                .iter()
-                .find(|range| range.contains(&cursor))
-                .expect("protected range")
-                .end;
+        while protected
+            .get(protection_index)
+            .is_some_and(|range| range.end <= cursor)
+        {
+            protection_index += 1;
+        }
+        if let Some(range) = protected
+            .get(protection_index)
+            .filter(|range| range.start <= cursor)
+        {
+            cursor = range.end;
             continue;
         }
         if source.as_bytes()[cursor] == b'%' {
@@ -142,13 +149,15 @@ pub(super) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range
         }
         if let Some((name, end)) = syntax::command_at(source, cursor) {
             if matches!(name, "[" | "(") {
-                let close = if name == "[" { "\\]" } else { "\\)" };
-                if let Some((start, _, finish)) = commands(&source[end..], &[])
-                    .into_iter()
-                    .find(|(start, _, _)| source[end + start..].starts_with(close))
-                {
-                    let _ = start;
-                    ranges.push(cursor..end + finish);
+                let close = if name == "[" { "]" } else { ")" };
+                let slot = usize::from(name == "[");
+                if !absent_closers[slot] {
+                    if let Some(finish) = find_math_close(source, end, close, protected) {
+                        ranges.push(cursor..finish);
+                        cursor = finish;
+                        continue;
+                    }
+                    absent_closers[slot] = true;
                 }
             } else if super::mathematical_command(name) {
                 let shape = crate::packages::math::command(name)
@@ -168,6 +177,8 @@ pub(super) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range
                 );
                 if let Some(last) = args.last() {
                     ranges.push(cursor..last.end);
+                    cursor = last.end;
+                    continue;
                 }
             }
             cursor = end;
@@ -180,4 +191,36 @@ pub(super) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range
         }
     }
     super::merged(ranges)
+}
+
+fn find_math_close(
+    source: &str,
+    mut cursor: usize,
+    close: &str,
+    protected: &[Range<usize>],
+) -> Option<usize> {
+    let mut index = protected.partition_point(|range| range.end <= cursor);
+    while cursor < source.len() {
+        while protected
+            .get(index)
+            .is_some_and(|range| range.end <= cursor)
+        {
+            index += 1;
+        }
+        if let Some(range) = protected.get(index).filter(|range| range.start <= cursor) {
+            cursor = range.end;
+        } else if source.as_bytes()[cursor] == b'%' {
+            cursor = source[cursor..]
+                .find('\n')
+                .map_or(source.len(), |end| cursor + end + 1);
+        } else if let Some((name, end)) = syntax::command_at(source, cursor) {
+            if name == close {
+                return Some(end);
+            }
+            cursor = syntax::primitive_data_end(source, name, end).unwrap_or(end);
+        } else {
+            cursor += source[cursor..].chars().next()?.len_utf8();
+        }
+    }
+    None
 }

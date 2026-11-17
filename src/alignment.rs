@@ -87,9 +87,7 @@ const DEFAULT_ROW_BREAK: &str = r"\\\\\*?|\\tabularnewline\*?";
 #[serde(rename_all = "kebab-case")]
 pub enum Width {
     #[default]
-    #[serde(alias = "grapheme")]
     Graphemes,
-    #[serde(alias = "unicode-display")]
     Display,
 }
 
@@ -124,7 +122,6 @@ pub enum RegexEngine {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AlignmentConfig {
     pub enabled: bool,
-    #[serde(alias = "width-mode")]
     pub width: Width,
     pub environments: Vec<String>,
     pub delimiter: String,
@@ -136,15 +133,11 @@ pub struct AlignmentConfig {
     pub spaces_before: usize,
     pub spaces_after: usize,
     pub spaces_before_row_break: usize,
+    #[serde(rename = "align-row-breaks")]
     pub align_double_backslash: bool,
-    #[serde(
-        rename = "align-last-row-break",
-        alias = "align-final-double-backslash"
-    )]
+    #[serde(rename = "align-last-row-break")]
     pub align_final_double_backslash: bool,
-    #[serde(alias = "align-content-after-double-backslash")]
     pub align_content_after_row_break: bool,
-    #[serde(alias = "spaces-after-double-backslash")]
     pub spaces_after_row_break: usize,
     pub format_children: bool,
     pub multicolumn: bool,
@@ -214,11 +207,9 @@ pub struct AlignmentRule {
     pub spaces_before: Option<usize>,
     pub spaces_after: Option<usize>,
     pub spaces_before_row_break: Option<usize>,
+    #[serde(rename = "align-row-breaks")]
     pub align_double_backslash: Option<bool>,
-    #[serde(
-        rename = "align-last-row-break",
-        alias = "align-final-double-backslash"
-    )]
+    #[serde(rename = "align-last-row-break")]
     pub align_final_double_backslash: Option<bool>,
     pub align_content_after_row_break: Option<bool>,
     pub spaces_after_row_break: Option<usize>,
@@ -530,6 +521,9 @@ fn format_alignment_with_context(
         && !tikz_matrix
         && !markup
         && config.config.syntax.environment_pattern.is_none()
+        && config.config.syntax.environment_aliases.is_empty()
+        && config.config.syntax.inferred_environment_aliases.is_empty()
+        && config.config.syntax.environment_alias_events.is_empty()
         && !source.match_indices("\\begin{").any(|(start, _)| {
             let rest = &source[start + "\\begin{".len()..];
             rest.find('}').is_some_and(|end| {

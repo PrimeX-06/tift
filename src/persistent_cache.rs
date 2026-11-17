@@ -106,6 +106,31 @@ impl PersistentCache {
             options.cache = Default::default();
             let mut fingerprint = blake3::Hasher::new();
             serde_json::to_writer(&mut fingerprint, &options).ok()?;
+            // Imported bindings affect formatting while remaining absent from
+            // serialized user configuration. Include them in result identity.
+            fingerprint.update(b"project-environment-aliases");
+            serde_json::to_writer(
+                &mut fingerprint,
+                &options.syntax.inferred_environment_aliases,
+            )
+            .ok()?;
+            fingerprint.update(b"project-environment-alias-events");
+            serde_json::to_writer(&mut fingerprint, &options.syntax.environment_alias_events)
+                .ok()?;
+            fingerprint.update(b"project-environment-arguments");
+            serde_json::to_writer(
+                &mut fingerprint,
+                &options.syntax.inferred_environment_arguments,
+            )
+            .ok()?;
+            fingerprint.update(b"project-environment-argument-events");
+            serde_json::to_writer(
+                &mut fingerprint,
+                &options.syntax.environment_argument_events,
+            )
+            .ok()?;
+            fingerprint.update(b"project-package-load-events");
+            serde_json::to_writer(&mut fingerprint, &options.syntax.package_load_events).ok()?;
             entry.insert(Options {
                 _config: Arc::clone(config),
                 fingerprint: fingerprint.finalize(),

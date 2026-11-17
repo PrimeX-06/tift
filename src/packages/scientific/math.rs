@@ -4,7 +4,7 @@
 #[derive(Clone, Copy)]
 pub(crate) struct Signature {
     pub shape: &'static str,
-    // M = math; I = inherited text/math; U = options or declaration data.
+    // M = math; T = text; I = inherited text/math; U = literal data.
     pub domains: &'static str,
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn command(name: &str) -> Option<Signature> {
         "DeclarePairedDelimiterX" => ("mommm", "UUUUU"),
         "DeclarePairedDelimiterXPP" => ("mommmmm", "UUUUUUU"),
         "reDeclarePairedDelimiterInnerWrapper" => ("mmm", "UUU"),
-        _ => return None,
+        _ => return super::scientific::math_signature(name),
     };
     Some(Signature { shape, domains })
 }
@@ -68,12 +68,14 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
         "dcases" | "dcases*" | "rcases" | "rcases*" | "drcases" | "drcases*" | "cases*" => "",
         "dmath" | "dmath*" | "dseries" | "dseries*" | "dgroup" | "dgroup*" | "darray" => "o",
-        _ => return None,
+        _ => return super::scientific::header_signature(name),
     })
 }
 
 pub(crate) fn is_math_environment(name: &str) -> bool {
-    ALIGNMENT_ENVIRONMENTS.contains(&name) || matches!(name, "dmath" | "dmath*")
+    ALIGNMENT_ENVIRONMENTS.contains(&name)
+        || super::scientific::ALIGNMENT_ENVIRONMENTS.contains(&name)
+        || matches!(name, "dmath" | "dmath*")
 }
 
 pub(crate) fn text_case_column(name: &str) -> bool {

@@ -114,6 +114,63 @@ fn format_document_inner(
     mut trace: Option<&mut Vec<StageTrace>>,
     mut details: Option<&mut Vec<crate::trace::DetailTrace>>,
 ) -> Result<FormatOutput, FormatError> {
+    match format_document_stages(
+        source,
+        kind,
+        config,
+        trace.as_deref_mut(),
+        details.as_deref_mut(),
+    ) {
+        Err(FormatError::Syntax(message)) => {
+            // A later stage can expose syntax hidden by the original opaque
+            // regions. Its offsets belong to an intermediate snapshot, so the
+            // recovery diagnostic covers the original file as a whole.
+            if let Some(trace) = trace {
+                trace.clear();
+            }
+            if let Some(details) = details {
+                details.clear();
+            }
+            Ok(FormatOutput {
+                text: source.into(),
+                diagnostics: vec![Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "Source retained because a formatting stage could not safely analyze an intermediate snapshot: {message}"
+                    ),
+                    span: 0..source.len(),
+                }],
+            })
+        }
+        result => result,
+    }
+}
+
+fn format_document_stages(
+    source: &str,
+    kind: FileKind,
+    config: &CompiledConfig,
+    mut trace: Option<&mut Vec<StageTrace>>,
+    mut details: Option<&mut Vec<crate::trace::DetailTrace>>,
+) -> Result<FormatOutput, FormatError> {
+    let original_source = source;
+    let model = if !config.config.replacement_only
+        && matches!(
+            kind,
+            FileKind::Tex | FileKind::Tikz | FileKind::Style | FileKind::Class
+        ) {
+        Some(crate::source_model::SourceModel::analyze(source, config))
+    } else {
+        None
+    };
+    if let Some(model) = &model
+        && model.has_errors()
+    {
+        return Ok(FormatOutput {
+            text: model.reconstruct(),
+            diagnostics: model.diagnostics().to_vec(),
+        });
+    }
     let bom = source.starts_with('\u{feff}');
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut text = stage(
@@ -131,16 +188,37 @@ fn format_document_inner(
             )
         },
     )?;
-    let mut diagnostics = Vec::new();
-    let mut parsing = ParseContext::new(config);
+    let mut diagnostics = model
+        .as_ref()
+        .map_or_else(Vec::new, |model| model.diagnostics().to_vec());
+    let mut parsing = ParseContext::with_model(config, model);
     if !config.config.replacement_only {
         if kind == FileKind::Bibtex {
             text = stage("bibtex", &text, &mut trace, &mut details, config, || {
-                crate::bibtex::format_bibtex(&text, config)
+                let output = crate::bibtex::format_bibtex_detailed(&text, config)?;
+                diagnostics.extend(output.diagnostics.into_iter().map(|mut diagnostic| {
+                    if bom {
+                        diagnostic.span.start += 3;
+                        diagnostic.span.end += 3;
+                    }
+                    diagnostic
+                }));
+                Ok(output.text)
             })?;
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error)
+            {
+                return Ok(FormatOutput {
+                    text: original_source.into(),
+                    diagnostics,
+                });
+            }
         } else if matches!(kind, FileKind::Dtx | FileKind::Ins) {
             text = stage("docstrip", &text, &mut trace, &mut details, config, || {
-                crate::docstrip::format_docstrip(&text, kind, config)
+                let output = crate::docstrip::format_docstrip(&text, kind, config)?;
+                diagnostics.extend(output.diagnostics);
+                Ok(output.text)
             })?;
             let math_active = crate::math_layout::is_active(&text, config);
             optional_stage(
@@ -150,7 +228,9 @@ fn format_document_inner(
                 &mut details,
                 config,
                 math_active,
-                |text| crate::math_layout::format_math(text, kind, config),
+                |text| {
+                    crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
+                },
             )?;
             optional_stage(
                 "docstrip-text",
@@ -193,7 +273,7 @@ fn format_document_inner(
                 &mut details,
                 config,
                 macro_active,
-                |text| syntax::format_macro_definitions(text, config),
+                |text| syntax::format_macro_definitions_with_context(text, config, &mut parsing),
             )?;
             // Formula spacing contributes to the width of text arguments and
             // prose, so normalize math before either text stage measures it.
@@ -205,7 +285,9 @@ fn format_document_inner(
                 &mut details,
                 config,
                 math_active,
-                |text| crate::math_layout::format_math(text, kind, config),
+                |text| {
+                    crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
+                },
             )?;
             needs_cleanup |= optional_stage(
                 "arguments",
@@ -281,7 +363,12 @@ fn format_document_inner(
                 config,
                 code_active,
                 |text| {
-                    let output = crate::code_layout::format_code(text, kind, config)?;
+                    let output = crate::code_layout::format_code_with_context(
+                        text,
+                        kind,
+                        config,
+                        &mut parsing,
+                    )?;
                     math_recheck = output.math_recheck;
                     Ok(output.text)
                 },
@@ -297,7 +384,9 @@ fn format_document_inner(
                 &mut details,
                 config,
                 math_active,
-                |text| crate::math_layout::format_math(text, kind, config),
+                |text| {
+                    crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
+                },
             )?;
         }
     }
@@ -323,7 +412,7 @@ fn format_document_inner(
     let protected = if kind == FileKind::Bibtex {
         crate::bibtex::protected_ranges(&text)?
     } else if config.config.whitespace.line_ending != LineEnding::Preserve
-        || config.config.whitespace.final_newline == FinalNewline::Never
+        || config.config.whitespace.final_newline != FinalNewline::Preserve
     {
         parsing.snapshot(&text, false, false)?.protected.clone()
     } else {
@@ -354,25 +443,6 @@ fn format_document_inner(
             }
         }
         _ => (),
-    }
-    for (command, message) in [
-        ("\\ExplSyntaxOn", "expl3 source preserved"),
-        ("\\catcode", "dynamic catcode region preserved"),
-        ("\\obeyspaces", "space-sensitive region preserved"),
-        ("\\obeylines", "line-sensitive region preserved"),
-    ] {
-        let enabled = if command == "\\ExplSyntaxOn" {
-            config.config.protect.expl3 && !config.config.code.expl3
-        } else {
-            config.config.protect.dynamic_catcodes
-        };
-        if enabled && let Some(pos) = source.find(command) {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                message: message.into(),
-                span: pos + usize::from(bom) * 3..pos + command.len() + usize::from(bom) * 3,
-            });
-        }
     }
     if bom {
         text.insert(0, '\u{feff}');
@@ -934,7 +1004,9 @@ fn environment_can_split_outer_boundaries(
     declared_environments: &std::collections::HashSet<String>,
 ) -> bool {
     if source_environment_signature(&block.name, analysis, block.begin.end).is_none()
-        && analysis.box_arguments(&block.name).is_none()
+        && analysis
+            .box_arguments_at(&block.name, block.body.start)
+            .is_none()
         || declared_environments.contains(block.name.as_str())
         || inline_math_environment(&block.name)
     {
@@ -983,7 +1055,9 @@ fn environment_can_split_outer_boundaries(
         }
         if ancestor.kind == BlockKind::Environment
             && (crate::package_environments::is_block(&ancestor.name)
-                || analysis.box_arguments(&ancestor.name).is_some()
+                || analysis
+                    .box_arguments_at(&ancestor.name, ancestor.body.start)
+                    .is_some()
                 || matches!(
                     ancestor.name.as_str(),
                     "table"
@@ -1172,7 +1246,9 @@ fn environment_argument_range(
                 end
             })
         }
-        b'm' => Some(start + source[start..].chars().next()?.len_utf8()),
+        b'm' if source.as_bytes()[start] != b'}' => {
+            Some(start + source[start..].chars().next()?.len_utf8())
+        }
         _ => None,
     };
     end.filter(|end| *end <= limit).map(|end| start..end)
@@ -1226,17 +1302,18 @@ pub(crate) fn environment_header_end(
         environment_argument_range(source, cursor, body.end, slot).map(|range| range.end)
     };
     let mut cursor = body.start;
-    let source_rule = if config.syntax.environment_arguments.contains_key(name) {
+    let configured_rule = config.syntax.environment_arguments.get(name).filter(|_| {
+        !config
+            .syntax
+            .inferred_environment_arguments
+            .contains_key(name)
+    });
+    let source_rule = if configured_rule.is_some() {
         None
     } else {
-        analysis.box_arguments(name)
+        analysis.box_arguments_at(name, body.start)
     };
-    if let Some(rule) = config
-        .syntax
-        .environment_arguments
-        .get(name)
-        .or(source_rule.as_deref())
-    {
+    if let Some(rule) = configured_rule.or(source_rule.as_deref()) {
         if rule
             .signature
             .as_deref()
@@ -1260,7 +1337,7 @@ pub(crate) fn environment_header_end(
             source_environment_signature(name, analysis, body.start).and_then(|signature| {
                 crate::packages::scoped_invocation_signature(source, body.start, name)
                     .or_else(|| {
-                        crate::packages::common_extensions::invocation_signature(
+                        crate::packages::links_color_columns::invocation_signature(
                             source, body.start, name,
                         )
                     })
@@ -1387,6 +1464,7 @@ struct BoundaryIndex<'a, 's> {
     environments: BTreeMap<usize, usize>,
     brackets: BTreeMap<usize, bool>,
     headers: Vec<usize>,
+    filecontents_ancestors: Vec<bool>,
 }
 
 impl<'a, 's> BoundaryIndex<'a, 's> {
@@ -1401,6 +1479,7 @@ impl<'a, 's> BoundaryIndex<'a, 's> {
             analysis,
             environments: environment_index(blocks),
             brackets: structural_bracket_events(source, blocks),
+            filecontents_ancestors: filecontents_ancestry(blocks, config),
             headers: blocks
                 .iter()
                 .map(|block| {
@@ -1431,6 +1510,50 @@ impl<'a, 's> BoundaryIndex<'a, 's> {
     fn header(&self, index: usize) -> usize {
         self.headers[index]
     }
+}
+
+// Resolve each parent link once, including trees whose parents appear later in
+// the block array. Boundary decisions then use constant-time ancestry queries.
+fn filecontents_ancestry(blocks: &[Block], config: &CompiledConfig) -> Vec<bool> {
+    let mut known: Vec<Option<bool>> = blocks
+        .iter()
+        .map(|block| {
+            (block.kind == BlockKind::Environment
+                && config
+                    .config
+                    .protect
+                    .file_contents
+                    .iter()
+                    .any(|name| name == block.name.as_str()))
+            .then_some(true)
+        })
+        .collect();
+    if known.iter().all(Option::is_none) {
+        return vec![false; blocks.len()];
+    }
+    let mut path = Vec::new();
+    for index in 0..blocks.len() {
+        let mut current = Some(index);
+        let inside = loop {
+            let Some(next) = current else { break false };
+            if let Some(inside) = known[next] {
+                break inside;
+            }
+            path.push(next);
+            current = blocks[next].parent;
+        };
+        for next in path.drain(..) {
+            known[next] = Some(inside);
+        }
+    }
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .parent
+                .is_some_and(|parent| known[parent] == Some(true))
+        })
+        .collect()
 }
 
 fn environment_index(blocks: &[Block]) -> BTreeMap<usize, usize> {
@@ -1504,7 +1627,7 @@ fn row_boundaries(
                 let block = &blocks[i];
                 let explicit = config.config.breaks.rules.contains_key(block.name.as_str())
                     || config.config.breaks.categories.contains_key("environment");
-                if !explicit && has_filecontents_ancestor(block, blocks, config) {
+                if !explicit && index.filecontents_ancestors[i] {
                     continue;
                 }
                 let Some(rule) = config.config.breaks.rule("environment", &block.name) else {
@@ -1610,7 +1733,7 @@ fn table_rule_boundaries(
                     && (declared_environments.contains(block.name.as_str())
                         || declared_commands.contains(name)
                         || config.config.syntax.commands.contains_key(name)
-                        || has_filecontents_ancestor(block, blocks, config))
+                        || index.filecontents_ancestors[i])
                 {
                     continue;
                 }
@@ -1728,7 +1851,7 @@ fn apply_breaks(
                 .breaks
                 .categories
                 .contains_key(block.kind.category());
-        if !explicit_rule && has_filecontents_ancestor(block, &blocks, config) {
+        if !explicit_rule && boundary_index.filecontents_ancestors[block_index] {
             continue;
         }
         // Environment header arguments share the environment's name. Its name

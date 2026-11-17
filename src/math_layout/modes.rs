@@ -1,6 +1,7 @@
 //! Mathematical regions and argument domains from tift's structural scanner.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::syntax::{self, BlockKind, TokenKind};
@@ -17,18 +18,92 @@ pub(crate) struct MathRegion {
 pub(crate) struct MathModes {
     pub regions: Vec<MathRegion>,
     pub declared: HashSet<String>,
+    source_overrides: HashSet<usize>,
+    signatures: HashMap<usize, math::Signature>,
+    arguments: HashMap<usize, Vec<MathArgument>>,
 }
 
 impl MathModes {
+    pub(crate) fn signature_at(&self, name: &str, at: usize) -> Option<math::Signature> {
+        if self.source_overrides.contains(&at) {
+            return None;
+        }
+        self.signatures
+            .get(&at)
+            .copied()
+            .or_else(|| command_signature(name))
+    }
+
+    pub(crate) fn is_overridden(&self, name: &str, at: usize) -> bool {
+        self.source_overrides.contains(&at)
+            || self.declared.contains(name) && !self.signatures.contains_key(&at)
+    }
+
+    pub(crate) fn arguments_at(
+        &self,
+        source: &str,
+        at: usize,
+        end: usize,
+        limit: usize,
+        signature: math::Signature,
+    ) -> Cow<'_, [MathArgument]> {
+        if let Some(arguments) = self.arguments.get(&at) {
+            let count = arguments.partition_point(|argument| argument.range.end <= limit);
+            return Cow::Borrowed(&arguments[..count]);
+        }
+        Cow::Owned(argument_ranges(
+            source,
+            invocation_cursor(source, end, signature),
+            limit,
+            signature,
+        ))
+    }
     pub(crate) fn build(
         source: &str,
         config: &CompiledConfig,
         protected: &[Range<usize>],
+        parsing: &mut crate::parse_context::ParseContext<'_>,
     ) -> Result<Self, FormatError> {
-        let (tokens, blocks) = syntax::blocks_with_ranges(source, config, protected)?;
-        let declared = syntax::declared_command_names(source, &config.config)?;
+        let parsed = parsing.snapshot(source, true, true)?;
+        let exposed_model = (parsed.protected != protected).then(|| {
+            parsed
+                .metadata
+                .exposed_model(source, &config.config, protected)
+        });
+        let analysis = if let Some(model) = &exposed_model {
+            crate::source_analysis::SourceAnalysis::for_model(
+                source,
+                &config.config,
+                model.protected_ranges(),
+                model,
+            )
+        } else {
+            crate::source_analysis::SourceAnalysis::with_memo(
+                source,
+                &config.config,
+                &parsed.protected,
+                std::rc::Rc::clone(&parsed.metadata),
+            )
+        };
+        let adjusted;
+        let (tokens, blocks) = if parsed.protected == protected {
+            (
+                parsed.tokens.as_deref().expect("math tokens"),
+                parsed.blocks.as_deref().expect("math blocks"),
+            )
+        } else {
+            let ranges = exposed_model
+                .as_ref()
+                .map_or(protected, |model| model.protected_ranges());
+            adjusted = syntax::shared_blocks_with_analysis(source, config, ranges, &analysis)?;
+            (adjusted.0.as_slice(), adjusted.1.as_slice())
+        };
+        let declared = analysis.declared_commands()?.into_owned();
         let mut regions = Vec::new();
-        for block in &blocks {
+        let mut signatures = HashMap::new();
+        let mut arguments = HashMap::new();
+        let mut source_overrides = HashSet::new();
+        for block in blocks {
             let special = block.kind == BlockKind::Special
                 && matches!(
                     block.name.as_str(),
@@ -39,7 +114,7 @@ impl MathModes {
                     .config
                     .syntax
                     .environment_arguments
-                    .contains_key(&block.name)
+                    .contains_key(block.name.as_str())
                 && is_math_environment(&block.name);
             if special || environment {
                 let mut body = block.body.clone();
@@ -69,7 +144,7 @@ impl MathModes {
                         block.name.as_str(),
                         "equation" | "equation*" | "displaymath"
                     )
-                    .then(|| (block.begin.start, block.name.clone()))
+                    .then(|| (block.begin.start, block.name.to_string()))
                 } else {
                     (block.name != "inlineMath").then(|| {
                         (
@@ -91,7 +166,7 @@ impl MathModes {
                 });
             }
         }
-        for token in &tokens {
+        for token in tokens {
             if token.kind != TokenKind::Command {
                 continue;
             }
@@ -99,26 +174,69 @@ impl MathModes {
                 continue;
             };
             let name = name.trim_end_matches('*');
-            if declared.contains(name) || config.config.syntax.commands.contains_key(name) {
+            let inferred_signature = analysis
+                .model()
+                .inferred_math_signature_at(token.span.start);
+            let source_override = analysis
+                .model()
+                .invocation_rule(token.span.start)
+                .is_some_and(|rule| rule.origin != crate::source_model::RuleOrigin::Builtin);
+            if config.config.syntax.commands.contains_key(name)
+                || source_override && inferred_signature.is_none()
+            {
+                source_overrides.insert(token.span.start);
                 continue;
             }
-            let Some(signature) = command_signature(name) else {
+            let signature = inferred_signature.or_else(|| {
+                crate::packages::context_math_signature(
+                    name,
+                    &analysis.model().invocation_context_at(token.span.start),
+                )
+                .or_else(|| command_signature(name))
+            });
+            let Some(signature) = signature else {
                 continue;
             };
-            for (range, domain) in argument_ranges(source, end, source.len(), signature) {
-                if domain == b'M' {
+            signatures.insert(token.span.start, signature);
+            let end = invocation_cursor(source, end, signature);
+            let invocation_arguments = if let Some(slots) = analysis
+                .model()
+                .invocation_argument_ranges_at(token.span.start)
+            {
+                slots
+                    .iter()
+                    .filter_map(|slot| {
+                        Some(MathArgument {
+                            range: slot.range.clone(),
+                            body: slot.body.clone(),
+                            domain: *signature.domains.as_bytes().get(slot.slot)?,
+                        })
+                    })
+                    .collect()
+            } else {
+                argument_ranges(source, end, source.len(), signature)
+            };
+            for argument in &invocation_arguments {
+                if argument.domain == b'M' {
                     regions.push(MathRegion {
-                        body: range.start + 1..range.end - 1,
+                        body: argument.body.clone(),
                         display: None,
                         environment: None,
                         text_cases: false,
                     });
                 }
             }
+            arguments.insert(token.span.start, invocation_arguments);
         }
         regions.sort_by_key(|region| (region.body.start, std::cmp::Reverse(region.body.end)));
         regions.dedup_by(|left, right| left.body == right.body);
-        Ok(Self { regions, declared })
+        Ok(Self {
+            regions,
+            declared,
+            signatures,
+            arguments,
+            source_overrides,
+        })
     }
 }
 
@@ -175,36 +293,37 @@ pub(crate) fn command_signature(name: &str) -> Option<math::Signature> {
     Some(math::Signature { shape, domains })
 }
 
-/// Locate positional groups without consuming following operands of zero-arg symbols.
+#[derive(Clone)]
+pub(crate) struct MathArgument {
+    pub range: Range<usize>,
+    pub body: Range<usize>,
+    pub domain: u8,
+}
+
+pub(crate) fn invocation_cursor(source: &str, end: usize, signature: math::Signature) -> usize {
+    syntax::arguments::invocation_cursor(source, end, signature.shape)
+}
+
+/// Locate all argument kinds through the shared signature parser.
 pub(crate) fn argument_ranges(
     source: &str,
-    mut cursor: usize,
+    cursor: usize,
     limit: usize,
     signature: math::Signature,
-) -> Vec<(Range<usize>, u8)> {
-    let mut ranges = Vec::new();
-    for (slot, &shape) in signature.shape.as_bytes().iter().enumerate() {
-        while cursor < limit && source.as_bytes()[cursor].is_ascii_whitespace() {
-            cursor += 1
-        }
-        let (open, close) = if shape == b'o' {
-            (b'[', b']')
-        } else {
-            (b'{', b'}')
-        };
-        if source.as_bytes().get(cursor) != Some(&open) {
-            if shape == b'o' {
-                continue;
-            }
-            break;
-        }
-        let Some(end) =
-            syntax::balanced_end(source, cursor, open, close).filter(|end| *end <= limit)
-        else {
-            break;
-        };
-        ranges.push((cursor..end, signature.domains.as_bytes()[slot]));
-        cursor = end;
-    }
-    ranges
+) -> Vec<MathArgument> {
+    let Some(shape) = syntax::xparse::Signature::parse(signature.shape) else {
+        return Vec::new();
+    };
+    shape
+        .slot_ranges(source, cursor..limit)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|argument| {
+            Some(MathArgument {
+                range: argument.range,
+                body: argument.body,
+                domain: *signature.domains.as_bytes().get(argument.slot)?,
+            })
+        })
+        .collect()
 }

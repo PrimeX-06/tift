@@ -29,7 +29,7 @@ pub(crate) fn environment(name: &str) -> bool {
     if crate::packages::tikz_diagrams::is_tikz_environment(name) {
         return true;
     }
-    crate::packages::tikz_derived::is_tikz_environment(name)
+    crate::packages::circuits_timing::is_tikz_environment(name)
         || matches!(
             name,
             "tikzpicture" | "scope" | "axis" | "groupplot" | "circuitikz" | "feynman"

@@ -2,14 +2,29 @@
 
 use std::ops::Range;
 
-use crate::{CompiledConfig, FileKind, FormatError, code_layout};
+use crate::{CompiledConfig, FileKind, FormatError, FormatOutput, code_layout};
 
 pub(crate) fn format_docstrip(
     source: &str,
     kind: FileKind,
     config: &CompiledConfig,
-) -> Result<String, FormatError> {
-    let mut ranges = code_layout::protected_ranges(source, config, config.config.code.expl3)?;
+) -> Result<FormatOutput, FormatError> {
+    let mut protection = config.config.clone();
+    if config.config.code.expl3 {
+        protection.protect.expl3 = false;
+    }
+    let (mut ranges, diagnostics) = crate::syntax::protected_ranges_with_diagnostics(
+        source,
+        &protection,
+        Some(&config.syntax),
+    )?;
+    let class = (kind == FileKind::Dtx)
+        .then(|| {
+            crate::source_model::SourceModel::with_ranges(source, &config.config, &ranges)
+                .document_class()
+                .map(str::to_owned)
+        })
+        .flatten();
     if kind == FileKind::Ins {
         ranges.extend(preamble_ranges(source, &ranges));
     }
@@ -31,7 +46,12 @@ pub(crate) fn format_docstrip(
         CompiledConfig::new(settings).map_err(|error| FormatError::Syntax(error.to_string()))?;
     let input = opaque.source();
     let formatted = if kind == FileKind::Dtx {
-        format_dtx_structure(input, &structural)?
+        let documentation = documentation_config(class.as_deref(), &structural)?;
+        format_dtx_structure(
+            input,
+            &structural,
+            documentation.as_ref().unwrap_or(&structural),
+        )?
     } else {
         crate::format(input, FileKind::Style, &structural)?.text
     };
@@ -42,10 +62,46 @@ pub(crate) fn format_docstrip(
     if !source.ends_with('\n') {
         output = output.trim_end_matches(['\r', '\n']).to_owned();
     }
-    Ok(output)
+    Ok(FormatOutput {
+        text: output,
+        diagnostics,
+    })
 }
 
-fn format_dtx_structure(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
+pub(crate) fn documentation_config(
+    class: Option<&str>,
+    config: &CompiledConfig,
+) -> Result<Option<CompiledConfig>, FormatError> {
+    let Some(delimiter) = crate::packages::documents::documentation_short_verbatim(class) else {
+        return Ok(None);
+    };
+    if config
+        .config
+        .syntax
+        .special
+        .iter()
+        .any(|rule| rule.begin == delimiter)
+    {
+        return Ok(None);
+    }
+    let mut settings = config.config.clone();
+    settings.syntax.special.push(crate::config::SpecialRule {
+        name: "ltxdocShortVerb".into(),
+        begin: delimiter.into(),
+        end: delimiter.into(),
+        verbatim: true,
+        ..Default::default()
+    });
+    CompiledConfig::new(settings)
+        .map(Some)
+        .map_err(|error| FormatError::Syntax(error.to_string()))
+}
+
+fn format_dtx_structure(
+    source: &str,
+    config: &CompiledConfig,
+    documentation_config: &CompiledConfig,
+) -> Result<String, FormatError> {
     let mut output = String::new();
     let mut code = String::new();
     let mut documentation = String::new();
@@ -66,7 +122,7 @@ fn format_dtx_structure(source: &str, config: &CompiledConfig) -> Result<String,
             if documentation.is_empty() {
                 return Ok(());
             }
-            match crate::format(documentation, FileKind::Tex, config) {
+            match crate::format(documentation, FileKind::Tex, documentation_config) {
                 Ok(formatted) => {
                     for line in formatted.text.split_inclusive('\n') {
                         output.push('%');

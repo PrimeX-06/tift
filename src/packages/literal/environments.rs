@@ -49,6 +49,11 @@ pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
     "filecontentsherestarred",
     // spverbatim.sty:40--45 uses the standard literal verbatim delimiter.
     "spverbatim",
+    // lyluatex.sty:218--238,283--289,311--316 records LilyPond input
+    // through a Lua input-buffer callback. Its backslashes are score syntax.
+    "lilypond",
+    "ly",
+    "lysavefrag",
 ];
 
 pub(crate) const INLINE_VERBATIM_COMMANDS: &[&str] = &["spverb"];
@@ -77,7 +82,8 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         | "filecontentshere"
         | "filecontentshere*"
         | "filecontentsherestarred" => "m",
-        "scontents" => "o",
+        "scontents" | "lilypond" | "ly" => "o",
+        "lysavefrag" => "m",
         "verbatimsc" | "spverbatim" => "",
         _ if is_line_delimited_environment(name) => "oo",
         _ => return None,

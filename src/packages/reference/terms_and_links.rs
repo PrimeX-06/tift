@@ -1,0 +1,362 @@
+//! Reference labels, glossary records and abbreviation interfaces.
+//!
+//! The signature describes the complete call; the bit mask describes only its
+//! literal operands. Printed text remains available to ordinary TeX layout.
+
+use crate::{config::CommandRule, trivia};
+use std::{collections::BTreeMap, ops::Range};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Modifier {
+    None,
+    Star,
+    /// glossaries' hyperlink switch accepts either a star or a plus.
+    Hyper,
+}
+
+#[derive(Clone, Copy)]
+struct Command {
+    shape: &'static str,
+    data: u16,
+    modifier: Modifier,
+}
+
+macro_rules! commands {
+    ($( $($name:literal)|+ => ($shape:literal, $data:expr, $modifier:ident) ),+ $(,)?) => {
+        fn fixed_command(name: &str) -> Option<Command> {
+            Some(match name.trim_end_matches('*') {
+                $( $($name)|+ => Command {
+                    shape: $shape, data: $data, modifier: Modifier::$modifier,
+                }, )+
+                _ => return None,
+            })
+        }
+
+        pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
+            $(
+                for name in [$($name),+] {
+                    commands.entry(name.into()).or_insert(CommandRule {
+                        arguments: Some($shape.bytes().filter(|&slot| slot == b'm').count()),
+                        optional_arguments: $shape.contains('o'),
+                        ..Default::default()
+                    });
+                }
+            )+
+        }
+    };
+}
+
+commands! {
+    // tools/varioref.sty:738--750,850--861,905--954. Optional arguments
+    // are printed phrases; the following label operands are literal data.
+    "vref" | "Vref" => ("om", 0b10, Star),
+    "vpageref" => ("oom", 0b100, Star),
+    "vpagerefrange" => ("omm", 0b110, Star),
+    "vrefrange" => ("omm", 0b110, None),
+    "fullref" => ("m", 0b1, None),
+    "vrefpagenum" => ("mm", 0b11, None),
+    "vpagerefcompare" => ("mmmm", 0b11, None),
+    "vpagerefnearby" => ("mmm", 0b1, None),
+    "reftextvario" => ("mm", 0, None),
+    // zref/zref-user.sty:59--95; zref-base.sty:459,716. zkvlabel reads
+    // a property list first and a label second, both through the wrapper.
+    "zlabel" | "zpageref" | "zrefused" => ("m", 0b1, None),
+    "zkvlabel" => ("mm", 0b11, None),
+    "zref" => ("om", 0b11, None),
+    // xr-hyper 2026 delegates to tools/xr.sty:43--48. The final URL is
+    // optional after the mandatory auxiliary-file name.
+    "externaldocument" | "externalcitedocument" => ("oomo", 0b1111, None),
+    // glossaries/base/glossaries.sty:2307--2344,2627,3000,3592,
+    // 3782--3813,4363--4496,4803--5038,5323--5354,6524,6581,8057.
+    "gls" | "Gls" | "GLS" | "glspl" | "Glspl" | "GLSpl"
+        | "acrshort" | "Acrshort" | "ACRshort"
+        | "acrshortpl" | "Acrshortpl" | "ACRshortpl"
+        | "acrlong" | "Acrlong" | "ACRlong"
+        | "acrlongpl" | "Acrlongpl" | "ACRlongpl"
+        | "acrfull" | "Acrfull" | "ACRfull"
+        | "acrfullpl" | "Acrfullpl" | "ACRfullpl" => ("omo", 0b11, Hyper),
+    "glslink" | "Glslink" | "glsdisp" | "Glsdisp" => ("omm", 0b11, Hyper),
+    "glshyperlink" => ("om", 0b10, None),
+    "glssee" => ("omm", 0b110, None),
+    "newglossaryentry" | "provideglossaryentry" => ("mm", 0b11, None),
+    "longnewglossaryentry" | "longprovideglossaryentry" => ("mmm", 0b11, Star),
+    "newglossary" => ("ommmm", 0b1111, Star),
+    "altnewglossary" => ("mmm", 0b11, None),
+    "newacronym" | "newabbreviation" => ("ommm", 0b11, None),
+    "loadglsentries" | "glsadd" => ("om", 0b11, None),
+    "printglossary" | "printnoidxglossary" | "printacronyms"
+        | "glsaddall" | "glsaddallunused" | "glsresetall" | "glsunsetall" => ("o", 0b1, None),
+    "printglossaries" | "printnoidxglossaries" | "makeglossaries" | "makenoidxglossaries" => ("", 0, None),
+    "glsreset" | "glsunset" | "glsentryname" | "Glsentryname"
+        | "glsentrydesc" | "Glsentrydesc" | "glsentrydescplural"
+        | "glsentrytext" | "Glsentrytext" | "glsentryplural" | "Glsentryplural"
+        | "glsentrysymbol" | "glsentrysymbolplural"
+        | "glsentryfirst" | "Glsentryfirst" | "glsentryfirstplural" | "Glsentryfirstplural"
+        | "glsentrytype" | "glsentrysort" | "glsentryparent"
+        | "glsentryshort" | "Glsentryshort" | "glsentryshortpl" | "Glsentryshortpl"
+        | "glsentrylong" | "Glsentrylong" | "glsentrylongpl" | "Glsentrylongpl"
+        | "glsentryfull" | "Glsentryfull" | "glsentryfullpl" | "Glsentryfullpl" => ("m", 0b1, None),
+    "ifglsentryexists" | "ifglsused" => ("mmm", 0b1, None),
+    "setglossarypreamble" => ("om", 0b1, None),
+    "setglossarystyle" | "setacronymstyle" => ("m", 0b1, None),
+    // glossaries.sty:8229--8250 stores both display/style replacement bodies.
+    "newacronymstyle" | "renewacronymstyle" => ("mmm", 0b111, None),
+    // glossaries-extra.sty:7081,9858--9883,10986,11253--11669,11873.
+    // These use the same options/label/printed-insertion order as gls.
+    "glsxtrshort" | "Glsxtrshort" | "GLSxtrshort"
+        | "glsxtrshortpl" | "Glsxtrshortpl" | "GLSxtrshortpl"
+        | "glsxtrlong" | "Glsxtrlong" | "GLSxtrlong"
+        | "glsxtrlongpl" | "Glsxtrlongpl" | "GLSxtrlongpl"
+        | "glsxtrfull" | "Glsxtrfull" | "GLSxtrfull"
+        | "glsxtrfullpl" | "Glsxtrfullpl" | "GLSxtrfullpl" => ("omo", 0b11, Hyper),
+    "setabbreviationstyle" | "glsxtrresourcefile" => ("om", 0b11, None),
+    "glssetcategoryattribute" | "glssetcategoryattributes" => ("mmm", 0b111, None),
+    "glsunsetcategoryattribute" => ("mm", 0b11, None),
+    // acro.sty:676--819,3317--3384,5224--5289. The public acro commands
+    // accept star/options before the ID; acronym uses the same order where
+    // its optional line-breaking penalty is supported (acronym.sty:568--747).
+    "ac" | "Ac" | "acp" | "Acp" | "iac" | "Iac"
+        | "Acs" | "Acsp" | "iacs" | "Iacs" | "iacl" | "Iacl"
+        | "aca" | "Aca" | "acap" | "Acap" | "iaca" | "Iaca"
+        | "acf" | "Acf" | "acfp" | "Acfp" | "iacf" | "Iacf"
+        | "acfi" | "Acfi" | "acfip" | "Acfip" | "acshow" => ("om", 0b11, Star),
+    // acronym's short/long-only forms have no optional penalty. Their shared
+    // minimum remains one ID; a certain acro load adds its options below.
+    "acs" | "acsp" | "acl" | "Acl" | "aclp" | "Aclp" => ("m", 0b1, Star),
+    "DeclareAcronym" | "NewAcroPreset" | "RenewAcroPreset" | "DeclareAcroPreset" => ("mm", 0b11, None),
+    "acsetup" | "acroloadstyle" | "acuse" | "acreset" | "acrotranslate" => ("m", 0b1, None),
+    "acuseall" | "acresetall" | "acbarrier" | "acswitchoff" | "acswitchon" => ("", 0, None),
+    "acroifusedTF" => ("mmm", 0b1, None),
+    "acroifusedT" | "acroifusedF" => ("mm", 0b1, None),
+    "NewAcroCommand" | "RenewAcroCommand" | "DeclareAcroCommand" | "ProvideAcroCommand" => ("mmm", 0b111, None),
+    "NewAcroTemplate" | "RenewAcroTemplate" | "SetupAcroTemplate" | "SetupNextAcroTemplate" => ("omm", 0b111, None),
+    "UseAcroTemplate" => ("omo", 0b111, None),
+    // acronym.sty:224--235,252--295,348--404,763--777. ID, optional
+    // short form, long form: the two display operands remain readable.
+    "newacro" | "acrodef" | "acro" | "newacroplural" | "acrodefplural" | "acroplural" => ("mom", 0b1, None),
+    "newacroindefinite" | "acrodefindefinite" | "acroindefinite" => ("mmm", 0b1, None),
+    "acused" | "acronymused" => ("m", 0b1, None),
+    "acsu" | "aclu" | "Aclu" => ("m", 0b1, Star),
+    "acroextra" => ("m", 0, None),
+    // prettyref.sty:21--23,30; fancyref.sty:289--304,488--507.
+    // Format bodies contain deferred parameter tokens and keep their bytes.
+    "prettyref" => ("m", 0b1, None),
+    "newrefformat" | "fancyrefchangeprefix" => ("mm", 0b11, None),
+    "fref" | "Fref" => ("om", 0b11, None),
+    "frefformat" | "Frefformat" => ("mmm", 0b111, None),
+    // bibunits.sty:225--260,307--324. bibliographyunit has only an
+    // optional division command; putbib accepts an optional database list.
+    "defaultbibliography" | "defaultbibliographystyle" => ("m", 0b1, None),
+    "bibliographyunit" | "putbib" => ("o", 0b1, None),
+}
+
+pub(crate) const LIST_ENVIRONMENTS: &[&str] = &["acronym"];
+pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[];
+
+pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
+    matches!(name, "acronym" | "bibunit").then_some("o")
+}
+
+pub(crate) fn environment_for_command(name: &str) -> Option<&str> {
+    let environment = name.strip_prefix("end").unwrap_or(name);
+    header_signature(environment).map(|_| environment)
+}
+
+pub(crate) fn is_package_item(name: &str, environment: &str) -> bool {
+    environment == "acronym" && matches!(name, "acro" | "acroplural" | "acroindefinite")
+}
+
+fn modifier_at(source: &str, name: &str, cursor: usize, modifier: Modifier) -> bool {
+    !name.ends_with('*')
+        && matches!(
+            (
+                modifier,
+                source.as_bytes().get(trivia::skip(source, cursor))
+            ),
+            (Modifier::Star | Modifier::Hyper, Some(b'*')) | (Modifier::Hyper, Some(b'+'))
+        )
+}
+
+fn command(source: &str, name: &str, cursor: usize) -> Option<Command> {
+    let mut command = fixed_command(name)?;
+    if name.trim_end_matches('*') == "newglossary"
+        && (name.ends_with('*') || modifier_at(source, name, cursor, command.modifier))
+    {
+        command.shape = "mm";
+        command.data = 0b1;
+    }
+    Some(command)
+}
+
+/// A separated modifier is one token in the compact grammar. Attached stars
+/// already belong to the lexer command token and require no extra operand.
+pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Option<&'static str> {
+    let command = command(source, name, cursor)?;
+    signature(source, name, cursor, command)
+}
+
+fn signature(source: &str, name: &str, cursor: usize, command: Command) -> Option<&'static str> {
+    if !modifier_at(source, name, cursor, command.modifier) {
+        return Some(command.shape);
+    }
+    Some(match command.shape {
+        "m" => "mm",
+        "mm" => "mmm",
+        "om" => "mom",
+        "oom" => "moom",
+        "omm" => "momm",
+        "omo" => "momo",
+        "mmm" => "mmmm",
+        _ => return None,
+    })
+}
+
+fn contextual_command(name: &str, context: &super::InvocationContext<'_>) -> Option<Command> {
+    if !matches!(
+        name.trim_end_matches('*'),
+        "acs" | "acsp" | "acl" | "Acl" | "aclp" | "Aclp"
+    ) {
+        return None;
+    }
+    if context_ambiguous(name, context).is_some() {
+        return Some(Command {
+            shape: "",
+            data: 0,
+            modifier: Modifier::None,
+        });
+    }
+    let acro = context.has_package("acro");
+    let acronym = context.has_package("acronym");
+    if acro && !context.possibly_has_package("acronym") {
+        Some(Command {
+            shape: "om",
+            data: 0b11,
+            modifier: Modifier::Star,
+        })
+    } else if acronym && !context.possibly_has_package("acro") {
+        fixed_command(name)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn context_ambiguous(
+    name: &str,
+    context: &super::InvocationContext<'_>,
+) -> Option<&'static str> {
+    if matches!(
+        name.trim_end_matches('*'),
+        "acs" | "acsp" | "acl" | "Acl" | "aclp" | "Aclp"
+    ) && (context.possibly_has_package("acro") || context.possibly_has_package("acronym"))
+        && !(context.has_package("acro") && !context.possibly_has_package("acronym")
+            || context.has_package("acronym") && !context.possibly_has_package("acro"))
+    {
+        Some(
+            "acro and acronym read different optional arguments for this command, or their package loading is conditional",
+        )
+    } else {
+        None
+    }
+}
+
+pub(crate) fn context_command_signature(
+    source: &str,
+    name: &str,
+    cursor: usize,
+    context: &super::InvocationContext<'_>,
+) -> Option<&'static str> {
+    signature(source, name, cursor, contextual_command(name, context)?)
+}
+
+pub(crate) fn context_command_data_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+    context: &super::InvocationContext<'_>,
+) -> Option<Vec<Range<usize>>> {
+    let command = contextual_command(name, context)?;
+    Some(domain_ranges(source, name, cursor, command, command.data).unwrap_or_default())
+}
+
+pub(crate) fn is_metadata_command(name: &str) -> bool {
+    fixed_command(name).is_some()
+}
+
+fn domain_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+    command: Command,
+    data: u16,
+) -> Option<Vec<Range<usize>>> {
+    let mut cursor = cursor;
+    if modifier_at(source, name, cursor, command.modifier) {
+        cursor = trivia::skip(source, cursor) + 1;
+    }
+    let mut domains = [b'T'; 16];
+    for (index, domain) in domains[..command.shape.len()].iter_mut().enumerate() {
+        if data & (1 << index) != 0 {
+            *domain = b'U';
+        }
+    }
+    crate::syntax::arguments::domain_ranges(
+        source,
+        cursor,
+        command.shape,
+        std::str::from_utf8(&domains[..command.shape.len()]).expect("ASCII operand domains"),
+    )
+}
+
+/// Protect label/configuration slots individually, including labels following
+/// printed optional text. Missing or malformed operands receive no guessed span.
+pub(crate) fn command_data_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Vec<Range<usize>>> {
+    let command = command(source, name, cursor)?;
+    Some(domain_ranges(source, name, cursor, command, command.data).unwrap_or_default())
+}
+
+/// These commands execute one supplied continuation. Definitions in either
+/// continuation have an uncertain lifetime until the condition is evaluated.
+pub(crate) fn command_branch_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Vec<Range<usize>>> {
+    let branches = match name {
+        "vpagerefcompare" => 0b1100,
+        "vpagerefnearby" | "ifglsentryexists" | "ifglsused" | "acroifusedTF" => 0b110,
+        "acroifusedT" | "acroifusedF" => 0b10,
+        _ => return None,
+    };
+    let command = command(source, name, cursor)?;
+    let slots = crate::syntax::xparse::Signature::parse(command.shape)?
+        .slot_ranges(source, cursor..source.len());
+    Some(
+        slots
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|slot| (branches & (1 << slot.slot) != 0).then_some(slot.body))
+            .collect(),
+    )
+}
+
+/// Compatibility for consumers that can represent only a literal prefix.
+/// The individual-range callback also covers data after printed arguments.
+pub(crate) fn command_header_end(source: &str, name: &str, cursor: usize) -> Option<usize> {
+    let command = command(source, name, cursor)?;
+    let prefix = command
+        .shape
+        .bytes()
+        .enumerate()
+        .take_while(|(index, _)| command.data & (1 << index) != 0)
+        .count();
+    let mut start = cursor;
+    if modifier_at(source, name, cursor, command.modifier) {
+        start = trivia::skip(source, cursor) + 1;
+    }
+    let end = crate::syntax::arguments::signature_end(source, start, &command.shape[..prefix])?;
+    (end > cursor).then_some(end)
+}

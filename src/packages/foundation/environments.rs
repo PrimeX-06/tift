@@ -302,10 +302,10 @@ pub(crate) fn is_math(name: &str) -> bool {
 }
 
 pub(crate) fn is_block(name: &str) -> bool {
-    crate::packages::visual_science::is_block(name)
-        || crate::packages::common_extensions::is_block(name)
-        || crate::packages::common_more::is_block(name)
-        || crate::packages::classic::is_block(name)
+    crate::packages::visual_languages::is_block(name)
+        || crate::packages::links_color_columns::is_block(name)
+        || crate::packages::page_styles::is_block(name)
+        || crate::packages::typography::is_block(name)
         || (has_additional_signature(name) && !is_box(name))
         || crate::class_environments::header_signature(name).is_some()
         || crate::document_environments::header_signature(name).is_some()
@@ -350,8 +350,8 @@ pub(crate) fn is_block(name: &str) -> bool {
 }
 
 pub(crate) fn is_box(name: &str) -> bool {
-    crate::packages::visual_science::is_box(name)
-        || crate::packages::tikz_derived::is_box(name)
+    crate::packages::visual_languages::is_box(name)
+        || crate::packages::circuits_timing::is_box(name)
         || crate::packages::tikz_diagrams::is_box(name)
         || crate::additional_package_syntax::is_box(name)
         || matches!(
@@ -371,10 +371,10 @@ pub(crate) fn is_box(name: &str) -> bool {
 
 /// These wrappers may expose text whose whitespace survives their begin/end.
 pub(crate) fn preserves_tight_whitespace(name: &str) -> bool {
-    crate::packages::visual_science::preserves_tight_whitespace(name)
-        || crate::packages::tikz_derived::preserves_tight_whitespace(name)
+    crate::packages::visual_languages::preserves_tight_whitespace(name)
+        || crate::packages::circuits_timing::preserves_tight_whitespace(name)
         || crate::packages::tikz_diagrams::preserves_tight_whitespace(name)
-        || crate::packages::common_more::preserves_tight_whitespace(name)
+        || crate::packages::page_styles::preserves_tight_whitespace(name)
         || crate::class_environments::preserves_tight_whitespace(name)
         || matches!(name, "frame" | "block" | "alertblock" | "exampleblock")
         || matches!(

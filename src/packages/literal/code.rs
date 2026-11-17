@@ -14,9 +14,41 @@ pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
     "VerbatimOut",
     "VerbatimOut*",
     "VerbatimBuffer",
+    // fancyvrb-ex.sty:49--171 records these examples with VerbatimOut before
+    // displaying and executing the stored source. Gobble and line numbers make
+    // their original physical lines significant.
+    "Example",
+    "CenterExample",
+    "SideBySideExample",
+    "PCenterExample",
+    "PSideBySideExample",
 ];
 
 pub(crate) const INLINE_CODE_COMMANDS: &[&str] = &["Verb", "SaveVerb"];
+
+/// Fixed catcode setters in expl3-code.tex:9200--9230. Their N operand is a
+/// character token; expanding arbitrary token-list operands is left to TeX.
+pub(crate) fn catcode_value(name: &str) -> Option<u8> {
+    Some(match name {
+        "char_set_catcode_escape:N" => 0,
+        "char_set_catcode_group_begin:N" => 1,
+        "char_set_catcode_group_end:N" => 2,
+        "char_set_catcode_math_toggle:N" => 3,
+        "char_set_catcode_alignment:N" => 4,
+        "char_set_catcode_end_line:N" => 5,
+        "char_set_catcode_parameter:N" => 6,
+        "char_set_catcode_math_superscript:N" => 7,
+        "char_set_catcode_math_subscript:N" => 8,
+        "char_set_catcode_ignore:N" => 9,
+        "char_set_catcode_space:N" => 10,
+        "char_set_catcode_letter:N" => 11,
+        "char_set_catcode_other:N" => 12,
+        "char_set_catcode_active:N" => 13,
+        "char_set_catcode_comment:N" => 14,
+        "char_set_catcode_invalid:N" => 15,
+        _ => return None,
+    })
+}
 
 /// Exact switch names assigned by listings.sty/lstmisc.sty through `\let`
 /// or `\lstKV@SetIf`. Their current runtime truth value remains unknown.
@@ -85,8 +117,11 @@ pub(crate) fn is_condition(name: &str) -> bool {
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
         "Verbatim" | "Verbatim*" | "BVerbatim" | "BVerbatim*" | "LVerbatim" | "LVerbatim*"
-        | "VerbatimBuffer" => "o",
+        | "VerbatimBuffer" | "Example" | "CenterExample" | "SideBySideExample" => "o",
         "SaveVerbatim" | "SaveVerbatim*" | "VerbatimOut" | "VerbatimOut*" => "om",
+        // Pst@@Example takes one required coordinate pair and optionally a
+        // second pair. xparse's delimited grammar expresses that distinction.
+        "PCenterExample" | "PSideBySideExample" => "o r() d()",
         _ => return None,
     })
 }
@@ -104,7 +139,7 @@ fn skip_space(source: &str, mut position: usize) -> usize {
 
 // FVExtraReadVArg gives braces their grouping catcodes and makes backslashes
 // and percent signs ordinary. Their spelling must not affect brace counting.
-fn raw_group_end(source: &str, start: usize) -> Option<usize> {
+pub(crate) fn raw_group_end(source: &str, start: usize) -> Option<usize> {
     if source.as_bytes().get(start) != Some(&b'{') {
         return None;
     }

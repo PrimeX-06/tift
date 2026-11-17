@@ -1,0 +1,103 @@
+//! ebproof and bussproofs statements, including scoped proof-tree names.
+
+use super::{CommandSpec, InvocationContext};
+
+specifications! {
+    // ebproof exports prefixed statements globally and short names locally.
+    "ebproofnewrulestyle" | "ebproofnewstyle" => ("mm", "UU", "mm"),
+    "ebproofset" | "ebproofrewrite" => ("m", "U", "m"),
+    "ebproofhypo" => ("om", "UM", "o"),
+    "ebproofinfer" => ("omom", "UUTM", "om"),
+    "ebproofellipsis" => ("mm", "TM", ""),
+    "ebproofdelims" => ("mm", "MM", ""),
+    "ebproofoverlay" => ("", "", ""),
+
+    // C statements are text boxes; dollar statements contain two math operands.
+    "AxiomC" | "UnaryInfC" | "BinaryInfC" | "TrinaryInfC" | "QuaternaryInfC"
+        | "QuinaryInfC" | "LeftLabel" | "RightLabel" => ("m", "T", ""),
+    "Axiom" | "UnaryInf" | "BinaryInf" | "TrinaryInf" | "QuaternaryInf"
+        | "QuinaryInf" => ("r$\\fCenter u{$}", "MM", ""),
+    "kernHyps" | "insertBetweenHyps" => ("m", "U", "m"),
+    "EnableBpAbbreviations" | "DisplayProof" | "doubleLine" | "alwaysDoubleLine"
+        | "singleLine" | "alwaysSingleLine" | "noLine" | "alwaysNoLine"
+        | "solidLine" | "alwaysSolidLine" | "dottedLine" | "alwaysDottedLine"
+        | "dashedLine" | "alwaysDashedLine" | "rootAtBottom" | "alwaysRootAtBottom"
+        | "rootAtTop" | "alwaysRootAtTop" => ("", "", ""),
+}
+
+pub(super) fn is_context_metadata(name: &str) -> bool {
+    matches!(
+        name.trim_end_matches('*'),
+        "set" | "infer" | "hypo" | "ellipsis" | "rewrite"
+    )
+}
+
+fn ebproof_context(context: &InvocationContext<'_>) -> bool {
+    context.has_package("ebproof")
+        && !context.possibly_has_package("bussproofs")
+        && !context.possibly_has_package("proof")
+        && context.environment() == Some("prooftree")
+}
+
+pub(super) fn context_ambiguous(
+    name: &str,
+    context: &InvocationContext<'_>,
+) -> Option<&'static str> {
+    let name = name.trim_end_matches('*');
+    let proof_environment = name == "prooftree" || context.environment() == Some("prooftree");
+    (proof_environment
+        && matches!(
+            name,
+            "prooftree" | "set" | "hypo" | "infer" | "ellipsis" | "rewrite" | "delims" | "overlay"
+        )
+        && (context.possibly_has_package("ebproof") || context.possibly_has_package("bussproofs"))
+        && !(context.has_package("ebproof")
+            && !context.possibly_has_package("bussproofs")
+            && !context.possibly_has_package("proof")
+            || context.has_package("bussproofs")
+                && !context.possibly_has_package("ebproof")
+                && !context.possibly_has_package("proof")))
+    .then_some("prooftree has incompatible package grammars, or its package loading is conditional")
+}
+
+pub(super) fn context_specification(
+    name: &str,
+    context: &InvocationContext<'_>,
+) -> Option<CommandSpec> {
+    if !ebproof_context(context) {
+        return None;
+    }
+    let global = match name.trim_end_matches('*') {
+        "set" => "ebproofset",
+        "rewrite" => "ebproofrewrite",
+        "hypo" => "ebproofhypo",
+        "infer" => "ebproofinfer",
+        "ellipsis" => "ebproofellipsis",
+        "delims" => "ebproofdelims",
+        "overlay" => "ebproofoverlay",
+        _ => return None,
+    };
+    specification(global)
+}
+
+pub(super) fn header_signature(
+    name: &str,
+    context: &InvocationContext<'_>,
+) -> Option<&'static str> {
+    if name != "prooftree" {
+        return None;
+    }
+    if context.has_package("ebproof")
+        && !context.possibly_has_package("bussproofs")
+        && !context.possibly_has_package("proof")
+    {
+        Some("s o")
+    } else if context.has_package("bussproofs")
+        && !context.possibly_has_package("ebproof")
+        && !context.possibly_has_package("proof")
+    {
+        Some("")
+    } else {
+        None
+    }
+}

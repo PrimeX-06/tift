@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  RUST_MIN_STACK: "67108864"
-
 jobs:
   rust:
     name: Rust / ${{ matrix.os }}
@@ -45,7 +42,7 @@ jobs:
               source = name.startswith("src/") and name.endswith(".rs")
               if name not in allowed and not source:
                   raise SystemExit("A file outside the public source list is tracked")
-              if name.endswith(".rs"):
+              if source:
                   text = Path(name).read_text(encoding="utf-8")
                   if re.search(r"#\s*\[\s*(?:test\b|cfg\s*\(\s*test\b)", text):
                       raise SystemExit("Private test code is present in a public source file")
@@ -54,22 +51,36 @@ jobs:
         run: cargo +stable fmt --all -- --check
       - name: Clippy
         run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+      - name: Check Cargo package contents
+        shell: bash
+        run: |
+          cargo +stable package --list --locked > "$RUNNER_TEMP/package-files.txt"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          allowed = {"Cargo.toml", "Cargo.toml.orig", "Cargo.lock", "README.md", "LICENSE", ".cargo_vcs_info.json"}
+          for name in (Path(os.environ["RUNNER_TEMP"]) / "package-files.txt").read_text().splitlines():
+              name = name.replace("\\", "/")
+              if name not in allowed and not (name.startswith("src/") and name.endswith(".rs")):
+                  raise SystemExit("A file outside the package source list would be published")
+          PY
       - name: Release build
         run: cargo +stable build --release --locked
       - name: API documentation
         run: cargo +stable doc --no-deps --locked
 
   msrv:
-    name: Minimum Rust / 1.90.0
+    name: Minimum Rust / 1.99.1
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - name: Formatting
-        run: cargo +1.90.0 fmt --all -- --check
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Clippy
-        run: cargo +1.90.0 clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo +1.99.1 clippy --all-targets --all-features --locked -- -D warnings
       - name: Release build
-        run: cargo +1.90.0 build --release --locked
+        run: cargo +1.99.1 build --release --locked

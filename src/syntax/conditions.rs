@@ -216,6 +216,7 @@ impl ConditionalBindings {
 }
 
 pub(super) struct ActiveCondition {
+    pub(super) start: usize,
     pub(super) meaning: ConditionalMeaning,
     pub(super) selected: Option<i32>,
     pub(super) branch: i32,
@@ -235,7 +236,39 @@ pub(super) fn literal_integer(source: &str, start: usize) -> Option<(i64, usize)
     }
     if source.as_bytes().get(cursor) == Some(&b'`') {
         cursor += 1;
-        let value = if source.as_bytes().get(cursor) == Some(&b'\\') {
+        let escaped = source.as_bytes().get(cursor) == Some(&b'\\');
+        let character = cursor + usize::from(escaped);
+        let value = if source.get(character..)?.starts_with("^^") {
+            let first = *source.as_bytes().get(character + 2)?;
+            let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+            let (value, finish) = if hex(first)
+                && source
+                    .as_bytes()
+                    .get(character + 3)
+                    .copied()
+                    .is_some_and(hex)
+            {
+                (
+                    u8::from_str_radix(&source[character + 2..character + 4], 16).ok()?,
+                    character + 4,
+                )
+            } else if first.is_ascii() && !matches!(first, b'\r' | b'\n' | b'^') {
+                (first ^ 64, character + 3)
+            } else {
+                return None;
+            };
+            if escaped
+                && value.is_ascii_alphabetic()
+                && source
+                    .as_bytes()
+                    .get(finish)
+                    .is_some_and(u8::is_ascii_alphabetic)
+            {
+                return None;
+            }
+            cursor = finish;
+            i64::from(value)
+        } else if escaped {
             let (name, end) = command_at(source, cursor)?;
             if name.chars().count() != 1 {
                 return None;

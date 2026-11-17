@@ -24,7 +24,7 @@ enabled = true
 width = "graphemes" # "display" measures Unicode terminal columns.
 spaces-before = 1
 spaces-after = 1
-align-double-backslash = true
+align-row-breaks = true
 # The default row regex also recognizes \tabularnewline and its modifiers.
 align-last-row-break = true
 align-content-after-row-break = false
@@ -52,33 +52,33 @@ spaces-after = 1
 [wrap]
 mode = "preserve" # "wrap" folds long lines; "rewrap" joins then folds; "unwrap" joins prose.
 columns = 88
-when = "after"
+stage = "after"
 comments = false
 collapse-spaces = true
-huge = "overflow" # "break" allows grapheme-safe splitting of long plain words.
+long-words = "overflow" # "break" allows grapheme-safe splitting of long plain words.
 # prose-commands = ['mytext'] # Permit custom commands at prose line starts.
 # text-commands = ['caption', 'footnote'] # Limit safe standard text parameters; [] disables them.
 # break-chars = ['-'] # Width-triggered tight breaks retain TeX spacing using %.
 # comments = true # Also reflow long trailing comments.
 
 # Arguments expand only with an active width, or explicit mode = "expand".
-# "wrap" and "rewrap" supply wrap.columns when line-width is omitted.
+# "wrap" and "rewrap" supply wrap.columns when columns is omitted.
 [arguments]
 mode = "auto"
 split-commas = true
 split-equals = false
-# line-width = 88
+# columns = 88
 # [arguments.rules.customkeys]
 # argument = 1 # Select the second mandatory brace group.
-# line-width = 60
+# columns = 60
 # [arguments.rules.includegraphics]
 # optional-argument = 0 # Keep selecting options when overriding the automatic rule.
-# line-width = 60
+# columns = 60
 
 [sentences]
 enabled = false
 preserve-line-breaks = true
-when = "after"
+stage = "after"
 indent = ""
 
 [whitespace]
@@ -167,13 +167,26 @@ indent = false
 # nested = true
 
 [bibtex]
-normalize = true # Lowercase entry types/field names and normalize field assignments.
+normalize = true # Normalize field assignments.
+name-case = "preserve" # "lower" or "upper" selects uniform type and field spelling.
 align-fields = true # Applied during normalization.
 value-delimiters = "preserve" # "preserve", "braces", or "quotes".
 field-order = [] # Keep source order; ["canonical"], ["alphabetical"], or field names.
 sort = false # Enable to order movable entry groups by citation key.
 sort-by = ["key"] # For example ["author", "-year", "title", "key"].
 case-sensitive = false
+
+[bibtex.cleanup]
+enabled = false
+months = false
+sentence-case-titles = false
+remove-duplicate-fields = false
+remove-empty-fields = false
+merge-duplicate-entries = false
+normalize-urls = false
+escape-special-characters = false
+generate-missing-keys = false
+# max-authors = 8 # Omit to retain complete author lists.
 
 [code]
 algorithm2e = true # Expand braced control flow and separate algorithm2e statements.
@@ -195,7 +208,7 @@ inactive-branches = true
 find = 'TODO'
 replace = 'TODO'
 regex = false
-when = "before"
+stage = "before"
 scope = "unprotected"
 enabled = false
 
@@ -204,7 +217,7 @@ find = '(?<=\b)colour\b'
 replace = 'color'
 regex = true
 engine = "enhanced"
-when = "after"
+stage = "after"
 scope = "unprotected"
 count = 1
 backtrack-limit = 1000000

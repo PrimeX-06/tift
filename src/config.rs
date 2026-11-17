@@ -111,6 +111,9 @@ impl CompiledConfig {
     }
 
     pub fn new(config: Config) -> Result<Self, ConfigError> {
+        if config.files.threads == Some(0) {
+            return Err(ConfigError("files.threads must be positive".into()));
+        }
         if config.indent.width == 0 || config.indent.width > 256 {
             return Err(ConfigError("indent.width must be between 1 and 256".into()));
         }
@@ -199,6 +202,19 @@ impl CompiledConfig {
 }
 
 fn validate_environment_arguments(config: &Config) -> Result<(), ConfigError> {
+    for (name, alias) in &config.syntax.environment_aliases {
+        let spelling = format!("\\{name}");
+        if name.is_empty()
+            || crate::syntax::command_at(&spelling, 0).is_none_or(|(_, end)| end != spelling.len())
+            || alias.environment.is_empty()
+            || alias
+                .environment
+                .chars()
+                .any(|c| c.is_whitespace() || "\\{}%#".contains(c))
+        {
+            return Err(ConfigError(format!("invalid environment alias {name:?}")));
+        }
+    }
     for (name, rule) in &config.syntax.commands {
         if let Some(signature) = &rule.signature {
             if rule.arguments.is_some() || rule.optional_arguments {
@@ -241,13 +257,77 @@ fn validate_environment_arguments(config: &Config) -> Result<(), ConfigError> {
 }
 
 impl Config {
+    /// Return an editable TOML configuration containing the stable built-in
+    /// settings. Automatically maintained lists stay omitted so later package
+    /// support additions continue to apply to generated configurations.
+    pub fn default_toml() -> Result<String, ConfigError> {
+        let mut value = toml::Value::try_from(Self::default())
+            .map_err(|error| ConfigError(error.to_string()))?;
+        let root = value
+            .as_table_mut()
+            .expect("serialized configuration table");
+        for (section, field) in [
+            ("alignment", "environments"),
+            ("syntax", "list-environments"),
+            ("protect", "environments"),
+            ("arguments", "commands"),
+            ("protect", "commands"),
+            ("protect", "file-contents"),
+            ("protect", "no-indent-blocks"),
+            ("sentences", "abbreviations"),
+        ] {
+            if let Some(table) = root.get_mut(section).and_then(toml::Value::as_table_mut) {
+                table.remove(field);
+            }
+        }
+        for key in ["overrides", "replacements"] {
+            root.remove(key);
+        }
+        omit_empty_config_tables(&mut value);
+        let root = value
+            .as_table_mut()
+            .expect("serialized configuration table");
+        let mut output = String::from(
+            "# tift configuration. Unspecified settings use built-in defaults.\n# Built-in command, environment and abbreviation lists stay dynamic.\n# Explicit arrays replace their inherited lists.\n\n",
+        );
+        for key in ["extend", "replacement-only"] {
+            if let Some(value) = root.remove(key) {
+                append_config_section(&mut output, key, value)?;
+            }
+        }
+        for (name, description) in [
+            ("indent", "Indentation"),
+            ("whitespace", "Whitespace and file endings"),
+            ("breaks", "Structural line breaks"),
+            ("wrap", "Paragraph wrapping"),
+            ("sentences", "Sentence boundaries"),
+            ("arguments", "Command argument layout"),
+            ("alignment", "Table and equation alignment"),
+            ("math", "Mathematical layout"),
+            ("code", "Package source and algorithm layout"),
+            ("bibtex", "Bibliography layout and optional data cleanup"),
+            ("syntax", "Source recognition and custom grammar"),
+            ("protect", "Literal source and conservative parsing"),
+            ("files", "Project file selection and workers"),
+            ("cache", "Persistent formatter cache"),
+        ] {
+            if let Some(value) = root.remove(name) {
+                output.push_str(&format!("# {description}\n"));
+                append_config_section(&mut output, name, value)?;
+            }
+        }
+        for (name, value) in std::mem::take(root) {
+            append_config_section(&mut output, &name, value)?;
+        }
+        Ok(output)
+    }
+
     pub fn from_toml(source: &str) -> Result<Self, ConfigError> {
         let value: toml::Value = toml::from_str(source).map_err(|e| ConfigError(e.to_string()))?;
         Self::from_value(value)
     }
 
-    pub fn from_value(mut value: toml::Value) -> Result<Self, ConfigError> {
-        normalize_aliases(&mut value);
+    pub fn from_value(value: toml::Value) -> Result<Self, ConfigError> {
         let mut defaults =
             toml::Value::try_from(Self::default()).map_err(|e| ConfigError(e.to_string()))?;
         merge_values(&mut defaults, value);
@@ -257,72 +337,41 @@ impl Config {
     }
 }
 
-/// Tables merge recursively; scalars and arrays replace their inherited value.
-pub fn merge_values(base: &mut toml::Value, mut overlay: toml::Value) {
-    normalize_aliases(&mut overlay);
-    merge_normalized_values(base, overlay);
+fn omit_empty_config_tables(value: &mut toml::Value) {
+    if let Some(table) = value.as_table_mut() {
+        for (_, child) in table.iter_mut() {
+            omit_empty_config_tables(child);
+        }
+        table.retain(|_, child| child.as_table().is_none_or(|table| !table.is_empty()));
+    }
 }
 
-fn merge_normalized_values(base: &mut toml::Value, overlay: toml::Value) {
+fn append_config_section(
+    output: &mut String,
+    name: &str,
+    value: toml::Value,
+) -> Result<(), ConfigError> {
+    let section = toml::Table::from_iter([(name.into(), value)]);
+    output.push_str(
+        &toml::to_string_pretty(&section).map_err(|error| ConfigError(error.to_string()))?,
+    );
+    output.push('\n');
+    Ok(())
+}
+
+/// Tables merge recursively; scalars and arrays replace their inherited value.
+pub fn merge_values(base: &mut toml::Value, overlay: toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base), toml::Value::Table(overlay)) => {
             for (key, value) in overlay {
                 if let Some(current) = base.get_mut(&key) {
-                    merge_normalized_values(current, value);
+                    merge_values(current, value);
                 } else {
                     base.insert(key, value);
                 }
             }
         }
         (base, overlay) => *base = overlay,
-    }
-}
-
-fn normalize_aliases(value: &mut toml::Value) {
-    if let Some(table) = value.as_table_mut() {
-        if let Some(alignment) = table
-            .get_mut("alignment")
-            .and_then(toml::Value::as_table_mut)
-        {
-            normalize_alignment_aliases(alignment);
-            if let Some(rules) = alignment
-                .get_mut("rules")
-                .and_then(toml::Value::as_table_mut)
-            {
-                for rule in rules
-                    .iter_mut()
-                    .filter_map(|(_, value)| value.as_table_mut())
-                {
-                    normalize_alignment_aliases(rule);
-                }
-            }
-        }
-        if let Some(overrides) = table
-            .get_mut("overrides")
-            .and_then(toml::Value::as_array_mut)
-        {
-            for config in overrides {
-                normalize_aliases(config);
-            }
-        }
-    }
-}
-
-fn normalize_alignment_aliases(table: &mut toml::Table) {
-    for (alias, canonical) in [
-        ("width-mode", "width"),
-        ("align-final-double-backslash", "align-last-row-break"),
-        (
-            "align-content-after-double-backslash",
-            "align-content-after-row-break",
-        ),
-        ("spaces-after-double-backslash", "spaces-after-row-break"),
-    ] {
-        if !table.contains_key(canonical)
-            && let Some(value) = table.remove(alias)
-        {
-            table.insert(canonical.into(), value);
-        }
     }
 }
 
@@ -566,6 +615,20 @@ pub struct SyntaxConfig {
     pub headings: BTreeMap<String, HeadingRule>,
     pub commands: BTreeMap<String, CommandRule>,
     pub environment_arguments: BTreeMap<String, EnvironmentArguments>,
+    /// Literal control sequences that open or close an environment.
+    pub environment_aliases: BTreeMap<String, EnvironmentAlias>,
+    /// Project declarations retain source precedence; never serialized as user settings.
+    #[serde(skip)]
+    pub inferred_environment_aliases: BTreeMap<String, EnvironmentAlias>,
+    /// Source-order project imports, anchored to loader occurrences across edits.
+    #[serde(skip)]
+    pub environment_alias_events: Vec<EnvironmentAliasEvent>,
+    #[serde(skip)]
+    pub inferred_environment_arguments: BTreeMap<String, EnvironmentArguments>,
+    #[serde(skip)]
+    pub environment_argument_events: Vec<EnvironmentArgumentEvent>,
+    #[serde(skip)]
+    pub package_load_events: Vec<PackageLoadEvent>,
     pub special: Vec<SpecialRule>,
     pub command_pattern: Option<String>,
     pub environment_pattern: Option<String>,
@@ -618,6 +681,12 @@ impl Default for SyntaxConfig {
             headings,
             commands: BTreeMap::new(),
             environment_arguments: BTreeMap::new(),
+            environment_aliases: BTreeMap::new(),
+            inferred_environment_aliases: BTreeMap::new(),
+            environment_alias_events: Vec::new(),
+            inferred_environment_arguments: BTreeMap::new(),
+            environment_argument_events: Vec::new(),
+            package_load_events: Vec::new(),
             special: Vec::new(),
             command_pattern: None,
             environment_pattern: None,
@@ -659,6 +728,34 @@ pub struct EnvironmentArguments {
     pub arguments: usize,
     pub optional_arguments: bool,
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct EnvironmentAlias {
+    pub environment: String,
+    pub begin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct EnvironmentAliasEvent {
+    pub at: usize,
+    pub loader: Option<(String, usize)>,
+    pub aliases: BTreeMap<String, Option<EnvironmentAlias>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct EnvironmentArgumentEvent {
+    pub at: usize,
+    pub loader: Option<(String, usize)>,
+    pub arguments: BTreeMap<String, Option<EnvironmentArguments>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct PackageLoadEvent {
+    pub at: usize,
+    pub loader: Option<(String, usize)>,
+    pub packages: BTreeMap<String, bool>,
 }
 
 impl EnvironmentArguments {

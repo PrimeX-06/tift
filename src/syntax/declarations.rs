@@ -10,9 +10,9 @@ use super::{
     declaration_reuse_config_supported, env_at, has_context_declaration,
     infer_list_environments_with_config, inferred_condition, inferred_protected_environments,
     is_condition_command, latex_macro_definition, let_declaration_end, line_end, literal_csname,
-    macro_body, next_character_test_end, next_inference_delimiter, primitive_condition,
-    primitive_data_end, primitive_test_end, protected_ranges, protected_ranges_with_syntax,
-    skip_trivia, token_data_range,
+    macro_body, next_character_test_end, primitive_condition, primitive_data_end,
+    primitive_test_end, protected_ranges, protected_ranges_with_syntax, skip_trivia,
+    source_environment_declaration, token_data_range,
 };
 
 use crate::{Config, FormatError};
@@ -209,6 +209,9 @@ fn infer_declaration_config_impl(
     } = state;
     let mut declarations_changed = !incremental;
     let mut reader_complete = source.is_empty() || source.ends_with('\n');
+    let reader_start = cursor;
+    let reader_positions =
+        crate::source_model::SourceModel::reader_positions(&source[reader_start..]);
     let mut protected_index = 0usize;
     while cursor < source.len() {
         while protected
@@ -322,7 +325,17 @@ fn infer_declaration_config_impl(
                 depth == 0 && conditional_depth > 0 && environment_depth == 0;
             let mut declarations = Vec::new();
             let mut finish = end;
-            if latex_macro_definition(base) {
+            if let Some(declaration) = source_environment_declaration(source, cursor, command, end)
+            {
+                finish = declaration.span.end;
+                declarations.push(ContextDeclaration {
+                    name: declaration.name,
+                    environment: true,
+                    span: declaration.span,
+                    arguments: declaration.signature,
+                    raw: false,
+                });
+            } else if latex_macro_definition(base) {
                 if let Some(declaration) =
                     context_macro_declaration_with_config(source, cursor, base, end, Some(config))
                 {
@@ -506,7 +519,9 @@ fn infer_declaration_config_impl(
             .iter()
             .find(|range| range.start >= cursor)
             .map_or(source.len(), |range| range.start);
-        cursor = next_inference_delimiter(source.as_bytes(), cursor, next_range);
+        cursor = reader_positions
+            .get(reader_positions.partition_point(|&at| at + reader_start < cursor))
+            .map_or(next_range, |&at| (at + reader_start).min(next_range));
     }
     let independent_append_safe = append_safe
         && protected
@@ -584,6 +599,20 @@ fn declaration_config_from_state(
                 output.protect.environments.push(declaration.name.clone());
             }
             if let Some(arguments) = &declaration.arguments {
+                if !config
+                    .syntax
+                    .environment_arguments
+                    .contains_key(&declaration.name)
+                    || config
+                        .syntax
+                        .inferred_environment_arguments
+                        .contains_key(&declaration.name)
+                {
+                    output
+                        .syntax
+                        .inferred_environment_arguments
+                        .insert(declaration.name.clone(), arguments.clone());
+                }
                 output
                     .syntax
                     .environment_arguments
@@ -665,6 +694,17 @@ fn declaration_config_from_state(
             }
         }
     }
+    // The same source-ordered binding index supplies aliases to imported files.
+    // Explicit configuration wins over source declarations.
+    let ranges = protected_ranges(source, config)?;
+    let model = crate::source_model::SourceModel::with_ranges(source, config, &ranges);
+    for (name, alias) in model.exported_aliases() {
+        output
+            .syntax
+            .inferred_environment_aliases
+            .entry(name.clone())
+            .or_insert_with(|| alias.clone());
+    }
     Ok(output)
 }
 
@@ -674,6 +714,9 @@ fn declaration_context_reader_complete(
     cursor: usize,
     end: usize,
 ) -> bool {
+    if source_environment_declaration(source, cursor, command, end).is_some() {
+        return true;
+    }
     let base = command.trim_end_matches('*');
     if latex_macro_definition(base) || matches!(base, "def" | "gdef" | "edef" | "xdef") {
         macro_body(source, base, end).is_some()

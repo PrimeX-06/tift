@@ -31,85 +31,108 @@ struct Args {
     /// Files or directories; use '-' for stdin. Defaults to the current directory.
     paths: Vec<PathBuf>,
     /// Check formatting without writing files; exit 1 when changes are needed.
-    #[arg(long, conflicts_with = "print")]
+    #[arg(long, conflicts_with = "print", help_heading = "Input and output")]
     check: bool,
     /// Show a unified diff without writing files; exit 1 when changes are needed.
-    #[arg(long, conflicts_with = "print")]
+    #[arg(long, conflicts_with = "print", help_heading = "Input and output")]
     diff: bool,
     /// Print a single formatted file to stdout without writing it.
-    #[arg(long, short = 'p', conflicts_with_all = ["check", "diff"])]
+    #[arg(long, short = 'p', conflicts_with_all = ["check", "diff"], help_heading = "Input and output")]
     print: bool,
     /// Write a single formatted input to this path, preserving the input file.
-    #[arg(long, short = 'o', value_name = "PATH", conflicts_with_all = ["check", "diff", "print", "backup"])]
+    #[arg(long, short = 'o', value_name = "PATH", conflicts_with_all = ["check", "diff", "print", "backup"], help_heading = "Input and output")]
     output: Option<PathBuf>,
     /// Keep N rotating backups when rewriting a file (default N: 1).
-    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "1", value_parser = parse_backup_count, value_name = "N", conflicts_with_all = ["check", "diff", "print", "output"])]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "1", value_parser = parse_backup_count, value_name = "N", conflicts_with_all = ["check", "diff", "print", "output"], help_heading = "Input and output")]
     backup: Option<usize>,
     /// Exit 1 when the formatted text differs, including after successful writes.
-    #[arg(long)]
+    #[arg(long, help_heading = "Input and output")]
     fail_on_change: bool,
     /// Print formatting stage changes and timings to stderr.
-    #[arg(long)]
+    #[arg(long, help_heading = "Performance and diagnostics")]
     trace: bool,
     /// Print changed text, source/output lines, structure and rules for each stage.
-    #[arg(long)]
+    #[arg(long, help_heading = "Performance and diagnostics")]
     trace_detail: bool,
     /// Format selected source lines: e.g. 3,7-12,!9. Other lines retain their bytes.
-    #[arg(long, short = 'n', value_name = "RANGES")]
+    #[arg(
+        long,
+        short = 'n',
+        value_name = "RANGES",
+        help_heading = "Input and output"
+    )]
     lines: Option<tift::LineRanges>,
+    /// Print the built-in configuration as editable TOML.
+    #[arg(long, exclusive = true, help_heading = "Configuration")]
+    dump_config: bool,
     /// Print effective configuration for one input without reading or formatting it.
-    #[arg(long, alias = "args", conflicts_with_all = ["check", "diff", "print", "output", "backup", "fail_on_change", "trace", "trace_detail", "lines"])]
+    #[arg(long, conflicts_with_all = ["check", "diff", "print", "output", "backup", "fail_on_change", "trace", "trace_detail", "lines"], help_heading = "Configuration")]
     show_config: bool,
     /// Generate shell completions to stdout.
-    #[arg(long, value_enum, value_name = "SHELL", exclusive = true)]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SHELL",
+        exclusive = true,
+        help_heading = "Generated help"
+    )]
     completion: Option<clap_complete::Shell>,
     /// Generate a roff manual page to stdout.
-    #[arg(long, exclusive = true)]
+    #[arg(long, exclusive = true, help_heading = "Generated help")]
     man: bool,
     /// Name used for stdin's file type, configuration and overrides.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = "Input and output")]
     stdin_filename: Option<PathBuf>,
     /// Read this TOML configuration instead of discovering tift.toml.
-    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "no_config",
+        help_heading = "Configuration"
+    )]
     config: Option<PathBuf>,
     /// Use defaults and command-line options without reading configuration files.
-    #[arg(long)]
+    #[arg(long, help_heading = "Configuration")]
     no_config: bool,
     /// Disable reading and writing persistent formatting cache files.
-    #[arg(long)]
+    #[arg(long, help_heading = "Performance and diagnostics")]
     no_cache: bool,
     /// Directory for persistent formatting results.
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help_heading = "Performance and diagnostics"
+    )]
     cache_dir: Option<PathBuf>,
     /// Number of spaces per indentation level.
-    #[arg(long, value_parser = parse_indent_width, value_name = "N")]
+    #[arg(long, value_parser = parse_indent_width, value_name = "N", help_heading = "Layout overrides")]
     indent_width: Option<usize>,
     /// Use tabs for indentation.
-    #[arg(long)]
+    #[arg(long, help_heading = "Layout overrides")]
     tabs: bool,
     /// Wrap prose using the configured column width.
-    #[arg(long, conflicts_with_all = ["no_wrap", "rewrap"])]
+    #[arg(long, conflicts_with_all = ["no_wrap", "rewrap"], help_heading = "Layout overrides")]
     wrap: bool,
     /// Join existing prose lines and wrap paragraphs to the configured width.
-    #[arg(long, conflicts_with_all = ["wrap", "no_wrap"])]
+    #[arg(long, conflicts_with_all = ["wrap", "no_wrap"], help_heading = "Layout overrides")]
     rewrap: bool,
     /// Preserve prose line breaks.
-    #[arg(long, alias = "nowrap", conflicts_with = "rewrap")]
+    #[arg(long, conflicts_with = "rewrap", help_heading = "Layout overrides")]
     no_wrap: bool,
     /// Target column width for prose wrapping.
-    #[arg(long, value_parser = parse_positive, value_name = "N")]
+    #[arg(long, value_parser = parse_positive, value_name = "N", help_heading = "Layout overrides")]
     wrap_width: Option<usize>,
     /// Enable configured structural line-break rules.
-    #[arg(long)]
+    #[arg(long, help_heading = "Layout overrides")]
     modify_line_breaks: bool,
     /// Apply configured replacements without other formatting.
-    #[arg(long)]
+    #[arg(long, help_heading = "Layout overrides")]
     replacement_only: bool,
     /// Maximum parallel worker count.
-    #[arg(long, short = 'j', value_parser = parse_positive, value_name = "N")]
+    #[arg(long, short = 'j', value_parser = parse_positive, value_name = "N", help_heading = "Performance and diagnostics")]
     threads: Option<usize>,
     /// Suppress summaries and warnings; errors remain visible.
-    #[arg(long, short = 'q')]
+    #[arg(long, short = 'q', help_heading = "Performance and diagnostics")]
     quiet: bool,
 }
 
@@ -256,6 +279,16 @@ pub fn run() -> i32 {
 }
 
 fn execute(args: &Args) -> Result<i32, String> {
+    if args.dump_config {
+        let config = tift::Config::default_toml().map_err(|error| error.to_string())?;
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        output
+            .write_all(config.as_bytes())
+            .map_err(|error| format!("stdout: {error}"))?;
+        output.flush().map_err(|error| format!("stdout: {error}"))?;
+        return Ok(0);
+    }
     if args.completion.is_some() || args.man {
         if !args.paths.is_empty() || args.stdin_filename.is_some() || args.config.is_some() {
             return Err(
@@ -917,7 +950,13 @@ fn diagnostics(path: &Path, diagnostics: &[Diagnostic], quiet: bool) -> bool {
             }
         };
         if !quiet || diagnostic.severity == Severity::Error {
-            eprintln!("{}: {severity}: {}", path.display(), diagnostic.message);
+            eprintln!(
+                "{}: {severity}: {} [bytes {}..{}]",
+                path.display(),
+                diagnostic.message,
+                diagnostic.span.start,
+                diagnostic.span.end,
+            );
         }
     }
     failed

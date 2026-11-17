@@ -16,6 +16,7 @@ mod parse_context;
 pub mod ranges;
 pub mod replacements;
 mod source_analysis;
+pub mod source_model;
 pub mod syntax;
 mod tikz;
 mod tikz_scan;
@@ -24,9 +25,9 @@ mod trivia;
 pub mod wrap;
 
 pub(crate) use packages::{
-    additional as additional_package_syntax, classes as class_environments,
-    code as code_package_syntax, code_environments, commands as package_commands,
-    documents as document_environments, environments as package_environments,
+    classes as class_environments, code as code_package_syntax, code_environments,
+    commands as package_commands, documents as document_environments,
+    environments as package_environments, equation_floats as additional_package_syntax,
     lua as luadraw_syntax, table_rules, tables as package_tables,
 };
 

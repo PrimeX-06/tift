@@ -5,6 +5,7 @@
 
 use crate::config::CommandRule;
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -162,4 +163,75 @@ pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Opti
         }
         _ => fixed_command_signature(name),
     }
+}
+
+/// hyperref's hyper@normalise changes percent/hash/underscore before scanning
+/// the URL. Its printed text argument keeps ordinary TeX tokenization.
+pub(crate) fn context_invocation_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+    _context: &crate::packages::InvocationContext<'_>,
+) -> Option<Result<Vec<crate::syntax::xparse::ArgumentSlot>, Range<usize>>> {
+    href_invocation_ranges(source, name, cursor)
+}
+
+fn href_invocation_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Result<Vec<crate::syntax::xparse::ArgumentSlot>, Range<usize>>> {
+    if name.trim_end_matches('*') != "href" {
+        return None;
+    }
+    let mut cursor = crate::trivia::skip(source, cursor);
+    let mut ranges = Vec::new();
+    if source.as_bytes().get(cursor) == Some(&b'[') {
+        let Some(end) = crate::syntax::balanced_end(source, cursor, b'[', b']') else {
+            return Some(Err(cursor..source.len()));
+        };
+        ranges.push(crate::syntax::xparse::ArgumentSlot {
+            range: cursor..end,
+            body: cursor + 1..end - 1,
+            slot: 0,
+        });
+        cursor = crate::trivia::skip(source, end);
+    }
+    if source.as_bytes().get(cursor) != Some(&b'{') {
+        return None;
+    }
+    let Some(end) = crate::syntax::literal_group_end(source, cursor) else {
+        return Some(Err(cursor..source.len()));
+    };
+    ranges.push(crate::syntax::xparse::ArgumentSlot {
+        range: cursor..end,
+        body: cursor + 1..end - 1,
+        slot: 1,
+    });
+    let text = crate::syntax::xparse::Signature::parse("m")?.slot_ranges(source, end..source.len());
+    let Some(text) = text else {
+        let start = crate::trivia::skip(source, end);
+        return (source.as_bytes().get(start) == Some(&b'{')).then_some(Err(start..source.len()));
+    };
+    ranges.extend(text.into_iter().map(|mut argument| {
+        argument.slot = 2;
+        argument
+    }));
+    Some(Ok(ranges))
+}
+
+pub(crate) fn command_data_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Vec<Range<usize>>> {
+    href_invocation_ranges(source, name, cursor)?
+        .ok()
+        .map(|arguments| {
+            arguments
+                .into_iter()
+                .filter(|argument| argument.slot < 2)
+                .map(|argument| argument.range)
+                .collect()
+        })
 }

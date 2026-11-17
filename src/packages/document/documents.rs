@@ -15,6 +15,12 @@ pub(crate) const LIST_ENVIRONMENTS: &[&str] = &[
 
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &["frame*"];
 
+pub(crate) fn documentation_short_verbatim(class: Option<&str>) -> Option<&'static str> {
+    // ltxdoc.cls:72 activates the doc package's short verbatim bar for its
+    // documentation. The delimiter is scoped to that documentation view.
+    (class == Some("ltxdoc")).then_some("|")
+}
+
 /// Overlay <...> is `d`; square-bracket options are `o`; required groups are `m`.
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -116,4 +122,8 @@ command_signatures! {
     "appendixmarker" => "",
     // Declaration exposes fixed arguments with optional model data.
     "DeclareColor" => "mom",
+    // beamer-reveal.sty:506: overlays, keys, coordinates, optional \at and URL.
+    "iframe" => "D<>{1-}O{}d()t\\at d()m",
+    // beamerbasecolor.sty:72 returns first/second-of-two after the color name.
+    "ifbeamercolorempty" => "ommm",
 }

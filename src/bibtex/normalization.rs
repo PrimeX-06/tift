@@ -5,7 +5,8 @@ use super::{
     protected_ranges, quoted_value_end, read_expression, skip_trivia, skip_whitespace,
     syntax_error, write_comments,
 };
-use crate::FormatError;
+use crate::{Diagnostic, FormatError, Severity};
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
@@ -139,33 +140,43 @@ pub(super) fn validate(config: &BibtexConfig) -> Result<(), String> {
     Ok(())
 }
 
-struct Field<'a> {
-    name: &'a str,
-    value: Range<usize>,
-    before: Vec<&'a str>,
-    after: Vec<&'a str>,
+pub(super) struct Field<'a> {
+    pub(super) name: &'a str,
+    pub(super) value: Cow<'a, str>,
+    pub(super) span: Range<usize>,
+    pub(super) before: Vec<&'a str>,
+    pub(super) after: Vec<&'a str>,
 }
 
-struct Fields<'a> {
-    key: &'a str,
-    fields: Vec<Field<'a>>,
-    trailing: Vec<&'a str>,
+pub(super) struct Fields<'a> {
+    pub(super) key: Cow<'a, str>,
+    pub(super) fields: Vec<Field<'a>>,
+    pub(super) trailing: Vec<&'a str>,
 }
 
 fn parse_fields(source: &str, start: usize, end: usize) -> Result<Fields<'_>, FormatError> {
+    parse_fields_allow_empty(source, start, end, false)
+}
+
+pub(super) fn parse_fields_allow_empty(
+    source: &str,
+    start: usize,
+    end: usize,
+    allow_empty: bool,
+) -> Result<Fields<'_>, FormatError> {
     let (mut cursor, mut before) = skip_trivia(source, start, end);
     let comma = source[cursor..end].find(',').map(|offset| cursor + offset);
     let key_end = comma.unwrap_or(end);
     let key = source[cursor..key_end].trim();
     if key.chars().any(|character| {
         character.is_whitespace() || matches!(character, '{' | '}' | '(' | ')' | '"' | '=')
-    }) || comma.is_some() && key.is_empty()
+    }) || comma.is_some() && key.is_empty() && !allow_empty
     {
         return Err(syntax_error(cursor, "invalid citation key"));
     }
     let Some(comma) = comma else {
         return Ok(Fields {
-            key,
+            key: Cow::Borrowed(key),
             fields: Vec::new(),
             trailing: before,
         });
@@ -178,7 +189,7 @@ fn parse_fields(source: &str, start: usize, end: usize) -> Result<Fields<'_>, Fo
         before.extend(comments);
         if cursor == end {
             return Ok(Fields {
-                key,
+                key: Cow::Borrowed(key),
                 fields,
                 trailing: before,
             });
@@ -240,7 +251,8 @@ fn parse_fields(source: &str, start: usize, end: usize) -> Result<Fields<'_>, Fo
         }
         fields.push(Field {
             name,
-            value,
+            value: Cow::Borrowed(&source[value.clone()]),
+            span: value,
             before,
             after,
         });
@@ -279,7 +291,12 @@ fn field_order(fields: &mut [Field<'_>], order: &[String]) {
     });
 }
 
-fn normalize_value(source: &str, range: Range<usize>, field: &str, mode: &str) -> String {
+fn normalize_value<'a>(
+    source: &'a str,
+    range: Range<usize>,
+    field: &str,
+    mode: &str,
+) -> Cow<'a, str> {
     let value = &source[range.clone()];
     if mode == "preserve"
         || matches!(
@@ -321,7 +338,7 @@ fn normalize_value(source: &str, range: Range<usize>, field: &str, mode: &str) -
         }
     }
     output.push_str(&source[copied..range.end]);
-    output
+    Cow::Owned(output)
 }
 
 fn quote_safe(inner: &str) -> bool {
@@ -354,18 +371,53 @@ pub(super) fn format_fields(
     indent: &str,
     newline: &str,
     config: &BibtexConfig,
+    origins: Option<&mut Vec<(Range<usize>, Range<usize>)>>,
 ) -> Result<String, FormatError> {
     let mut entry = parse_fields(source, start, end)?;
+    Ok(format_parsed_fields(
+        source,
+        &mut entry,
+        Some(start..end),
+        opening,
+        closing,
+        base,
+        indent,
+        newline,
+        config,
+        origins,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn format_parsed_fields(
+    source: &str,
+    entry: &mut Fields<'_>,
+    original_body: Option<Range<usize>>,
+    opening: &str,
+    closing: &str,
+    base: &str,
+    indent: &str,
+    newline: &str,
+    config: &BibtexConfig,
+    mut origins: Option<&mut Vec<(Range<usize>, Range<usize>)>>,
+) -> String {
     field_order(&mut entry.fields, &config.field_order);
     let mut output = opening.to_owned();
-    output.push_str(entry.key);
+    output.push_str(&entry.key);
     if entry.fields.is_empty() {
         if !entry.trailing.is_empty() {
-            output.truncate(opening.len());
-            output.push_str(&source[start..end]);
+            if let Some(body) = original_body {
+                output.truncate(opening.len());
+                output.push_str(&source[body]);
+            } else {
+                output.push(',');
+                output.push_str(newline);
+                write_comments(&mut output, &entry.trailing, indent, newline);
+                output.push_str(base);
+            }
         }
         output.push_str(closing);
-        return Ok(output);
+        return output;
     }
     output.push(',');
     output.push_str(newline);
@@ -379,7 +431,7 @@ pub(super) fn format_fields(
     } else {
         0
     };
-    for field in entry.fields {
+    for field in &entry.fields {
         write_comments(&mut output, &field.before, indent, newline);
         output.push_str(indent);
         let name = config.name(field.name);
@@ -389,12 +441,16 @@ pub(super) fn format_fields(
             width.saturating_sub(UnicodeWidthStr::width(name.as_ref())),
         ));
         output.push_str(" = ");
+        let printed_start = output.len();
         output.push_str(&normalize_value(
-            source,
-            field.value,
+            &field.value,
+            0..field.value.len(),
             field.name,
             &config.value_delimiters,
         ));
+        if let Some(origins) = &mut origins {
+            origins.push((printed_start..output.len(), field.span.clone()));
+        }
         output.push(',');
         if let Some(comment) = field.after.first() {
             output.push(' ');
@@ -408,7 +464,7 @@ pub(super) fn format_fields(
     write_comments(&mut output, &entry.trailing, indent, newline);
     output.push_str(base);
     output.push_str(closing);
-    Ok(output)
+    output
 }
 
 struct Entry {
@@ -417,9 +473,15 @@ struct Entry {
     kind: String,
     values: HashMap<String, String>,
     indent: String,
+    resolvable: bool,
 }
 
-fn resolve_value(source: &str, value: Range<usize>, macros: &HashMap<String, String>) -> String {
+fn resolve_value(
+    source: &str,
+    value: Range<usize>,
+    macros: &HashMap<String, Option<String>>,
+    remaining: &mut usize,
+) -> Option<String> {
     let mut result = String::new();
     let mut cursor = value.start;
     while cursor < value.end {
@@ -435,9 +497,11 @@ fn resolve_value(source: &str, value: Range<usize>, macros: &HashMap<String, Str
                     quoted_value_end(source, cursor, value.end)
                 };
                 let Ok(end) = end else {
-                    return source[value].into();
+                    return None;
                 };
-                result.push_str(&source[cursor + 1..end - 1]);
+                let piece = &source[cursor + 1..end - 1];
+                *remaining = remaining.checked_sub(piece.len())?;
+                result.push_str(piece);
                 cursor = end;
             }
             b'#' => cursor += 1,
@@ -454,22 +518,26 @@ fn resolve_value(source: &str, value: Range<usize>, macros: &HashMap<String, Str
                     continue;
                 }
                 let token = &source[start..cursor];
-                result.push_str(
-                    macros
-                        .get(&token.to_ascii_lowercase())
-                        .map_or(token, String::as_str),
-                );
+                let piece = match macros.get(&token.to_ascii_lowercase()) {
+                    Some(Some(value)) => value.as_str(),
+                    Some(None) => return None,
+                    None => token,
+                };
+                *remaining = remaining.checked_sub(piece.len())?;
+                result.push_str(piece);
             }
         }
     }
-    result
+    Some(result)
 }
 
 fn read_string_definitions(
     source: &str,
     mut cursor: usize,
     end: usize,
-    macros: &mut HashMap<String, String>,
+    macros: &mut HashMap<String, Option<String>>,
+    remaining: &mut usize,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), FormatError> {
     while cursor < end {
         cursor = skip_trivia(source, cursor, end).0;
@@ -490,7 +558,11 @@ fn read_string_definitions(
         }
         cursor = skip_trivia(source, cursor + 1, end).0;
         let (value, next) = read_expression(source, cursor, end)?;
-        macros.insert(name, resolve_value(source, value, macros));
+        let resolved = resolve_value(source, value.clone(), macros, remaining);
+        if resolved.is_none() {
+            expansion_warning(diagnostics, value, &name);
+        }
+        macros.insert(name, resolved);
         cursor = skip_trivia(source, next, end).0;
         if source.as_bytes().get(cursor) == Some(&b',') {
             cursor += 1;
@@ -499,10 +571,17 @@ fn read_string_definitions(
     Ok(())
 }
 
-pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String, FormatError> {
+pub(super) fn sort_entries(
+    source: &str,
+    config: &BibtexConfig,
+) -> Result<(String, Vec<Diagnostic>), FormatError> {
     let protected = protected_ranges(source)?;
     let mut entries = Vec::new();
     let mut macros = HashMap::new();
+    // Bound all materialized sort values together by the input size. Source
+    // order and raw expressions remain available when expansion cannot finish.
+    let mut remaining = source.len().saturating_mul(4);
+    let mut diagnostics = Vec::new();
     let mut needed: HashSet<_> = config
         .sort_by
         .iter()
@@ -529,7 +608,8 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
             continue;
         }
         if source.as_bytes()[cursor] != b'@' {
-            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+            cursor = memchr::memchr2(b'@', b'%', &source.as_bytes()[cursor + 1..])
+                .map_or(source.len(), |offset| cursor + 1 + offset);
             continue;
         }
         let start = cursor;
@@ -557,7 +637,14 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
         };
         cursor = close + 1;
         if kind == "string" {
-            read_string_definitions(source, open + 1, close, &mut macros)?;
+            read_string_definitions(
+                source,
+                open + 1,
+                close,
+                &mut macros,
+                &mut remaining,
+                &mut diagnostics,
+            )?;
             continue;
         }
         if matches!(kind.as_str(), "comment" | "preamble") {
@@ -565,12 +652,18 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
         }
         let fields = parse_fields(source, open + 1, close)?;
         let mut values = HashMap::new();
+        let mut resolvable = true;
         for field in fields.fields {
             let name = field.name.to_ascii_lowercase();
             if needed.contains(&name) {
-                values
-                    .entry(name)
-                    .or_insert_with(|| resolve_value(source, field.value, &macros));
+                values.entry(name).or_insert_with(|| {
+                    resolve_value(source, field.span.clone(), &macros, &mut remaining)
+                        .unwrap_or_else(|| {
+                            resolvable = false;
+                            expansion_warning(&mut diagnostics, field.span.clone(), field.name);
+                            field.value.into_owned()
+                        })
+                });
             }
         }
         entries.push(Entry {
@@ -579,6 +672,7 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
             kind,
             values,
             indent: entry_indent(source, start),
+            resolvable,
         });
     }
     let mut counts = HashMap::new();
@@ -590,9 +684,10 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
     let mut begin = 0;
     while begin < entries.len() {
         let mut end = begin + 1;
-        if counts[entries[begin].key.as_str()] == 1 {
+        if counts[entries[begin].key.as_str()] == 1 && entries[begin].resolvable {
             while end < entries.len()
                 && counts[entries[end].key.as_str()] == 1
+                && entries[end].resolvable
                 && source[entries[end - 1].range.end..entries[end].range.start]
                     .trim()
                     .is_empty()
@@ -614,7 +709,15 @@ pub(super) fn sort_entries(source: &str, config: &BibtexConfig) -> Result<String
         begin = end;
     }
     output.push_str(&source[copied..]);
-    Ok(output)
+    Ok((output, diagnostics))
+}
+
+fn expansion_warning(diagnostics: &mut Vec<Diagnostic>, span: Range<usize>, name: &str) {
+    diagnostics.push(Diagnostic {
+        severity: Severity::Warning,
+        message: format!("BibTeX sort preserved {name} expression: string expansion exceeds the input-sized allocation budget or depends on an unresolved string"),
+        span,
+    });
 }
 
 fn plain(text: &str) -> String {

@@ -327,7 +327,7 @@ pub(crate) fn protected_ranges(
     if allow_expl3 {
         protection.protect.expl3 = false;
     }
-    syntax::protected_ranges(source, &protection)
+    syntax::protected_ranges_with_syntax(source, &protection, &config.syntax)
 }
 
 fn matching_ending(formatted: &str, original: &str) -> String {
@@ -359,8 +359,22 @@ pub(crate) struct CodeOutput {
 
 pub(crate) fn format_code(
     source: &str,
+    kind: FileKind,
+    config: &CompiledConfig,
+) -> Result<CodeOutput, FormatError> {
+    format_code_with_context(
+        source,
+        kind,
+        config,
+        &mut crate::parse_context::ParseContext::new(config),
+    )
+}
+
+pub(crate) fn format_code_with_context(
+    source: &str,
     _kind: FileKind,
     config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<CodeOutput, FormatError> {
     if !is_active(source, config) {
         return Ok(CodeOutput {
@@ -368,26 +382,69 @@ pub(crate) fn format_code(
             math_recheck: false,
         });
     }
-    let mut protected = protected_ranges(source, config, config.config.code.expl3)?;
-    if config.config.code.expl3 {
+    let expl3_active = config.config.code.expl3
+        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"));
+    let expl3_ranges = if expl3_active && config.config.protect.expl3 {
+        Some(parsing.expl3_protected_ranges(source)?)
+    } else {
+        None
+    };
+    let parsed = parsing.snapshot(source, false, false)?;
+    let mut protected = expl3_ranges.unwrap_or_else(|| parsed.protected.clone());
+    if expl3_active {
+        let exposed_model = (protected != parsed.protected).then(|| {
+            parsed
+                .metadata
+                .exposed_model(source, &config.config, &protected)
+        });
+        let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+            source,
+            &config.config,
+            &parsed.protected,
+            std::rc::Rc::clone(&parsed.metadata),
+        );
+        let model = exposed_model.as_deref().unwrap_or_else(|| analysis.model());
+        let mut stored = model
+            .stored_argument_ranges()
+            .iter()
+            .map(|range| {
+                // Keep delimiters visible to the expl3 argument printer. Replacing
+                // only their contents also preserves leading and trailing spaces.
+                match source.as_bytes().get(range.start) {
+                    Some(b'{' | b'[') if range.end > range.start + 1 => {
+                        range.start + 1..range.end - 1
+                    }
+                    _ => range.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if config.config.protect.macro_bodies && !config.config.protect.format_macro_bodies {
+            stored.extend(model.declarations().iter().filter_map(|declaration| {
+                syntax::command_at(source, declaration.span.start)
+                    .filter(|(name, _)| name.starts_with("cs_"))
+                    .map(|_| declaration.span.clone())
+            }));
+        }
         // Keep module names opaque while exposing the key-definition command
         // to the code printer. Explicit whole-invocation protection stays intact.
         let prefixes = scanner::commands(source, &[])
             .into_iter()
             .filter(|(_, name, _)| *name == "keys_define:nn")
-            .filter_map(|(start, _, end)| {
+            .filter_map(|(_, _, end)| {
                 let arguments = crate::layout::signature_argument_ranges(
                     source,
                     end..source.len(),
                     "mm".bytes(),
                 );
-                arguments.first().map(|argument| (start, argument.clone()))
+                arguments
+                    .first()
+                    .map(|argument| (argument.end, argument.clone()))
             })
-            .collect::<Vec<_>>();
+            .collect::<HashMap<_, _>>();
         for range in &mut protected {
-            if let Some((_, argument)) = prefixes
-                .iter()
-                .find(|(_, argument)| range.start <= argument.start && range.end == argument.end)
+            if let Some(argument) = prefixes
+                .get(&range.end)
+                .filter(|argument| range.start <= argument.start)
             {
                 // Leave the argument delimiters available to the expl3
                 // printer while preserving the module name byte for byte.
@@ -395,15 +452,19 @@ pub(crate) fn format_code(
                 range.end = argument.end - 1;
             }
         }
+        protected.extend(stored.into_iter().filter(|range| !range.is_empty()));
+        protected = merged(protected);
     }
-    // Declarations use the user's original protection policy. Validate it
-    // even when there are no algorithm fragments, preserving prior errors.
-    let declaration_protection = if config.config.code.expl3 {
+    let declaration_protection = if expl3_active && !config.config.protect.expl3 {
         let mut scope_config = config.config.clone();
         scope_config.protect.expl3 = true;
-        Cow::Owned(syntax::protected_ranges(source, &scope_config)?)
+        Cow::Owned(syntax::protected_ranges_with_syntax(
+            source,
+            &scope_config,
+            &config.syntax,
+        )?)
     } else {
-        Cow::Borrowed(protected.as_slice())
+        Cow::Borrowed(parsed.protected.as_slice())
     };
     let mut fragments = Vec::new();
     if config.config.code.algorithm2e {
@@ -414,13 +475,21 @@ pub(crate) fn format_code(
                 .map(|(_, range)| (range, false)),
         );
         if !fragments.is_empty() {
-            let definitions =
-                syntax::macro_definitions_with_ranges(source, &declaration_protection);
-            let declared = syntax::declared_command_names_with_ranges(
-                source,
-                &declaration_protection,
-                &definitions,
-            );
+            let analysis = if matches!(declaration_protection, Cow::Borrowed(_)) {
+                crate::source_analysis::SourceAnalysis::with_memo(
+                    source,
+                    &config.config,
+                    &declaration_protection,
+                    std::rc::Rc::clone(&parsed.metadata),
+                )
+            } else {
+                crate::source_analysis::SourceAnalysis::new(
+                    source,
+                    &config.config,
+                    &declaration_protection,
+                )
+            };
+            let declared = analysis.declared_commands()?;
             if [
                 "For", "ForEach", "ForAll", "While", "If", "ElseIf", "Else", "eIf", "Repeat",
                 "KwIn", "KwOut",
@@ -432,18 +501,32 @@ pub(crate) fn format_code(
             }
         }
     }
-    if config.config.code.expl3 {
+    if expl3_active {
         fragments.extend(
             expl3_regions(source, &protected)
                 .into_iter()
                 .map(|mut range| {
                     // Executed expl3 boundaries include local catcode restoration.
                     if let Some(scope) = declaration_protection
-                        .iter()
-                        .find(|scope| scope.start <= range.start && range.start < scope.end)
+                        .get(
+                            declaration_protection
+                                .partition_point(|scope| scope.end <= range.start),
+                        )
+                        .filter(|scope| scope.start <= range.start)
                     {
                         range.end = range.end.min(scope.end);
-                        if source.as_bytes().get(range.end.saturating_sub(1)) == Some(&b'}') {
+                        if source.as_bytes().get(scope.start) == Some(&b'{')
+                            && source.as_bytes().get(range.end.saturating_sub(1)) == Some(&b'}')
+                        {
+                            range.end -= 1;
+                        }
+                        // A scope terminator can have indentation after the
+                        // fragment's last newline. Retain that newline so the
+                        // printer does not attach the terminator to its last
+                        // argument and change the next pass's boundary.
+                        while range.end > range.start
+                            && matches!(source.as_bytes()[range.end - 1], b' ' | b'\t')
+                        {
                             range.end -= 1;
                         }
                     }

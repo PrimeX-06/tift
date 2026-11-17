@@ -26,10 +26,25 @@ impl Default for MathConfig {
 
 pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
     config.config.math.enabled
-        && (source.contains('$')
+        && (!config.config.syntax.environment_aliases.is_empty()
+            || !config.config.syntax.inferred_environment_aliases.is_empty()
+            || !config.config.syntax.environment_alias_events.is_empty()
+            || source.contains('$')
             || memchr::memchr_iter(b'\\', source.as_bytes()).any(|start| {
                 command_at(source, start).is_some_and(|(name, end)| {
                     matches!(name, "(" | "[")
+                        || matches!(name, "hypo" | "infer" | "ellipsis" | "delims")
+                        || matches!(
+                            name,
+                            "NewDerivative"
+                                | "RenewDerivative"
+                                | "ProvideDerivative"
+                                | "DeclareDerivative"
+                                | "NewDifferential"
+                                | "RenewDifferential"
+                                | "ProvideDifferential"
+                                | "DeclareDifferential"
+                        )
                         || modes::command_signature(name)
                             .is_some_and(|signature| signature.domains.contains(['M', 'I']))
                         || name == "begin"
@@ -43,30 +58,26 @@ pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
             || crate::packages::math::has_extensions(source))
 }
 
-pub(crate) fn format_math(
+pub(crate) fn format_math_with_context(
     source: &str,
     kind: FileKind,
     config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
     if !config.config.math.enabled || kind == FileKind::Bibtex {
         return Ok(source.into());
     }
-    let mut protected = code_layout::protected_ranges(source, config, config.config.code.expl3)?;
+    if kind == FileKind::Dtx {
+        return format_documented_math(source, config, parsing);
+    }
+    let mut protected = math_protection(source, config, parsing)?;
     if kind == FileKind::Ins {
         protected.extend(crate::docstrip::preamble_ranges(source, &protected));
         protected = code_layout::merged(protected);
     }
-    let (virtual_source, margins) = if kind == FileKind::Dtx {
-        let (source, margins) = documentation_source(source);
-        (std::borrow::Cow::Owned(source), margins)
-    } else {
-        (std::borrow::Cow::Borrowed(source), Vec::new())
-    };
-    let modes = MathModes::build(&virtual_source, config, &protected)?;
-    protected.extend(margins);
-    protected = code_layout::merged(protected);
+    let modes = MathModes::build(source, config, &protected, parsing)?;
     let mut editor = Editor {
-        source: &virtual_source,
+        source,
         config,
         modes: &modes,
         protected: &protected,
@@ -74,12 +85,76 @@ pub(crate) fn format_math(
         visited: BTreeSet::new(),
     };
     for region in &modes.regions {
-        if valid_sized_delimiters(&virtual_source, &region.body) {
+        if valid_sized_delimiters(source, &region.body, &modes) {
             editor.sequence(region.body.clone(), false, region.text_cases);
         }
     }
     let normalized = editor.finish(source);
-    break_displays(&normalized, kind, config)
+    if normalized == source {
+        return layout_displays(source, config, &modes, &protected);
+    }
+    break_displays(&normalized, kind, config, parsing)
+}
+
+fn format_documented_math(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, FormatError> {
+    // Executable code and documentation carry independent TeX state. A code
+    // catcode assignment or open group cannot hide documentation environments.
+    let code = format_math_with_context(source, FileKind::Style, config, parsing)?;
+    let parsed = parsing.snapshot(&code, false, false)?;
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        &code,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let documentation_config =
+        crate::docstrip::documentation_config(analysis.model().document_class(), config)?;
+    let documentation_config = documentation_config.as_ref().unwrap_or(config);
+    let (documentation, margins) = documentation_source(&code);
+    let model = crate::source_model::SourceModel::analyze(&documentation, documentation_config);
+    let mut protected = model.protected_ranges().to_vec();
+    let mut documentation_parsing =
+        crate::parse_context::ParseContext::with_model(documentation_config, Some(model));
+    let modes = MathModes::build(
+        &documentation,
+        documentation_config,
+        &protected,
+        &mut documentation_parsing,
+    )?;
+    protected.extend(margins);
+    protected = code_layout::merged(protected);
+    let mut editor = Editor {
+        source: &documentation,
+        config: documentation_config,
+        modes: &modes,
+        protected: &protected,
+        edits: BTreeMap::new(),
+        visited: BTreeSet::new(),
+    };
+    for region in &modes.regions {
+        if valid_sized_delimiters(&documentation, &region.body, &modes) {
+            editor.sequence(region.body.clone(), false, region.text_cases);
+        }
+    }
+    Ok(editor.finish(&code))
+}
+
+fn math_protection(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<Vec<Range<usize>>, FormatError> {
+    if config.config.code.expl3
+        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
+    {
+        parsing.expl3_protected_ranges(source)
+    } else {
+        Ok(parsing.snapshot(source, false, false)?.protected.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -137,7 +212,16 @@ fn skip_space(source: &str, mut cursor: usize, end: usize) -> usize {
 /// Replace documentation margins in a same-length scan buffer, then keep their
 /// original byte ranges protected when projecting whitespace edits.
 fn documentation_source(source: &str) -> (String, Vec<Range<usize>>) {
-    let mut bytes = source.as_bytes().to_vec();
+    let mut documentation_bytes: Vec<u8> = source
+        .bytes()
+        .map(|byte| {
+            if matches!(byte, b'\r' | b'\n') {
+                byte
+            } else {
+                b' '
+            }
+        })
+        .collect();
     let mut margins = Vec::new();
     let mut offset = 0;
     let mut macrocode = false;
@@ -158,18 +242,21 @@ fn documentation_source(source: &str) -> (String, Vec<Range<usize>>) {
             })
         {
             let margin = offset + line.len() - trimmed.len();
-            bytes[margin] = b' ';
+            documentation_bytes[offset..offset + line.len()].copy_from_slice(line.as_bytes());
+            if !documentation.is_some_and(|text| text.trim_start().starts_with("tift:")) {
+                documentation_bytes[margin] = b' ';
+            }
             margins.push(margin..margin + 1);
         }
         offset += line.len();
     }
     (
-        String::from_utf8(bytes).expect("only ASCII margins were replaced"),
+        String::from_utf8(documentation_bytes).expect("whole UTF-8 source lines were copied"),
         margins,
     )
 }
 
-fn valid_sized_delimiters(source: &str, range: &Range<usize>) -> bool {
+fn valid_sized_delimiters(source: &str, range: &Range<usize>, modes: &MathModes) -> bool {
     let mut depth = 0usize;
     let mut scopes = Vec::new();
     let mut literal = BTreeMap::new();
@@ -182,11 +269,13 @@ fn valid_sized_delimiters(source: &str, range: &Range<usize>) -> bool {
                 .find('\n')
                 .map_or(range.end, |offset| cursor + offset + 1);
         } else if let Some((name, end)) = command_at(source, cursor) {
-            if let Some(signature) = modes::command_signature(name) {
-                for (argument, domain) in modes::argument_ranges(source, end, range.end, signature)
+            if let Some(signature) = modes.signature_at(name, cursor) {
+                for argument in modes
+                    .arguments_at(source, cursor, end, range.end, signature)
+                    .iter()
                 {
-                    if domain == b'U' {
-                        literal.insert(argument.start, argument.end);
+                    if argument.domain == b'U' {
+                        literal.insert(argument.range.start, argument.range.end);
                     }
                 }
             } else if !symbols::known_command(name) && !matches!(name, "left" | "right" | "middle")
@@ -259,6 +348,10 @@ impl Editor<'_> {
     }
 
     fn collapse(&mut self, range: Range<usize>) {
+        // Empty intervals and conservative boundary exits contain no gap.
+        if range.start >= range.end {
+            return;
+        }
         let authored = &self.source[range.clone()];
         if !authored.contains(['\r', '\n']) && authored.contains("  ") {
             let mut output = String::with_capacity(authored.len());
@@ -280,7 +373,25 @@ impl Editor<'_> {
         if self.source.as_bytes()[range.start] == b'{' && !self.source[body.clone()].contains('%') {
             let text = &self.source[body.clone()];
             let first = text.len() - text.trim_start_matches(char::is_whitespace).len();
-            let last = text.trim_end_matches(char::is_whitespace).len();
+            let mut last = text.trim_end_matches(char::is_whitespace).len();
+            // A control space is a complete TeX token. Trimming its whitespace
+            // would turn the escape into a different command or consume the
+            // closing brace during the recursive scan.
+            if last < text.len()
+                && text[..last]
+                    .bytes()
+                    .rev()
+                    .take_while(|&byte| byte == b'\\')
+                    .count()
+                    % 2
+                    == 1
+            {
+                let whitespace = text[last..].chars().next().expect("trailing whitespace");
+                last += whitespace.len_utf8();
+                if whitespace == '\r' && text.as_bytes().get(last) == Some(&b'\n') {
+                    last += 1;
+                }
+            }
             if first <= last {
                 self.edit(body.start..body.start + first, "");
                 self.edit(body.start + last..body.end, "");
@@ -321,6 +432,16 @@ impl Editor<'_> {
                 info = Default::default();
             }
         } else if let Some((name, command_end)) = command_at(self.source, cursor) {
+            if command_end > end {
+                return Atom {
+                    range: cursor..end,
+                    class: info.class,
+                    delimiter: None,
+                    command: true,
+                    unary: false,
+                    barrier: true,
+                };
+            }
             command = true;
             range.end = command_end;
             let name = name.trim_end_matches('*');
@@ -373,6 +494,16 @@ impl Editor<'_> {
                         },
                         |(_, end)| end,
                     );
+                    if delimiter_end > end {
+                        return Atom {
+                            range: cursor..end,
+                            class: info.class,
+                            delimiter: None,
+                            command: true,
+                            unary: false,
+                            barrier: true,
+                        };
+                    }
                     self.edit(command_end..delimiter_start, "");
                     range.end = delimiter_end;
                     info.class = if name.ends_with('l') || name == "left" {
@@ -389,19 +520,27 @@ impl Editor<'_> {
                     };
                 }
             } else {
-                let overridden = self.modes.declared.contains(name)
+                let overridden = self.modes.is_overridden(name, cursor)
                     || self.config.config.syntax.commands.contains_key(name);
                 let signature = (!overridden)
-                    .then(|| modes::command_signature(name))
+                    .then(|| self.modes.signature_at(name, cursor))
                     .flatten();
                 if let Some(signature) = signature {
-                    for (argument, domain) in
-                        modes::argument_ranges(self.source, command_end, end, signature)
+                    let modes = self.modes;
+                    for argument in modes
+                        .arguments_at(self.source, cursor, command_end, end, signature)
+                        .iter()
                     {
-                        if matches!(domain, b'M' | b'I') {
-                            self.group(argument.clone(), script)
+                        if matches!(argument.domain, b'M' | b'I') {
+                            if argument.range.start + 1 == argument.body.start
+                                && argument.body.end + 1 == argument.range.end
+                            {
+                                self.group(argument.range.clone(), script)
+                            } else {
+                                self.sequence(argument.body.clone(), script, false)
+                            }
                         }
-                        range.end = argument.end;
+                        range.end = argument.range.end;
                     }
                     if name == "sqrt" {
                         info = Default::default()
@@ -425,6 +564,9 @@ impl Editor<'_> {
         if !barrier {
             loop {
                 let marker = skip_space(self.source, range.end, end);
+                if marker >= end {
+                    break;
+                }
                 if !matches!(self.source.as_bytes().get(marker), Some(b'_' | b'^')) {
                     break;
                 }
@@ -677,18 +819,28 @@ fn break_displays(
     source: &str,
     kind: FileKind,
     config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
-    let mut protected = code_layout::protected_ranges(source, config, config.config.code.expl3)?;
+    let mut protected = math_protection(source, config, parsing)?;
     if kind == FileKind::Ins {
         protected.extend(crate::docstrip::preamble_ranges(source, &protected));
         protected = code_layout::merged(protected);
     }
-    let modes = MathModes::build(source, config, &protected)?;
+    let modes = MathModes::build(source, config, &protected, parsing)?;
+    layout_displays(source, config, &modes, &protected)
+}
+
+fn layout_displays(
+    source: &str,
+    config: &CompiledConfig,
+    modes: &MathModes,
+    protected: &[Range<usize>],
+) -> Result<String, FormatError> {
     let mut editor = Editor {
         source,
         config,
-        modes: &modes,
-        protected: &protected,
+        modes,
+        protected,
         edits: BTreeMap::new(),
         visited: BTreeSet::new(),
     };
@@ -698,8 +850,8 @@ fn break_displays(
             continue;
         };
         let body = &source[region.body.clone()];
-        if overlaps(&protected, &region.body)
-            || !valid_sized_delimiters(source, &region.body)
+        if overlaps(protected, &region.body)
+            || !valid_sized_delimiters(source, &region.body, modes)
             || body.contains('%')
             || body.contains("\\\\")
         {

@@ -31,6 +31,13 @@ pub(crate) struct Signature {
     slots: Vec<Slot>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ArgumentSlot {
+    pub range: Range<usize>,
+    pub body: Range<usize>,
+    pub slot: usize,
+}
+
 pub(crate) fn extended(signature: &str) -> bool {
     !signature.bytes().all(|byte| b"moOpgld".contains(&byte))
 }
@@ -53,6 +60,25 @@ fn group(source: &str, cursor: &mut usize) -> Option<Range<usize>> {
 }
 
 impl Signature {
+    /// The command lexer includes an adjacent star. Revisit it only when a
+    /// leading argument slot can consume that star as an xparse switch.
+    pub(crate) fn invocation_cursor(&self, source: &str, end: usize) -> usize {
+        if source.as_bytes().get(end.wrapping_sub(1)) != Some(&b'*') {
+            return end;
+        }
+        for slot in &self.slots {
+            match &slot.kind {
+                Kind::Token(token) if token == "*" => return end - 1,
+                Kind::Optional {
+                    required: false, ..
+                }
+                | Kind::Token(_) => (),
+                _ => break,
+            }
+        }
+        end
+    }
+
     pub(crate) fn parse(source: &str) -> Option<Self> {
         let mut cursor = 0;
         let mut slots = Vec::new();
@@ -187,7 +213,17 @@ impl Signature {
 
     pub(crate) fn ranges(&self, source: &str, body: Range<usize>) -> Option<Vec<Range<usize>>> {
         let mut ranges = Vec::with_capacity(self.slots.len());
-        self.scan(source, body, |range, _| ranges.push(range))?;
+        self.scan(source, body, |argument, _| ranges.push(argument.range))?;
+        Some(ranges)
+    }
+
+    pub(crate) fn slot_ranges(
+        &self,
+        source: &str,
+        body: Range<usize>,
+    ) -> Option<Vec<ArgumentSlot>> {
+        let mut ranges = Vec::with_capacity(self.slots.len());
+        self.scan(source, body, |argument, _| ranges.push(argument))?;
         Some(ranges)
     }
 
@@ -197,9 +233,9 @@ impl Signature {
         body: Range<usize>,
     ) -> Option<Vec<Range<usize>>> {
         let mut ranges = Vec::new();
-        self.scan(source, body, |range, literal| {
+        self.scan(source, body, |argument, literal| {
             if literal {
-                ranges.push(range);
+                ranges.push(argument.range);
             }
         })?;
         Some(ranges)
@@ -213,9 +249,10 @@ impl Signature {
         &self,
         source: &str,
         body: Range<usize>,
-        mut visit: impl FnMut(Range<usize>, bool),
+        mut visit: impl FnMut(ArgumentSlot, bool),
     ) -> Option<usize> {
         let mut cursor = body.start;
+        let mut argument_slot = 0;
         for slot in &self.slots {
             let start = if slot.skip_space {
                 trivia::skip_until(source, cursor, body.end)
@@ -225,7 +262,15 @@ impl Signature {
             match &slot.kind {
                 Kind::Mandatory => {
                     let end = argument_end(source, start, body.end)?;
-                    visit(start..end, false);
+                    let body = argument_body(source, start..end);
+                    visit(
+                        ArgumentSlot {
+                            range: start..end,
+                            body,
+                            slot: argument_slot,
+                        },
+                        source.as_bytes()[start] == b'\\',
+                    );
                     cursor = end;
                 }
                 Kind::Optional {
@@ -235,7 +280,14 @@ impl Signature {
                 } => {
                     if source.get(start..body.end)?.starts_with(open) {
                         let end = delimited_end(source, start, body.end, open, close)?;
-                        visit(start..end, open != "[" && open != "{");
+                        visit(
+                            ArgumentSlot {
+                                range: start..end,
+                                body: start + open.len()..end - close.len(),
+                                slot: argument_slot,
+                            },
+                            open != "[" && open != "{",
+                        );
                         cursor = end;
                     } else if *required {
                         return None;
@@ -244,7 +296,14 @@ impl Signature {
                 Kind::Token(token) => {
                     if matches_token(source, start, body.end, token) {
                         cursor = start + token.len();
-                        visit(start..cursor, token.starts_with('\\'));
+                        visit(
+                            ArgumentSlot {
+                                range: start..cursor,
+                                body: start..cursor,
+                                slot: argument_slot,
+                            },
+                            token.starts_with('\\'),
+                        );
                     }
                 }
                 Kind::Embellishments(tokens) => {
@@ -264,7 +323,14 @@ impl Signature {
                         let token_end = token_start + tokens[index].len();
                         let argument = trivia::skip_until(source, token_end, body.end);
                         let end = argument_end(source, argument, body.end)?;
-                        visit(token_start..end, true);
+                        visit(
+                            ArgumentSlot {
+                                range: token_start..end,
+                                body: argument_body(source, argument..end),
+                                slot: argument_slot + index,
+                            },
+                            true,
+                        );
                         seen[index] = true;
                         next = end;
                         cursor = end;
@@ -272,18 +338,45 @@ impl Signature {
                 }
                 Kind::Until(delimiter) => {
                     let end = until_end(source, start, body.end, delimiter)?;
-                    visit(start..end, true);
+                    visit(
+                        ArgumentSlot {
+                            range: start..end,
+                            body: start..end - delimiter.len(),
+                            slot: argument_slot,
+                        },
+                        true,
+                    );
                     cursor = end;
                 }
                 Kind::Verbatim => {
                     let end = verbatim_end(source, start, body.end)?;
-                    visit(start..end, true);
+                    let width = source[start..].chars().next()?.len_utf8();
+                    visit(
+                        ArgumentSlot {
+                            range: start..end,
+                            body: start + width..end - width,
+                            slot: argument_slot,
+                        },
+                        true,
+                    );
                     cursor = end;
                 }
                 Kind::Body => (),
             }
+            argument_slot += match &slot.kind {
+                Kind::Embellishments(tokens) => tokens.len(),
+                _ => 1,
+            };
         }
         Some(cursor)
+    }
+}
+
+fn argument_body(source: &str, range: Range<usize>) -> Range<usize> {
+    if source.as_bytes().get(range.start) == Some(&b'{') {
+        range.start + 1..range.end - 1
+    } else {
+        range
     }
 }
 
@@ -298,7 +391,7 @@ fn matches_token(source: &str, start: usize, limit: usize, value: &str) -> bool 
 }
 
 fn argument_end(source: &str, start: usize, limit: usize) -> Option<usize> {
-    if start >= limit {
+    if start >= limit || source.as_bytes()[start] == b'}' {
         return None;
     }
     let end = if source.as_bytes()[start] == b'{' {
@@ -334,6 +427,11 @@ fn delimited_end(
         } else if open != close && matches_token(source, cursor, limit, open) {
             depth += 1;
             cursor += open.len();
+        } else if source.as_bytes()[cursor] == b'}' {
+            // An unmatched outer group cannot belong to this argument. In
+            // particular, expansion-dependent delimiters must not search past
+            // their enclosing declaration into unrelated source.
+            return None;
         } else {
             cursor = argument_end(source, cursor, limit)?;
         }
@@ -349,6 +447,9 @@ fn until_end(source: &str, start: usize, limit: usize, delimiter: &str) -> Optio
     while cursor < limit {
         if source[cursor..limit].starts_with(delimiter) {
             return Some(cursor + delimiter.len());
+        }
+        if source.as_bytes()[cursor] == b'}' {
+            return None;
         }
         if source.as_bytes()[cursor] == b'%' {
             cursor = trivia::skip_until(source, cursor, limit);

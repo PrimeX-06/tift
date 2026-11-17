@@ -141,12 +141,6 @@ impl Loader {
             )?;
             let config =
                 Config::from_value(value).map_err(|e| config_error(source.as_deref(), e))?;
-            if config.files.threads == Some(0) {
-                return Err(config_error(
-                    source.as_deref(),
-                    "files.threads must be positive",
-                ));
-            }
             let root = document
                 .as_ref()
                 .map_or(self.cwd.as_path(), |doc| doc.exclude_root.as_path());

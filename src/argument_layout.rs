@@ -13,6 +13,7 @@ use crate::{CompiledConfig, FormatError, syntax};
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ArgumentLayoutConfig {
     pub mode: String,
+    #[serde(rename = "columns")]
     pub line_width: Option<usize>,
     pub commands: Vec<String>,
     pub split_commas: bool,
@@ -55,6 +56,7 @@ impl Default for ArgumentLayoutConfig {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ArgumentLayoutRule {
     pub mode: Option<String>,
+    #[serde(rename = "columns")]
     pub line_width: Option<usize>,
     /// Zero-based mandatory brace argument selected for this command.
     pub argument: usize,
@@ -73,7 +75,7 @@ pub fn validate(config: &ArgumentLayoutConfig) -> Result<(), String> {
     };
     let width = |value: Option<usize>| -> Result<(), String> {
         if value == Some(0) {
-            Err("arguments.line-width must be positive".into())
+            Err("arguments.columns must be positive".into())
         } else {
             Ok(())
         }
