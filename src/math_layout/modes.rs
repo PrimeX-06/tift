@@ -86,7 +86,7 @@ impl MathModes {
                 regions.push(MathRegion {
                     body,
                     display,
-                    environment: environment.then(|| block.begin.start..block.end.end),
+                    environment: environment.then_some(block.begin.start..block.end.end),
                     text_cases: environment && math::text_case_column(&block.name),
                 });
             }
