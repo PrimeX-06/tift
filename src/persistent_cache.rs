@@ -388,5 +388,3 @@ fn default_directory() -> Option<PathBuf> {
             .map(|directory| directory.join("tift"))
     }
 }
-
-

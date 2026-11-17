@@ -528,5 +528,3 @@ pub fn absolute(path: &Path, cwd: &Path) -> PathBuf {
     }
     result
 }
-
-

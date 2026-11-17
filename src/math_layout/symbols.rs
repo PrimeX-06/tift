@@ -215,5 +215,3 @@ pub(crate) fn command_info(name: &str) -> MathAtomInfo {
         delimiter: None,
     }
 }
-
-

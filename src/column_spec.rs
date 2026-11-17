@@ -509,5 +509,3 @@ fn group(source: &str, start: usize, open: u8, close: u8) -> Option<Range<usize>
     }
     None
 }
-
-

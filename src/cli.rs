@@ -1168,5 +1168,3 @@ fn atomic_write(path: &Path, original: &str, formatted: &str) -> Result<(), Stri
         .map_err(|e| format!("{}: cannot replace file: {}", path.display(), e.error))?;
     Ok(())
 }
-
-

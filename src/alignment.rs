@@ -2131,7 +2131,3 @@ fn multicolumn_span(text: &str) -> Option<usize> {
     let span = body[..end].trim().parse::<usize>().ok()?;
     (1..=256).contains(&span).then_some(span)
 }
-
-
-
-

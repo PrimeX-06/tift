@@ -206,5 +206,3 @@ pub(crate) fn preserves_tight_whitespace(name: &str) -> bool {
             "custom" | "solution" | "assumption" | "conclusion" | "property" | "column" | "column*"
         )
 }
-
-

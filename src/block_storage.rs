@@ -180,5 +180,3 @@ impl From<StructuralBlock<String>> for Block {
         }
     }
 }
-
-

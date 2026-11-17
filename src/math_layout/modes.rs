@@ -208,5 +208,3 @@ pub(crate) fn argument_ranges(
     }
     ranges
 }
-
-

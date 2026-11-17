@@ -5749,5 +5749,3 @@ pub fn declaration_neutral_segment_with_syntax(
     }
     groups == 0 && brackets == 0 && environments.is_empty() && conditions.is_empty()
 }
-
-

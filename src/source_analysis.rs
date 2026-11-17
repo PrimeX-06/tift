@@ -244,5 +244,3 @@ impl<'a> SourceAnalysis<'a> {
         Cow::Borrowed(self.memo.lists.get_or_init(analyze))
     }
 }
-
-

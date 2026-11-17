@@ -201,5 +201,3 @@ fn tabu_dimension_end(source: &str, start: usize, limit: usize) -> Option<usize>
         None
     }
 }
-
-

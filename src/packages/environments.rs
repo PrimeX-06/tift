@@ -655,8 +655,6 @@ fn definition_end(source: &str, command: &str, mut cursor: usize) -> Option<usiz
     Some(cursor)
 }
 
-
-
 /// Resolve all ordinary box headers in one source scan. The caller supplies
 /// the protection ranges for this exact text and configuration.
 pub(crate) fn source_box_argument_map(
@@ -883,8 +881,6 @@ pub(crate) fn verbatim_declaration(
     })
 }
 
-
-
 pub(crate) fn is_source_verbatim_environment_outside(
     source: &str,
     name: &str,
@@ -1092,5 +1088,3 @@ fn false_branch_end(source: &str, mut cursor: usize) -> usize {
     }
     source.len()
 }
-
-

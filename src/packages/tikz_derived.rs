@@ -239,5 +239,3 @@ pub(crate) fn literal_data_range(
     cursor = skip(source, cursor);
     Some(cursor..syntax::balanced_end(source, cursor, b'{', b'}')?)
 }
-
-

@@ -629,5 +629,3 @@ pub(super) fn dead_branch_needs_protection(
     }
     !stack.is_empty() || conditions != 0
 }
-
-

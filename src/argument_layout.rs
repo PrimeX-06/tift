@@ -1018,5 +1018,3 @@ pub(crate) fn format_arguments_with_context(
         Ok(output)
     }
 }
-
-

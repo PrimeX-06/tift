@@ -926,5 +926,3 @@ fn flat_piece(source: &str, atoms: &[Atom], range: &Range<usize>) -> Option<Stri
     }
     Some(output)
 }
-
-

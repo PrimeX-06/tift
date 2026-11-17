@@ -29,11 +29,6 @@ pub struct ProjectContext {
     compiled: HashMap<(PathBuf, usize), Arc<CompiledConfig>>,
     compiled_states: HashMap<(usize, SyntaxConfig, ProtectConfig), Arc<CompiledConfig>>,
     bases: HashMap<usize, Arc<CompiledConfig>>,
-    
-    
-    
-    
-    
 }
 
 #[derive(Default)]
@@ -47,7 +42,7 @@ struct InputGraph {
     // Their calls may invalidate later dynamic names and must stay in history.
     binding_targets: HashSet<String>,
     literal_inputs_index: Option<LiteralInputState>,
-    
+
     file_ends: HashMap<PathBuf, usize>,
     file_inference_ends: HashMap<PathBuf, usize>,
     file_options: HashMap<PathBuf, Arc<Config>>,
@@ -58,18 +53,6 @@ struct InputGraph {
     // historical policy refusal can retain the conservative false answer;
     // incomplete source must keep checking when later inputs complete it.
     boundary_policy_refused: bool,
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
 }
 
 struct DeclarationMemo {
@@ -170,7 +153,6 @@ impl InputGraph {
     }
 
     fn append_segment(&mut self, source: &str, neutral: bool) {
-        
         if neutral && source.len() >= 256 && self.compaction_preserves_bindings(source) {
             self.source.push_str(source);
             self.inference_source.push('\n');
@@ -337,8 +319,6 @@ impl InputGraph {
         }
     }
 
-    
-
     fn append_prepared_input(&mut self, prefix: &str, input: &str, reusable: bool) {
         self.append_segment(prefix, reusable);
         self.append(input);
@@ -357,8 +337,7 @@ impl InputGraph {
         {
             return Ok(Arc::clone(&memo.options));
         }
-        
-        
+
         let result = syntax::infer_declaration_config_indexed(
             &self.inference_source,
             config,
@@ -375,7 +354,7 @@ impl InputGraph {
                 }
             })
             .map_err(|error| format!("{}: project declarations: {error}", path.display()))?;
-        
+
         let options = self
             .last_options
             .as_ref()
@@ -383,18 +362,17 @@ impl InputGraph {
                 memo.options.syntax == inferred.syntax && memo.options.protect == inferred.protect
             })
             .map_or_else(|| Arc::new(inferred), |memo| Arc::clone(&memo.options));
-        
+
         let boundary = if self.boundary_policy_refused {
             syntax::DeclarationReuseBoundary::PolicyRefused
         } else {
-            
             if self.inference_source.len() == self.source.len() {
                 inferred_boundary
             } else {
                 syntax::declaration_reuse_boundary_status(&self.source, config)
             }
         };
-        
+
         self.boundary_policy_refused |= boundary == syntax::DeclarationReuseBoundary::PolicyRefused;
         let safe = boundary == syntax::DeclarationReuseBoundary::Safe;
         let compiled = self
@@ -413,8 +391,6 @@ impl InputGraph {
         });
         Ok(options)
     }
-
-    
 
     fn prepare_prefix(
         &mut self,
@@ -435,8 +411,7 @@ impl InputGraph {
         // The memo is untouched, and truncation restores its immutable revision.
         let length = self.inference_source.len();
         self.inference_source.push_str(suffix);
-        
-        
+
         let mut preview_index = self.declaration_index.clone();
         let inferred = syntax::infer_declaration_config_indexed(
             &self.inference_source,
@@ -455,7 +430,7 @@ impl InputGraph {
                 Err(error)
             }
         });
-        
+
         self.inference_source.truncate(length);
         inferred
             .map(|options| (Arc::new(options), false))
@@ -465,14 +440,12 @@ impl InputGraph {
     fn literal_inputs(&self, source: &str) -> Result<(Vec<Input>, Option<usize>), String> {
         let memo = self.last_options.as_ref().expect("input options inferred");
         debug_assert_eq!(memo.revision, self.revision);
-        
-        let result = if let Some(compiled) = &memo.compiled {
+
+        if let Some(compiled) = &memo.compiled {
             literal_inputs_with_syntax(source, &memo.options, compiled)
         } else {
             literal_inputs(source, &memo.options)
-        };
-        
-        result
+        }
     }
 }
 
@@ -526,7 +499,7 @@ impl ProjectContext {
         } else {
             cwd.join(path)
         };
-        
+
         let resolved = absolute(
             &fs::canonicalize(&requested).unwrap_or_else(|_| requested.clone()),
             cwd,
@@ -659,7 +632,7 @@ impl ProjectContext {
                 Arc::clone(graph)
             } else {
                 let mut graph = InputGraph::default();
-                
+
                 self.expand_inputs(
                     &root,
                     &root,
@@ -675,7 +648,7 @@ impl ProjectContext {
                 Arc::clone(options)
             } else if let Some(end) = graph.file_ends.get(&path) {
                 let inference_end = graph.file_inference_ends[&path];
-                
+
                 Arc::new(
                     syntax::infer_declaration_config(
                         &graph.inference_source[..inference_end],
@@ -699,7 +672,7 @@ impl ProjectContext {
                 let mut declarations = graph.source[..end].to_owned();
                 declarations.push('\n');
                 declarations.push_str(&source);
-                
+
                 Arc::new(
                     syntax::infer_declaration_config(&declarations, &config.config).map_err(
                         |error| format!("{}: project declarations: {error}", path.display()),
@@ -809,9 +782,9 @@ impl ProjectContext {
             // original source text. Leave it in the pending suffix instead of
             // creating a declaration checkpoint and scanning the cumulative
             // graph twice. Dynamic filenames still need prefix inference.
-            
+
             let prune_unresolved = true;
-            
+
             if prune_unresolved && !input.name.contains('\\') {
                 let mut local_target = false;
                 for name in input.name.split(',').filter(|name| !name.is_empty()) {
@@ -1047,8 +1020,6 @@ impl ProjectContext {
         Ok(result)
     }
 }
-
-
 
 fn root_marker(source: &str, config: &Config) -> Result<Option<String>, String> {
     static ROOT: OnceLock<regex::Regex> = OnceLock::new();
@@ -1339,7 +1310,3 @@ fn trivia_end(source: &str, mut cursor: usize) -> usize {
             .map_or(source.len(), |offset| cursor + offset + 1);
     }
 }
-
-
-
-

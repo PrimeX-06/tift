@@ -2485,5 +2485,3 @@ fn add_inline_atoms(
     }
     merge_ranges(ranges);
 }
-
-

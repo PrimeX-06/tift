@@ -549,5 +549,3 @@ pub(crate) fn format_code(
         math_recheck,
     })
 }
-
-
