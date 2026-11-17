@@ -23,6 +23,7 @@ pub(crate) struct AnalysisMemo {
     arguments: OnceCell<HashMap<String, EnvironmentArguments>>,
     definitions: OnceCell<Vec<crate::syntax::MacroDefinition>>,
     commands: OnceCell<HashSet<String>>,
+    command_arguments: OnceCell<HashMap<String, EnvironmentArguments>>,
     environments: OnceCell<HashSet<String>>,
     visual_headers: OnceCell<Option<HashMap<usize, bool>>>,
     constructed_commands: OnceCell<HashMap<usize, (String, usize)>>,
@@ -156,6 +157,24 @@ impl<'a> SourceAnalysis<'a> {
             })
         };
         Cow::Borrowed(self.memo.definitions.get_or_init(analyze))
+    }
+
+    pub(crate) fn command_arguments(&self, name: &str) -> Option<Cow<'_, EnvironmentArguments>> {
+        self.memo
+            .command_arguments
+            .get_or_init(|| {
+                let Some(protected) = self.protected else {
+                    return HashMap::new();
+                };
+                crate::syntax::command_argument_map_with_definitions(
+                    self.source,
+                    self.config,
+                    protected,
+                    &self.definitions(),
+                )
+            })
+            .get(name)
+            .map(Cow::Borrowed)
     }
 
     pub(crate) fn declared_commands(&self) -> Result<Cow<'_, HashSet<String>>, crate::FormatError> {

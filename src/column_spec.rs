@@ -1,7 +1,7 @@
 //! Bounded literal column-preamble parsing for source alignment.
 
 use super::Justification;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 #[path = "column_spec/tabularray.rs"]
@@ -19,31 +19,29 @@ pub(super) const TABULARRAY_STYLE_COMMANDS: &[&str] = &[
     "SetColumns",
 ];
 
-/// Body-wide row/column commands run after inner keys and may change cells
-/// outside their source row. Keep the uniform alignment path for those forms.
-pub(super) fn tabularray_body_supported(
-    source: &str,
-    body: Range<usize>,
-    tokens: &[crate::syntax::Token],
-) -> bool {
-    let first = tokens.partition_point(|token| token.span.end <= body.start);
-    tokens[first..]
-        .iter()
-        .take_while(|token| token.span.start < body.end)
-        .filter(|token| token.kind == crate::syntax::TokenKind::Command)
-        .all(|token| {
-            crate::syntax::command_at(source, token.span.start).is_none_or(|(name, _)| {
-                name == "SetCell" || !TABULARRAY_STYLE_COMMANDS.contains(&name)
-            })
-        })
-}
-
 #[derive(Default, Clone)]
 pub(super) struct DeclaredTypes {
     columns: HashSet<u8>,
+    literal_columns: HashMap<u8, LiteralColumn>,
+    rows: HashSet<u8>,
+    literal_rows: HashMap<u8, LiteralColumn>,
     selectors: HashSet<String>,
     tabularray_defaults: bool,
-    tabularray_siunitx: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LiteralColumn {
+    arguments: usize,
+    justification: Justification,
+}
+
+impl DeclaredTypes {
+    fn for_rows(&self) -> Self {
+        let mut result = self.clone();
+        result.columns.clone_from(&self.rows);
+        result.literal_columns.clone_from(&self.literal_rows);
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -87,12 +85,13 @@ impl TableSpec {
         )
     }
 
-    pub fn local_style(&self, text: &str) -> Result<CellStyle, ()> {
-        if self.is_tabularray() {
-            tabularray::set_cell(text)
-        } else {
-            Ok(CellStyle::default())
-        }
+    pub fn body_styles(
+        &self,
+        source: &str,
+        opaque: &[Range<usize>],
+        cells: impl Iterator<Item = (usize, usize, Range<usize>)>,
+    ) -> Result<tabularray::BodyStyles, ()> {
+        tabularray::BodyStyles::parse(source, opaque, cells)
     }
 }
 
@@ -109,10 +108,7 @@ pub(super) fn declared_types(source: &str, tokens: &[crate::syntax::Token]) -> D
             declared.tabularray_defaults = true;
         }
         if let Some(body) = group(source, skip(source, end), b'{', b'}') {
-            let letter = source[body].trim();
-            if name == "UseTblrLibrary" && letter.split(',').any(|item| item.trim() == "siunitx") {
-                declared.tabularray_siunitx = true;
-            }
+            let letter = source[body.clone()].trim();
             if matches!(name, "NewTblrChildSelector" | "NewTblrChildIndexer") {
                 declared.selectors.insert(letter.to_owned());
             } else if matches!(
@@ -122,11 +118,31 @@ pub(super) fn declared_types(source: &str, tokens: &[crate::syntax::Token]) -> D
                     | "NewColumnType"
                     | "NewTblrColumnType"
                     | "NewTblrColumnRowType"
+                    | "NewColumnRowType"
                     | "NewRowType"
                     | "NewTblrRowType"
             ) && let [byte] = letter.as_bytes()
             {
-                declared.columns.insert(*byte);
+                // Complete local declarations take precedence over common
+                // column defaults; opaque declarations keep the fallback.
+                let literal = literal_column(source, body.end + 1);
+                if !matches!(name, "NewRowType" | "NewTblrRowType") {
+                    declared.columns.insert(*byte);
+                    declared.literal_columns.remove(byte);
+                    if let Some(column) = literal {
+                        declared.literal_columns.insert(*byte, column);
+                    }
+                }
+                if matches!(
+                    name,
+                    "NewRowType" | "NewTblrRowType" | "NewTblrColumnRowType" | "NewColumnRowType"
+                ) {
+                    declared.rows.insert(*byte);
+                    declared.literal_rows.remove(byte);
+                    if let Some(row) = literal {
+                        declared.literal_rows.insert(*byte, row);
+                    }
+                }
             }
         }
     }
@@ -141,11 +157,7 @@ pub(super) fn for_environment(
     if matches!(name, "tabu" | "longtabu") {
         let range = crate::package_tables::tabu_column_spec(header, 0..header.len())?;
         return Some(TableSpec {
-            columns: parse_for_environment(
-                name,
-                &header[range.start + 1..range.end - 1],
-                declared,
-            )?,
+            columns: parse(&header[range.start + 1..range.end - 1], declared)?,
             ray: None,
         });
     }
@@ -197,7 +209,7 @@ pub(super) fn for_environment(
         })
     } else {
         Some(TableSpec {
-            columns: parse_for_environment(name, selected?, declared)?,
+            columns: parse(selected?, declared)?,
             ray: None,
         })
     }
@@ -206,7 +218,7 @@ pub(super) fn for_environment(
 pub(super) fn multicolumn(
     text: &str,
     declared: &DeclaredTypes,
-    environment: Option<&str>,
+    _environment: Option<&str>,
 ) -> Option<(usize, Justification)> {
     let (command, mut cursor) = crate::syntax::command_at(text, 0)?;
     if command != "multicolumn" {
@@ -220,29 +232,8 @@ pub(super) fn multicolumn(
     }
     cursor = skip(text, span.end + 1);
     let spec = group(text, cursor, b'{', b'}')?;
-    let parsed = parse_for_environment(environment.unwrap_or(""), &text[spec], declared)?;
+    let parsed = parse(&text[spec], declared)?;
     (parsed.len() == 1).then_some((count, parsed[0]))
-}
-
-fn parse_for_environment(
-    name: &str,
-    source: &str,
-    declared: &DeclaredTypes,
-) -> Option<Vec<Justification>> {
-    let mut declared = declared.clone();
-    // A column letter only has its built-in meaning in its package grammar.
-    // Other environments may use the same letter for an external definition.
-    declared.columns.insert(b'Q');
-    if name != "tabulary" {
-        declared.columns.extend(*b"LCR");
-    }
-    if !matches!(
-        name,
-        "tabularx" | "xltabular" | "NiceTabularX" | "tabu" | "longtabu"
-    ) {
-        declared.columns.insert(b'X');
-    }
-    parse(source, &declared)
 }
 
 pub(super) fn parse(source: &str, declared: &DeclaredTypes) -> Option<Vec<Justification>> {
@@ -267,6 +258,17 @@ fn parse_into(
             break;
         };
         cursor += 1;
+        if let Some(column) = declared.literal_columns.get(&byte) {
+            for _ in 0..column.arguments {
+                cursor = skip(source, cursor);
+                cursor = group(source, cursor, b'{', b'}')?.end + 1;
+            }
+            output.push(column.justification);
+            if output.len() > MAX_COLUMNS {
+                return None;
+            }
+            continue;
+        }
         if declared.columns.contains(&byte) {
             return None;
         }
@@ -276,8 +278,16 @@ fn parse_into(
             b'r' => Justification::Right,
             b'p' | b'm' | b'b' => {
                 cursor = skip(source, cursor);
+                let mut align = Justification::Left;
+                if source.as_bytes().get(cursor) == Some(&b'[') {
+                    let options = group(source, cursor, b'[', b']')?;
+                    align = option_alignment(&source[options.clone()])
+                        .ok()?
+                        .unwrap_or(align);
+                    cursor = skip(source, options.end + 1);
+                }
                 cursor = group(source, cursor, b'{', b'}')?.end + 1;
-                Justification::Left
+                align
             }
             b'X' | b'Q' | b'L' | b'C' | b'R' => {
                 let align = match byte {
@@ -286,13 +296,27 @@ fn parse_into(
                     _ => Justification::Left,
                 };
                 let after = skip(source, cursor);
-                if source.as_bytes().get(after) == Some(&b'[') {
+                let align = if source.as_bytes().get(after) == Some(&b'[') {
                     let options = group(source, after, b'[', b']')?;
                     cursor = options.end + 1;
                     option_alignment(&source[options]).ok()?.unwrap_or(align)
                 } else {
                     align
+                };
+                if matches!(byte, b'L' | b'C' | b'R') {
+                    let after = skip(source, cursor);
+                    if source.as_bytes().get(after) == Some(&b'{') {
+                        cursor = group(source, after, b'{', b'}')?.end + 1;
+                    }
                 }
+                align
+            }
+            b'S' | b's' => {
+                let after = skip(source, cursor);
+                if source.as_bytes().get(after) == Some(&b'[') {
+                    cursor = group(source, after, b'[', b']')?.end + 1;
+                }
+                Justification::Center
             }
             b'|' | b':' => continue,
             b'>' | b'<' | b'@' | b'!' => {
@@ -334,6 +358,54 @@ fn parse_into(
     Some(())
 }
 
+/// Recognize a single literal column alias and its mandatory argument count.
+/// Width expressions remain opaque; declaration bodies are never executed.
+fn literal_column(source: &str, start: usize) -> Option<LiteralColumn> {
+    let mut cursor = skip(source, start);
+    let mut arguments = 0;
+    if source.as_bytes().get(cursor) == Some(&b'[') {
+        let count = group(source, cursor, b'[', b']')?;
+        arguments = source[count.clone()].trim().parse::<usize>().ok()?;
+        if arguments > 9 {
+            return None;
+        }
+        cursor = skip(source, count.end + 1);
+        // Optional custom arguments require a distinct package-specific model.
+        if source.as_bytes().get(cursor) == Some(&b'[') {
+            return None;
+        }
+    }
+    let body = group(source, cursor, b'{', b'}')?;
+    let body = &source[body];
+    let mut cursor = skip(body, 0);
+    let mut modifier = None;
+    while body.as_bytes().get(cursor) == Some(&b'>') {
+        cursor = skip(body, cursor + 1);
+        let content = group(body, cursor, b'{', b'}')?;
+        let mut at = skip(body, content.start);
+        while at < content.end {
+            let (command, end) = crate::syntax::command_at(body, at)?;
+            modifier = match command {
+                "raggedright" | "RaggedRight" => Some(Justification::Left),
+                "centering" | "Centering" => Some(Justification::Center),
+                "raggedleft" | "RaggedLeft" => Some(Justification::Right),
+                "arraybackslash" => modifier,
+                _ => return None,
+            };
+            at = skip(body, end);
+        }
+        cursor = skip(body, content.end + 1);
+    }
+    let columns = parse(&body[cursor..], &DeclaredTypes::default())?;
+    let [justification] = columns.as_slice() else {
+        return None;
+    };
+    Some(LiteralColumn {
+        arguments,
+        justification: modifier.unwrap_or(*justification),
+    })
+}
+
 fn option_alignment(source: &str) -> Result<Option<Justification>, ()> {
     let mut result = None;
     for option in parts(source).ok_or(())? {
@@ -354,7 +426,7 @@ fn option_alignment(source: &str) -> Result<Option<Justification>, ()> {
             value
         };
         result = match value {
-            "l" => Some(Justification::Left),
+            "l" | "j" => Some(Justification::Left),
             "c" => Some(Justification::Center),
             "r" => Some(Justification::Right),
             _ if required => return Err(()),

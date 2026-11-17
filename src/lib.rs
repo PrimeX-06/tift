@@ -11,7 +11,6 @@ mod foreach;
 pub mod layout;
 pub mod literal_expansion;
 pub mod math_layout;
-mod math_symbols;
 mod packages;
 mod parse_context;
 pub mod ranges;

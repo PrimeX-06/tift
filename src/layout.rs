@@ -272,6 +272,7 @@ fn format_document_inner(
                 )?;
             }
             let code_active = crate::code_layout::is_active(&text, config);
+            let mut math_recheck = false;
             let code_changed = optional_stage(
                 "code",
                 &mut text,
@@ -279,11 +280,16 @@ fn format_document_inner(
                 &mut details,
                 config,
                 code_active,
-                |text| crate::code_layout::format_code(text, kind, config),
+                |text| {
+                    let output = crate::code_layout::format_code(text, kind, config)?;
+                    math_recheck = output.math_recheck;
+                    Ok(output.text)
+                },
             )?;
-            // Code layout can move a formula to a differently indented line.
-            // Re-evaluate math only when that final surrounding layout changed.
-            let math_active = code_changed && crate::math_layout::is_active(&text, config);
+            // Code preserves inline math islands exactly. A changed display
+            // prefix or an uncovered mathematical argument needs rechecking.
+            let math_active =
+                code_changed && math_recheck && crate::math_layout::is_active(&text, config);
             optional_stage(
                 "math-final",
                 &mut text,
@@ -1177,6 +1183,15 @@ pub(crate) fn configured_environment_argument_ranges(
     body: Range<usize>,
     rule: &crate::config::EnvironmentArguments,
 ) -> Vec<Range<usize>> {
+    if let Some(signature) = rule
+        .signature
+        .as_deref()
+        .filter(|signature| crate::syntax::xparse::extended(signature))
+    {
+        return crate::syntax::xparse::Signature::parse(signature)
+            .and_then(|signature| signature.ranges(source, body))
+            .unwrap_or_default();
+    }
     signature_argument_ranges(source, body, rule.slots())
 }
 
@@ -1222,6 +1237,15 @@ pub(crate) fn environment_header_end(
         .get(name)
         .or(source_rule.as_deref())
     {
+        if rule
+            .signature
+            .as_deref()
+            .is_some_and(crate::syntax::xparse::extended)
+        {
+            return configured_environment_argument_ranges(source, body, rule)
+                .last()
+                .map_or(cursor, |range| range.end);
+        }
         for slot in rule.slots() {
             match next_argument(cursor, slot) {
                 Some(end) => cursor = end,

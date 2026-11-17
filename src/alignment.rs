@@ -845,13 +845,8 @@ fn format_alignment_with_context(
                 .syntax
                 .environment_arguments
                 .contains_key(&block.name)
-            && (!crate::package_tables::is_tabularray(&block.name)
-                || !declared_ray_commands
-                    && column_spec::tabularray_body_supported(
-                        source,
-                        content_start..block.body.end,
-                        cached_tokens,
-                    )) {
+            && (!crate::package_tables::is_tabularray(&block.name) || !declared_ray_commands)
+        {
             column_spec::for_environment(
                 &block.name,
                 &source[block.body.start..content_start],
@@ -1433,6 +1428,7 @@ fn row_suffix_end(source: &str, cursor: usize, end: usize) -> (usize, usize) {
 }
 
 struct MeasuredCell<'a> {
+    source: Range<usize>,
     text: Cow<'a, str>,
     span: usize,
     width: usize,
@@ -1463,6 +1459,8 @@ struct RowLayoutContext<'a> {
 }
 
 fn apply_column_spec(
+    source: &str,
+    opaque: &[Range<usize>],
     rows: &mut [MeasuredRow<'_>],
     spec: &column_spec::TableSpec,
     settings: &AlignmentConfig,
@@ -1476,6 +1474,23 @@ fn apply_column_spec(
         .unwrap_or(0)
         .max(spec.column_count());
     let mut omitted: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let body_styles = if spec.is_tabularray() {
+        let mut row_number = 0;
+        let cells = rows.iter().filter(|row| row.data_row).flat_map(|row| {
+            row_number += 1;
+            let mut column_number = 0;
+            row.cells.iter().map(move |cell| {
+                column_number += cell.span;
+                (row_number, column_number, cell.source.clone())
+            })
+        });
+        let Ok(styles) = spec.body_styles(source, opaque, cells) else {
+            return;
+        };
+        Some(styles)
+    } else {
+        None
+    };
     let mut logical_row = 0;
     for row in rows {
         if !row.data_row {
@@ -1483,6 +1498,13 @@ fn apply_column_spec(
         }
         logical_row += 1;
         if !row.eligible {
+            continue;
+        }
+        if body_styles
+            .as_ref()
+            .is_some_and(|styles| !styles.row_supported(logical_row))
+        {
+            row.eligible = false;
             continue;
         }
         // Obsolete multicolumn calls in tabularray do not share SetCell's
@@ -1509,13 +1531,12 @@ fn apply_column_spec(
                 continue;
             }
             let mut style = spec.style(logical_row, column, row_count, column_count);
-            let Ok(local) = spec.local_style(&row.cells[index].text) else {
-                row.eligible = false;
-                break;
-            };
-            style.justification = local.justification.or(style.justification);
-            style.colspan = local.colspan.or(style.colspan);
-            style.rowspan = local.rowspan.or(style.rowspan);
+            if let Some(styles) = &body_styles {
+                let local = styles.style(logical_row, column);
+                style.justification = local.justification.or(style.justification);
+                style.colspan = local.colspan.or(style.colspan);
+                style.rowspan = local.rowspan.or(style.rowspan);
+            }
             row.cells[index].justification = row.cells[index].justification.or(style.justification);
             let span = if spec.is_tabularray() {
                 style.colspan.unwrap_or(1)
@@ -1614,7 +1635,8 @@ fn format_rows(
                     } else {
                         range.end
                     };
-                    let text = edited_source(source, start.min(end)..end, children);
+                    let body_source = start.min(end)..end;
+                    let text = edited_source(source, body_source.clone(), children);
                     let left = text.len() - text.trim_start_matches([' ', '\t', '\r', '\n']).len();
                     let end = trim_cell_end(&text).len();
                     let text = match text {
@@ -1653,6 +1675,7 @@ fn format_rows(
                             .any(|literal| literal == text.as_ref())
                         && !any_match(&rule.dont_measure, &text)?;
                     Ok::<_, FormatError>(MeasuredCell {
+                        source: body_source,
                         text,
                         span,
                         width,
@@ -1700,7 +1723,7 @@ fn format_rows(
     if settings.justification == Justification::Columns
         && let Some(spec) = column_spec
     {
-        apply_column_spec(&mut measured, spec, settings);
+        apply_column_spec(source, opaque, &mut measured, spec, settings);
     }
     let columns = measured
         .iter()

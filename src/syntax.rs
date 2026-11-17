@@ -1,3 +1,10 @@
+pub(crate) mod arguments;
+mod declarations;
+pub(crate) mod xparse;
+pub use declarations::{
+    DeclarationIndex, infer_declaration_config, infer_declaration_config_indexed,
+    infer_declaration_config_with_continuation, infer_declaration_config_with_reuse,
+};
 mod conditions;
 use conditions::{
     ActiveCondition, ConditionalBindings, ConditionalMeaning, dead_branch_needs_protection,
@@ -725,6 +732,7 @@ fn primitive_condition(name: &str) -> bool {
 /// Whether a command opens a primitive, known package, or configured condition.
 pub fn is_condition_command(name: &str, config: &Config) -> bool {
     primitive_condition(name)
+        || conditions::package_condition(name)
         || crate::code_package_syntax::is_condition(name)
         || config
             .syntax
@@ -734,7 +742,8 @@ pub fn is_condition_command(name: &str, config: &Config) -> bool {
 }
 
 fn math_environment(name: &str) -> bool {
-    crate::packages::visual_science::is_display_math(name)
+    crate::packages::math::is_math_environment(name)
+        || crate::packages::visual_science::is_display_math(name)
         || crate::package_environments::is_math(name)
         || matches!(
             name,
@@ -1044,39 +1053,9 @@ fn context_argument(source: &str, cursor: &mut usize, open: u8, close: u8) -> Op
 }
 
 fn context_signature(source: &str, specification: Range<usize>) -> Option<String> {
-    let mut cursor = specification.start;
-    let mut signature = String::new();
-    while cursor < specification.end {
-        cursor = skip_trivia(source, cursor);
-        if cursor >= specification.end {
-            break;
-        }
-        if source.as_bytes()[cursor] == b'+' {
-            cursor = skip_trivia(source, cursor + 1);
-        }
-        match source.as_bytes().get(cursor)? {
-            b'm' => signature.push('m'),
-            b'o' => signature.push('o'),
-            b'O' => {
-                signature.push('o');
-                cursor += 1;
-                context_argument(source, &mut cursor, b'{', b'}')?;
-                if cursor > specification.end {
-                    return None;
-                }
-                if signature.len() > 9 {
-                    return None;
-                }
-                continue;
-            }
-            _ => return None,
-        }
-        if signature.len() > 9 {
-            return None;
-        }
-        cursor += 1;
-    }
-    Some(signature)
+    let text = &source[specification];
+    let signature = xparse::Signature::parse(text)?;
+    Some(signature.compact().unwrap_or_else(|| text.to_owned()))
 }
 
 fn context_macro_declaration(
@@ -1342,6 +1321,156 @@ pub(crate) fn environment_argument_map_with_definitions(
         .collect()
 }
 
+pub(crate) fn command_argument_map_with_definitions(
+    source: &str,
+    config: &Config,
+    protected: &[Range<usize>],
+    definitions: &[MacroDefinition],
+) -> HashMap<String, crate::config::EnvironmentArguments> {
+    if !definitions
+        .iter()
+        .any(|definition| definition.command.is_some())
+    {
+        return HashMap::new();
+    }
+    let mut selected = HashMap::new();
+    let mut cursor = 0;
+    let mut definition_index = 0;
+    let mut depth = 0usize;
+    let mut conditions = 0usize;
+    let mut environments = 0usize;
+    let mut known_conditions = HashSet::new();
+    while cursor < source.len() {
+        let index = protected.partition_point(|range| range.end <= cursor);
+        if let Some(range) = protected.get(index).filter(|range| range.start <= cursor) {
+            cursor = range.end;
+            continue;
+        }
+        while definitions
+            .get(definition_index)
+            .is_some_and(|definition| definition.start < cursor)
+        {
+            definition_index += 1;
+        }
+        if let Some(definition) = definitions
+            .get(definition_index)
+            .filter(|definition| definition.start == cursor)
+        {
+            let finish = definition.end;
+            if let Some(name) = &definition.command {
+                if depth == 0 && environments == 0 {
+                    let base = definition.name.trim_end_matches('*');
+                    if conditions > 0 {
+                        selected.insert(name.clone(), None);
+                    } else if !base.starts_with("Provide")
+                        || !selected.contains_key(name)
+                            && !config.syntax.commands.contains_key(name)
+                            && !context_builtin_command(name)
+                    {
+                        let (_, end) =
+                            command_at(source, cursor).expect("parsed definition command");
+                        let declaration = if base == "newtheorem" {
+                            context_theorem_declaration(source, cursor, &definition.name, end)
+                        } else {
+                            context_macro_declaration(source, cursor, base, end)
+                        };
+                        let arguments = declaration.and_then(|declaration| declaration.arguments);
+                        selected.insert(name.clone(), arguments);
+                    }
+                }
+            } else if depth == 0
+                && environments == 0
+                && let Some(name) = &definition.environment
+            {
+                for target in [Some(name.as_str()), name.strip_prefix("end")]
+                    .into_iter()
+                    .flatten()
+                {
+                    if selected.contains_key(target) {
+                        selected.insert(target.to_owned(), None);
+                    }
+                }
+            }
+            cursor = finish;
+            definition_index += 1;
+            continue;
+        }
+        if source.as_bytes()[cursor] == b'%' {
+            cursor = line_end(source, cursor);
+            continue;
+        }
+        if let Some((command, end)) = command_at(source, cursor) {
+            let base = command.trim_end_matches('*');
+            if base == "newif"
+                && let Some((name, finish)) = command_at(source, skip_trivia(source, end))
+            {
+                known_conditions.insert(name.to_owned());
+                cursor = finish;
+                continue;
+            }
+            if matches!(base, "let" | "futurelet")
+                && let Some(declaration) = context_primitive_declaration(source, cursor, base, end)
+            {
+                if depth == 0 && environments == 0 {
+                    for target in [
+                        Some(declaration.name.as_str()),
+                        declaration.name.strip_prefix("end"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if selected.contains_key(target) {
+                            selected.insert(target.to_owned(), None);
+                        }
+                    }
+                }
+                cursor = let_declaration_end(source, base, end).unwrap_or(declaration.span.end);
+                continue;
+            }
+            if let Some(finish) = primitive_data_end(source, command, end) {
+                cursor = finish;
+                continue;
+            }
+            if let Some((name, begin, finish)) = env_at(source, cursor) {
+                if name != "document" {
+                    if begin {
+                        environments += 1;
+                    } else {
+                        environments = environments.saturating_sub(1);
+                    }
+                }
+                cursor = finish;
+                continue;
+            }
+            match base {
+                "begingroup" | "bgroup" => depth += 1,
+                "endgroup" | "egroup" => depth = depth.saturating_sub(1),
+                "fi" => conditions = conditions.saturating_sub(1),
+                _ if is_condition_command(base, config) || known_conditions.contains(base) => {
+                    conditions += 1
+                }
+                _ => (),
+            }
+            cursor = end;
+            continue;
+        }
+        match source.as_bytes()[cursor] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => (),
+        }
+        cursor += source[cursor..]
+            .chars()
+            .next()
+            .expect("source character")
+            .len_utf8();
+    }
+    selected
+        .into_iter()
+        .filter_map(|(name, arguments)| arguments.map(|arguments| (name, arguments)))
+        .collect()
+}
+
 fn context_factory_range(source: &str, range: &Range<usize>) -> bool {
     let mut cursor = range.start;
     while cursor < range.end {
@@ -1461,6 +1590,7 @@ fn context_builtin_command(name: &str) -> bool {
         || crate::packages::scoped_environment_for_command(name).is_some()
         || primitive_condition(name)
         || crate::package_commands::builtin_command_rule(name).is_some()
+        || crate::packages::math::command(name).is_some()
         || matches!(
             name,
             "input"
@@ -1495,465 +1625,6 @@ fn context_builtin_command(name: &str) -> bool {
                 | "specialcomment"
                 | "processcomment"
         )
-}
-
-/// Augment explicit settings with supported literal declarations from project
-/// sources. The source is used only as declaration context; formatting and
-/// diagnostic offsets continue to refer to the original input file.
-///
-/// Definitions are read in source order outside groups, conditional branches,
-/// comments and protected content. Explicit configuration always wins. Dynamic
-/// or unsupported argument specifications do not inherit an earlier signature.
-pub fn infer_declaration_config(source: &str, config: &Config) -> Result<Config, FormatError> {
-    infer_declaration_config_impl(source, config, false).map(|(config, _)| config)
-}
-
-/// Infer project declarations and retain a completed scanner boundary for an
-/// independently balanced, declaration-free append. Ordinary open scopes keep
-/// their existing lifetime; pending declarations or data operands cannot reuse
-/// the result. The public declaration reuse policy remains a separate gate.
-#[doc(hidden)]
-pub fn infer_declaration_config_with_continuation(
-    source: &str,
-    config: &Config,
-) -> Result<(Config, bool), FormatError> {
-    infer_declaration_config_impl(source, config, true)
-}
-
-fn infer_declaration_config_impl(
-    source: &str,
-    config: &Config,
-    continuation: bool,
-) -> Result<(Config, bool), FormatError> {
-    let has_declaration = has_context_declaration(source);
-    let validate_protection =
-        has_declaration || declaration_protection_validation_needed(source, config);
-    if !has_declaration {
-        // The original no-declaration inference only validates protection
-        // when requested by its established gate. Conservative false metadata
-        // needs no extra reader/protection scan and cannot conceal an error.
-        if validate_protection {
-            protected_ranges(source, config)?;
-        }
-        return Ok((config.clone(), false));
-    }
-    let protected = protected_ranges(source, config)?;
-    let mut append_safe = continuation
-        && declaration_reuse_config_supported(config)
-        && (source.is_empty() || source.ends_with('\n'))
-        && protected
-            .last()
-            .is_none_or(|range| range.end != source.len());
-    let mut selected: HashMap<(bool, String), ContextDeclaration> = HashMap::new();
-    let mut ambiguous = HashSet::new();
-    let mut cursor = 0;
-    let mut protected_index = 0usize;
-    let mut depth = 0usize;
-    let mut conditional_depth = 0usize;
-    let mut environment_depth = 0usize;
-    let mut readable_factory_end = None;
-    let mut continuation_conditions: Vec<(bool, bool)> = Vec::new();
-    let mut continuation_operand_end = 0usize;
-    let mut continuation_groups: Vec<bool> = Vec::new();
-    while cursor < source.len() {
-        while protected
-            .get(protected_index)
-            .is_some_and(|range| range.end <= cursor)
-        {
-            protected_index += 1;
-        }
-        let range = protected
-            .get(protected_index)
-            .filter(|range| range.start <= cursor);
-        if let Some(range) = range.filter(|range| range.start == cursor)
-            && (context_factory_range(source, range) || token_data_range(source, range))
-        {
-            readable_factory_end = Some(range.end);
-        }
-        if let Some(range) = range.filter(|range| readable_factory_end != Some(range.end)) {
-            cursor = range.end;
-            continue;
-        }
-        if source.as_bytes()[cursor] == b'%' {
-            cursor = line_end(source, cursor);
-            continue;
-        }
-        if let Some((command, end)) = command_at(source, cursor) {
-            let base = command.trim_end_matches('*');
-            if append_safe && !declaration_reader_complete(source, command, cursor, end) {
-                append_safe = false;
-            }
-            if append_safe && cursor >= continuation_operand_end {
-                let constructed = (base == "csname")
-                    .then(|| literal_csname(source, cursor))
-                    .flatten();
-                let (executed, executed_end) = constructed
-                    .as_ref()
-                    .map_or((base, end), |(name, finish)| (name.as_str(), *finish));
-                if base == "newif" {
-                    continuation_operand_end = command_at(source, skip_trivia(source, end))
-                        .map_or(end, |(_, finish)| finish);
-                } else if inferred_condition(executed, source, executed_end) {
-                    continuation_conditions.push((executed == "ifcase", false));
-                    continuation_operand_end = primitive_test_end(source, command, end)
-                        .or_else(|| next_character_test_end(source, command, end))
-                        .unwrap_or(executed_end);
-                } else if executed == "fi" {
-                    if continuation_conditions.pop().is_none() {
-                        if let Some(unknown_branch) = continuation_groups.last_mut() {
-                            // Library-specific condition names can occur in
-                            // delayed argument data. Require their surrounding
-                            // ordinary brace group to close in this scan.
-                            *unknown_branch = true;
-                        } else {
-                            append_safe = false;
-                        }
-                    }
-                } else if matches!(executed, "else" | "or") {
-                    if let Some((case, had_else)) = continuation_conditions.last_mut() {
-                        append_safe = !*had_else && (executed != "or" || *case);
-                        *had_else = executed == "else";
-                    } else if let Some(unknown_branch) = continuation_groups.last_mut() {
-                        *unknown_branch = true;
-                    } else {
-                        append_safe = false;
-                    }
-                } else if let Some(finish) = next_character_test_end(source, command, end) {
-                    continuation_operand_end = finish;
-                }
-            }
-            if let Some(finish) = primitive_data_end(source, command, end) {
-                cursor = finish;
-                continue;
-            }
-            if matches!(base, "begingroup" | "bgroup") {
-                depth += 1;
-            } else if matches!(base, "endgroup" | "egroup") {
-                depth = depth.saturating_sub(1);
-            }
-            if is_condition_command(base, config) {
-                conditional_depth += 1;
-            } else if base == "fi" {
-                conditional_depth = conditional_depth.saturating_sub(1);
-            }
-            if let Some((name, begin, finish)) = env_at(source, cursor) {
-                if name != "document" {
-                    if begin {
-                        environment_depth += 1;
-                    } else {
-                        environment_depth = environment_depth.saturating_sub(1);
-                    }
-                }
-                cursor = finish;
-                continue;
-            }
-            if base == "string" || base == "noexpand" {
-                let next = skip_trivia(source, end);
-                cursor = command_at(source, next).map_or_else(
-                    || next + source[next..].chars().next().map_or(0, char::len_utf8),
-                    |(_, end)| end,
-                );
-                continue;
-            }
-            let at_top_level = depth == 0 && conditional_depth == 0 && environment_depth == 0;
-            let in_top_level_condition =
-                depth == 0 && conditional_depth > 0 && environment_depth == 0;
-            let mut declarations = Vec::new();
-            let mut finish = end;
-            if latex_macro_definition(base) {
-                if let Some(declaration) =
-                    context_macro_declaration_with_config(source, cursor, base, end, Some(config))
-                {
-                    finish = declaration.span.end;
-                    declarations.push(declaration);
-                }
-            } else if matches!(base, "def" | "gdef" | "edef" | "xdef" | "let" | "futurelet") {
-                if let Some(declaration) = context_primitive_declaration(source, cursor, base, end)
-                {
-                    finish = declaration.span.end;
-                    if selected.contains_key(&(true, declaration.name.clone())) {
-                        let mut environment = declaration.clone();
-                        environment.environment = true;
-                        declarations.push(environment);
-                    }
-                    if let Some(name) = declaration.name.strip_prefix("end")
-                        && selected.contains_key(&(true, name.to_owned()))
-                    {
-                        let mut environment = declaration.clone();
-                        environment.environment = true;
-                        environment.name = name.to_owned();
-                        declarations.push(environment);
-                    }
-                    declarations.push(declaration);
-                }
-            } else if (at_top_level || in_top_level_condition)
-                && context_declaration_command(base)
-                && !config.syntax.commands.contains_key(base)
-                && !selected.contains_key(&(false, base.to_owned()))
-                && !ambiguous.contains(&(false, base.to_owned()))
-            {
-                if base == "newtheorem" {
-                    if let Some(declaration) =
-                        context_theorem_declaration(source, cursor, command, end)
-                    {
-                        finish = declaration.span.end;
-                        declarations.push(declaration);
-                    }
-                } else if let Some(declaration) = context_box_declaration(source, cursor, base, end)
-                {
-                    finish = declaration.span.end;
-                    declarations.push(declaration);
-                } else if let Some(declaration) =
-                    crate::package_environments::verbatim_declaration(source, base, end)
-                {
-                    finish = declaration.end;
-                    if !declaration.line_delimited {
-                        for name in declaration.names {
-                            declarations.push(ContextDeclaration {
-                                name,
-                                environment: true,
-                                span: cursor..finish,
-                                arguments: None,
-                                raw: true,
-                            });
-                        }
-                    }
-                } else if base == "newlist" {
-                    let mut after = end;
-                    let parsed = (|| {
-                        let name = context_literal_name(
-                            &source[context_argument(source, &mut after, b'{', b'}')?],
-                        )?;
-                        context_literal_name(
-                            &source[context_argument(source, &mut after, b'{', b'}')?],
-                        )?;
-                        source[context_argument(source, &mut after, b'{', b'}')?]
-                            .trim()
-                            .parse::<usize>()
-                            .ok()?;
-                        Some(name)
-                    })();
-                    if let Some(name) = parsed {
-                        finish = after;
-                        declarations.push(ContextDeclaration {
-                            name,
-                            environment: true,
-                            span: cursor..finish,
-                            arguments: Some(crate::config::EnvironmentArguments {
-                                signature: Some("o".into()),
-                                ..Default::default()
-                            }),
-                            raw: false,
-                        });
-                    }
-                }
-            }
-            if append_safe && finish == end && context_declaration_command(command) {
-                // Failed inference can mean an unsupported complete signature,
-                // or a declaration waiting for a later segment. Only a fully
-                // read declaration is a stable append boundary.
-                append_safe = if latex_macro_definition(base)
-                    || matches!(base, "def" | "gdef" | "edef" | "xdef")
-                {
-                    macro_body(source, base, end).is_some()
-                } else if matches!(base, "let" | "futurelet") {
-                    let_declaration_end(source, base, end).is_some()
-                } else if base == "newtheorem" {
-                    context_theorem_declaration(source, cursor, command, end).is_some()
-                } else if base == "newlist" {
-                    let mut after = end;
-                    (0..3).all(|_| context_argument(source, &mut after, b'{', b'}').is_some())
-                } else {
-                    context_box_declaration(source, cursor, base, end).is_some()
-                        || crate::package_environments::verbatim_declaration(source, base, end)
-                            .is_some()
-                };
-            }
-            if at_top_level {
-                let provide = base.starts_with("provide") || base.starts_with("Provide");
-                for declaration in declarations {
-                    let key = (declaration.environment, declaration.name.clone());
-                    let configured = if declaration.environment {
-                        config
-                            .syntax
-                            .environment_arguments
-                            .contains_key(&declaration.name)
-                            || config.protect.environments.contains(&declaration.name)
-                            || config.syntax.list_environments.contains(&declaration.name)
-                            || crate::layout::environment_signature(&declaration.name).is_some()
-                    } else {
-                        config.syntax.commands.contains_key(&declaration.name)
-                            || config.syntax.headings.contains_key(&declaration.name)
-                            || config.protect.commands.contains(&declaration.name)
-                            || context_builtin_command(&declaration.name)
-                    };
-                    if !provide
-                        || !configured && !selected.contains_key(&key) && !ambiguous.contains(&key)
-                    {
-                        ambiguous.remove(&key);
-                        selected.insert(key, declaration);
-                    }
-                }
-            } else if in_top_level_condition {
-                // An unevaluated branch can replace prior syntax. Dropping that
-                // inference keeps later calls conservative without executing TeX.
-                for declaration in declarations {
-                    let key = (declaration.environment, declaration.name);
-                    selected.remove(&key);
-                    ambiguous.insert(key);
-                }
-            }
-            cursor = finish;
-            continue;
-        }
-        match source.as_bytes()[cursor] {
-            b'{' => {
-                depth += 1;
-                if append_safe {
-                    continuation_groups.push(false);
-                }
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                if append_safe {
-                    continuation_groups.pop();
-                }
-            }
-            b'\\' => append_safe = false,
-            _ => (),
-        }
-        cursor += source[cursor..]
-            .chars()
-            .next()
-            .expect("valid position")
-            .len_utf8();
-        // Declaration state changes only at these delimiters. A forward range
-        // cursor bounds the byte search so protected text still participates
-        // in exactly the same declaration/reader decisions.
-        let next_range = protected[protected_index..]
-            .iter()
-            .find(|range| range.start >= cursor)
-            .map_or(source.len(), |range| range.start);
-        cursor = next_inference_delimiter(source.as_bytes(), cursor, next_range);
-    }
-    append_safe &= conditional_depth == 0
-        && continuation_conditions.is_empty()
-        && !continuation_groups
-            .iter()
-            .any(|unknown_branch| *unknown_branch);
-    let mut declarations: Vec<_> = selected.into_values().collect();
-    declarations.sort_by(|left, right| {
-        (left.span.start, left.environment, &left.name).cmp(&(
-            right.span.start,
-            right.environment,
-            &right.name,
-        ))
-    });
-    // Signature configuration does not imply list membership or raw safety.
-    // Keep declaration bodies when either property still needs inference, and
-    // avoid copying/reparsing a command-only context or fully covered targets.
-    let infer_lists = config.syntax.infer_list_environments
-        && declarations.iter().any(|declaration| {
-            declaration.environment && !config.syntax.list_environments.contains(&declaration.name)
-        });
-    let infer_raw = declarations.iter().any(|declaration| {
-        declaration.environment
-            && !declaration.raw
-            && !config.protect.environments.contains(&declaration.name)
-    });
-    let need_declaration_source = infer_lists || infer_raw;
-    let mut declaration_source = String::new();
-    let mut last_span = None;
-    let mut output = config.clone();
-    for declaration in &declarations {
-        if need_declaration_source && last_span.as_ref() != Some(&declaration.span) {
-            declaration_source.push_str(&source[declaration.span.clone()]);
-            declaration_source.push('\n');
-            last_span = Some(declaration.span.clone());
-        }
-        if declaration.environment {
-            if declaration.raw && !output.protect.environments.contains(&declaration.name) {
-                output.protect.environments.push(declaration.name.clone());
-            }
-            if let Some(arguments) = &declaration.arguments {
-                output
-                    .syntax
-                    .environment_arguments
-                    .entry(declaration.name.clone())
-                    .or_insert_with(|| arguments.clone());
-            }
-        } else if declaration.name != "pie"
-            && !output.syntax.commands.contains_key(&declaration.name)
-        {
-            // TikZ installs its picture-local pie alias on every picture entry.
-            // A source binding outside that scope cannot become a global
-            // formatting rule. Explicit user syntax is retained in the clone.
-            let rule = declaration
-                .arguments
-                .as_ref()
-                .and_then(|arguments| {
-                    let signature = arguments.signature.as_deref()?;
-                    let required = signature.strip_prefix('o').unwrap_or(signature);
-                    required
-                        .bytes()
-                        .all(|slot| slot == b'm')
-                        .then(|| crate::config::CommandRule {
-                            arguments: Some(required.len()),
-                            optional_arguments: signature.starts_with('o'),
-                            ..Default::default()
-                        })
-                })
-                .or_else(|| {
-                    context_builtin_command(&declaration.name).then(|| crate::config::CommandRule {
-                        // The original built-in grammar is unavailable. This generic
-                        // rule retains ordinary argument grouping and disables package
-                        // or project-loader assumptions about the overwritten command.
-                        optional_arguments: true,
-                        ..Default::default()
-                    })
-                });
-            if let Some(rule) = rule {
-                output
-                    .syntax
-                    .commands
-                    .entry(declaration.name.clone())
-                    .or_insert(rule);
-            }
-        }
-    }
-    for (environment, name) in ambiguous {
-        if !environment && context_builtin_command(&name) {
-            output
-                .syntax
-                .commands
-                .entry(name)
-                .or_insert(crate::config::CommandRule {
-                    optional_arguments: true,
-                    ..Default::default()
-                });
-        }
-    }
-    if infer_lists {
-        output
-            .syntax
-            .list_environments
-            .extend(infer_list_environments_with_config(
-                &declaration_source,
-                &config.syntax.list_environments,
-                config,
-            ));
-    }
-    if infer_raw {
-        let declaration_ranges = protected_ranges(&declaration_source, &output)?;
-        for name in
-            inferred_protected_environments(&declaration_source, &output, &declaration_ranges)
-        {
-            if !output.protect.environments.contains(&name) {
-                output.protect.environments.push(name);
-            }
-        }
-    }
-    Ok((output, append_safe))
 }
 
 fn next_inference_delimiter(bytes: &[u8], mut cursor: usize, limit: usize) -> usize {
@@ -2781,27 +2452,56 @@ fn inferred_protected_environments(
 
 /// Source regions whose original bytes must survive all formatting passes.
 pub fn protected_ranges(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    let mut ranges = protected_ranges_basic(source, config)?;
+    protected_ranges_impl(source, config, None)
+}
+
+#[doc(hidden)]
+pub fn protected_ranges_with_syntax(
+    source: &str,
+    config: &Config,
+    compiled: &CompiledSyntax,
+) -> Result<Vec<Range<usize>>, FormatError> {
+    protected_ranges_impl(source, config, Some(compiled))
+}
+
+fn protected_ranges_impl(
+    source: &str,
+    config: &Config,
+    compiled: Option<&CompiledSyntax>,
+) -> Result<Vec<Range<usize>>, FormatError> {
+    let owned;
+    let compiled = if let Some(compiled) = compiled {
+        Some(compiled)
+    } else if memchr::memchr2(b'\\', b'%', source.as_bytes()).is_some()
+        || config.syntax.special.iter().any(|rule| rule.verbatim)
+    {
+        owned = compile(&config.syntax).map_err(FormatError::Syntax)?;
+        Some(&owned)
+    } else {
+        None
+    };
+    let mut ranges =
+        protected_ranges_with_inferred_environments(source, config, &[], None, compiled)?;
     if !["environment", "DocumentEnvironment"]
         .iter()
         .any(|name| source.contains(name))
     {
-        add_conditional_environment_protection(source, config, &mut ranges)?;
+        add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
         return Ok(ranges);
     }
     let names = inferred_protected_environments(source, config, &ranges);
     if names.is_empty() {
-        add_conditional_environment_protection(source, config, &mut ranges)?;
+        add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
         return Ok(ranges);
     }
     // Rescan outside definition text, keeping begin, body and end intact.
-    ranges = protected_ranges_with_inferred_environments(source, config, &names, None)?;
-    add_conditional_environment_protection(source, config, &mut ranges)?;
+    ranges = protected_ranges_with_inferred_environments(source, config, &names, None, compiled)?;
+    add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
     Ok(ranges)
 }
 
 fn protected_ranges_basic(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_with_inferred_environments(source, config, &[], None)
+    protected_ranges_with_inferred_environments(source, config, &[], None, None)
 }
 
 pub(crate) fn visual_header_bindings(
@@ -2811,7 +2511,7 @@ pub(crate) fn visual_header_bindings(
 ) -> Result<HashMap<usize, bool>, FormatError> {
     let names = inferred_protected_environments(source, config, protected);
     let mut bindings = HashMap::new();
-    protected_ranges_with_inferred_environments(source, config, &names, Some(&mut bindings))?;
+    protected_ranges_with_inferred_environments(source, config, &names, Some(&mut bindings), None)?;
     Ok(bindings)
 }
 
@@ -2821,6 +2521,7 @@ fn inferred_condition(name: &str, source: &str, end: usize) -> bool {
             && ![
                 "iff",
                 "ifthenelse",
+                "ifpatchable",
                 "iftoggle",
                 "ifboolexpr",
                 "ifstrequal",
@@ -2843,6 +2544,7 @@ fn add_conditional_environment_protection(
     source: &str,
     config: &Config,
     ranges: &mut Vec<Range<usize>>,
+    compiled: Option<&CompiledSyntax>,
 ) -> Result<(), FormatError> {
     if !source.contains("\\csname")
         && !source
@@ -2857,10 +2559,16 @@ fn add_conditional_environment_protection(
     {
         return Ok(());
     }
-    let compiled = compile(&config.syntax).map_err(FormatError::Syntax)?;
+    let owned;
+    let compiled = if let Some(compiled) = compiled {
+        compiled
+    } else {
+        owned = compile(&config.syntax).map_err(FormatError::Syntax)?;
+        &owned
+    };
     let constructed_commands = constant_constructed_commands(source, config, ranges);
     let tokens =
-        lex_with_constructed_commands(source, config, &compiled, ranges, &constructed_commands)?;
+        lex_with_constructed_commands(source, config, compiled, ranges, &constructed_commands)?;
     struct Branch {
         start: usize,
         name: String,
@@ -3350,14 +3058,21 @@ fn protected_ranges_with_inferred_environments(
     config: &Config,
     inferred_environments: &[String],
     mut visual_headers: Option<&mut HashMap<usize, bool>>,
+    compiled: Option<&CompiledSyntax>,
 ) -> Result<Vec<Range<usize>>, FormatError> {
     if memchr::memchr2(b'\\', b'%', source.as_bytes()).is_none()
         && !config.syntax.special.iter().any(|r| r.verbatim)
     {
         return Ok(Vec::new());
     }
-    let compiled = compile(&config.syntax).map_err(FormatError::Syntax)?;
-    let special_matches = special_matches(source, config, &compiled, true)?;
+    let owned;
+    let compiled = if let Some(compiled) = compiled {
+        compiled
+    } else {
+        owned = compile(&config.syntax).map_err(FormatError::Syntax)?;
+        &owned
+    };
+    let special_matches = special_matches(source, config, compiled, true)?;
     let mut ranges = Vec::new();
     let mut pos = 0usize;
     let mut directives = FormatDirectiveState::default();
@@ -3375,6 +3090,8 @@ fn protected_ranges_with_inferred_environments(
         })
         .collect();
     let mut macro_ranges = Vec::new();
+    let mut delayed_key_ranges = std::collections::BTreeMap::new();
+    let mut xparse_bindings: HashMap<(bool, String), xparse::Signature> = HashMap::new();
     let mut package_verbatim: HashMap<String, bool> = HashMap::new();
     let mut package_commands_redefined = HashSet::new();
     let mut visual_overrides = crate::packages::visual_science::Overrides::default();
@@ -3385,6 +3102,11 @@ fn protected_ranges_with_inferred_environments(
     let mut conditional_loops = Vec::new();
     let mut pending_unless = false;
     while pos < source.len() {
+        if let Some(end) = delayed_key_ranges.remove(&pos) {
+            ranges.push(pos..end);
+            pos = end;
+            continue;
+        }
         if inline_tikz_start.is_some_and(|start| start < pos) {
             inline_tikz_start = None;
         }
@@ -3519,6 +3241,24 @@ fn protected_ranges_with_inferred_environments(
                     pos = end;
                     continue;
                 }
+                if begin {
+                    let signature = config
+                        .syntax
+                        .environment_arguments
+                        .get(name)
+                        .and_then(|rule| rule.signature.as_deref())
+                        .filter(|signature| xparse::extended(signature))
+                        .and_then(xparse::Signature::parse);
+                    let signature = signature
+                        .as_ref()
+                        .or_else(|| xparse_bindings.get(&(true, name.to_owned())));
+                    if let Some(arguments) = signature.and_then(|signature| {
+                        signature.literal_ranges(source, finish..source.len())
+                    }) {
+                        delayed_key_ranges
+                            .extend(arguments.into_iter().map(|range| (range.start, range.end)));
+                    }
+                }
                 if begin
                     && !config.syntax.environment_arguments.contains_key(name)
                     && !visual_overrides.contains(name)
@@ -3585,6 +3325,50 @@ fn protected_ranges_with_inferred_environments(
             }
             if let Some((name, end)) = command {
                 let base = name.trim_end_matches('*');
+                if latex_macro_definition(name) {
+                    if let Some(declaration) = context_macro_declaration(source, pos, name, end) {
+                        let key = (declaration.environment, declaration.name);
+                        if let Some(signature) = declaration
+                            .arguments
+                            .and_then(|arguments| arguments.signature)
+                            .filter(|signature| xparse::extended(signature))
+                            .and_then(|signature| xparse::Signature::parse(&signature))
+                        {
+                            if catcode_scopes.is_empty() && active_conditions.is_empty() {
+                                xparse_bindings.insert(key, signature);
+                            }
+                        } else {
+                            xparse_bindings.remove(&key);
+                        }
+                    }
+                } else if matches!(base, "def" | "gdef" | "edef" | "xdef" | "let" | "futurelet")
+                    && let Some((target, _)) = command_at(source, skip_trivia(source, end))
+                {
+                    xparse_bindings.remove(&(false, target.to_owned()));
+                }
+                let configured = config.syntax.commands.get(base);
+                let signature = configured
+                    .and_then(|rule| rule.signature.as_deref())
+                    .filter(|signature| xparse::extended(signature))
+                    .and_then(xparse::Signature::parse);
+                let signature = signature.as_ref().or_else(|| {
+                    configured
+                        .is_none()
+                        .then(|| xparse_bindings.get(&(false, base.to_owned())))
+                        .flatten()
+                });
+                if let Some(signature) = signature {
+                    let start = end - usize::from(name.ends_with('*'));
+                    if let Some(arguments) = signature.literal_ranges(source, start..source.len()) {
+                        delayed_key_ranges.extend(
+                            arguments
+                                .into_iter()
+                                .filter(|range| range.start >= end)
+                                .map(|range| (range.start, range.end)),
+                        );
+                    }
+                }
+
                 let uncertain = active_conditions.iter().any(|condition| {
                     condition.meaning == ConditionalMeaning::Other
                         || condition.meaning == ConditionalMeaning::Case
@@ -3715,30 +3499,17 @@ fn protected_ranges_with_inferred_environments(
                         pos = finish;
                         continue;
                     }
+                    delayed_key_ranges.extend(
+                        crate::packages::keys::delayed_ranges(source, name, end)
+                            .into_iter()
+                            .map(|range| (range.start, range.end)),
+                    );
                     if let Some(finish) = (!config
                         .protect
                         .commands
                         .iter()
                         .any(|command| command == base || command == name))
-                    .then(|| {
-                        crate::package_commands::subcaption_command_header_end(source, name, end)
-                            .or_else(|| {
-                                crate::packages::visual_science::command_header_end(
-                                    source, name, end,
-                                )
-                            })
-                            .or_else(|| {
-                                crate::packages::common_more::command_header_end(source, name, end)
-                            })
-                            .or_else(|| {
-                                crate::packages::indexing::command_header_end(source, name, end)
-                            })
-                            .or_else(|| {
-                                crate::packages::tikz_utilities::command_header_end(
-                                    source, name, end,
-                                )
-                            })
-                    })
+                    .then(|| crate::packages::command_data_end(source, name, end))
                     .flatten()
                     {
                         ranges.push(end..finish);
@@ -3930,7 +3701,7 @@ fn protected_ranges_with_inferred_environments(
                                 source,
                                 start..finish,
                                 config,
-                                &compiled,
+                                compiled,
                                 &conditional_bindings,
                             ))
                     {
@@ -4037,6 +3808,10 @@ fn protected_ranges_with_inferred_environments(
                     .map_or(source.len(), |i| pos + i);
                 let next = memchr::memchr(b'}', &source.as_bytes()[pos..])
                     .map_or(next, |i| next.min(pos + i));
+                let next = delayed_key_ranges
+                    .range(pos..)
+                    .next()
+                    .map_or(next, |(&start, _)| next.min(start));
                 pos = macro_ranges
                     .last()
                     .filter(|r| r.start >= pos)
@@ -5227,7 +5002,23 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         blocks[i].body.end = token.span.end;
                         blocks[i].end = token.span.end..token.span.end;
                     }
-                    let signature =
+                    let declared_rule = if config.config.syntax.commands.contains_key(base) {
+                        None
+                    } else {
+                        analysis.command_arguments(base)
+                    };
+                    let user_signature = config
+                        .config
+                        .syntax
+                        .commands
+                        .get(base)
+                        .and_then(|rule| rule.signature.as_deref())
+                        .or_else(|| {
+                            declared_rule
+                                .as_deref()
+                                .and_then(|rule| rule.signature.as_deref())
+                        });
+                    let package_signature =
                         match crate::packages::command_signature(source, name, token.span.end) {
                             Some(signature)
                                 if matches!(kind, BlockKind::Command | BlockKind::Heading)
@@ -5238,7 +5029,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             }
                             _ => None,
                         };
-                    if let Some(signature) = signature {
+                    if let Some(signature) = user_signature.or(package_signature) {
                         let limit = stack
                             .iter()
                             .rev()
@@ -5250,11 +5041,19 @@ fn parse_blocks_from_tokens<S: NameStore>(
                                     .flatten()
                             })
                             .unwrap_or(source.len());
-                        let ranges = crate::layout::signature_argument_ranges(
-                            source,
-                            token.span.end..limit,
-                            signature.bytes(),
-                        );
+                        let start = token.span.end
+                            - usize::from(user_signature.is_some() && name.ends_with('*'));
+                        let ranges = if xparse::extended(signature) {
+                            xparse::Signature::parse(signature)
+                                .and_then(|signature| signature.ranges(source, start..limit))
+                                .unwrap_or_default()
+                        } else {
+                            crate::layout::signature_argument_ranges(
+                                source,
+                                start..limit,
+                                signature.bytes(),
+                            )
+                        };
                         if let Some(last) = ranges.last() {
                             blocks[i].body.end = last.end;
                             blocks[i].end = last.end..last.end;
@@ -5573,7 +5372,7 @@ pub fn declaration_reuse_boundary_status(
     source: &str,
     config: &Config,
 ) -> DeclarationReuseBoundary {
-    use DeclarationReuseBoundary::{Pending, PolicyRefused, Safe};
+    use DeclarationReuseBoundary::Pending;
     if !declaration_reuse_config_supported(config) || !source.is_empty() && !source.ends_with('\n')
     {
         return Pending;
@@ -5581,6 +5380,19 @@ pub fn declaration_reuse_boundary_status(
     let Ok(ranges) = protected_ranges(source, config) else {
         return Pending;
     };
+    declaration_reuse_boundary_with_ranges(source, config, &ranges)
+}
+
+fn declaration_reuse_boundary_with_ranges(
+    source: &str,
+    config: &Config,
+    ranges: &[Range<usize>],
+) -> DeclarationReuseBoundary {
+    use DeclarationReuseBoundary::{Pending, PolicyRefused, Safe};
+    if !declaration_reuse_config_supported(config) || !source.is_empty() && !source.ends_with('\n')
+    {
+        return Pending;
+    }
     // EOF protection may contain a pending raw environment, catcode region,
     // formatter-off block or macro body completed by a later file.
     if ranges.last().is_some_and(|range| range.end == source.len()) {
@@ -5742,20 +5554,73 @@ pub fn declaration_neutral_segment_with_syntax(
     config: &Config,
     compiled: &CompiledSyntax,
 ) -> bool {
-    if !declaration_reuse_config_supported(config) || has_context_declaration(source) {
+    if !declaration_reuse_config_supported(config) {
         return false;
     }
     if source.contains("tift:") || source.contains("tex-fmt:") {
         return false;
     }
+    if source.trim().is_empty() {
+        return true;
+    }
+    // Reject an early declaration before allocating a full protection scan.
+    // Once a possible literal opener is seen, its body needs the range-aware
+    // check below because documentation examples can contain declarations.
     for (start, _) in source.match_indices('\\') {
+        let Some((name, _)) = command_at(source, start) else {
+            return false;
+        };
+        let base = name.trim_end_matches('*');
+        if base == "begin"
+            || config
+                .protect
+                .commands
+                .iter()
+                .any(|command| command == base || command == name)
+            || config
+                .syntax
+                .commands
+                .get(base)
+                .is_some_and(|rule| rule.verbatim || rule.preserve_body)
+        {
+            break;
+        }
+        if context_declaration_command(base) {
+            return false;
+        }
+    }
+    let Ok(ranges) = protected_ranges_with_syntax(source, config, compiled) else {
+        return false;
+    };
+    if ranges.last().is_some_and(|range| range.end == source.len()) {
+        return false;
+    }
+    let mut protected_index = 0;
+    for (start, _) in source.match_indices('\\') {
+        // Literal examples can contain declaration and reader tokens. Their
+        // bodies cannot change the state inherited by the following file.
+        // Keep checking the opener itself: a protected macro declaration or
+        // catcode command still changes that state.
+        while ranges
+            .get(protected_index)
+            .is_some_and(|range| range.end <= start)
+        {
+            protected_index += 1;
+        }
+        if ranges
+            .get(protected_index)
+            .is_some_and(|range| range.start < start)
+        {
+            continue;
+        }
         let Some((name, end)) = command_at(source, start) else {
             return false;
         };
         let base = name.trim_end_matches('*');
         let conditional =
             inferred_condition(base, source, end) || matches!(base, "fi" | "else" | "or");
-        if declaration_cross_segment_command(base) && !conditional
+        if context_declaration_command(base)
+            || declaration_cross_segment_command(base) && !conditional
             || matches!(
                 base,
                 "string"
@@ -5769,15 +5634,6 @@ pub fn declaration_neutral_segment_with_syntax(
         {
             return false;
         }
-    }
-    if source.trim().is_empty() {
-        return true;
-    }
-    let Ok(ranges) = protected_ranges(source, config) else {
-        return false;
-    };
-    if ranges.last().is_some_and(|range| range.end == source.len()) {
-        return false;
     }
     let Ok(tokens) = lex_with_ranges(source, config, compiled, &ranges) else {
         return false;

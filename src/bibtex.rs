@@ -1,6 +1,6 @@
 //! BibTeX layout with a dedicated value lexer.
 //!
-//! Defaults normalize names and assignments while preserving field order and
+//! Defaults align assignments while preserving name case, field order and
 //! the source of every value expression. Braced
 //! and quoted values, concatenation, macros, string definitions, and preambles
 //! are parsed without applying LaTeX whitespace transformations inside values.
@@ -8,6 +8,7 @@
 use crate::syntax::{self, FormatDirectiveState};
 use crate::{CompiledConfig, FormatError};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::ops::Range;
 
 mod normalization;
@@ -16,8 +17,10 @@ mod normalization;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BibtexConfig {
-    /// Lowercase entry types and regular field names; align assignments when enabled.
+    /// Normalize assignment layout; align assignments when enabled.
     pub normalize: bool,
+    /// `preserve`, `lower`, or `upper` for entry types and regular field names.
+    pub name_case: String,
     /// Align regular field assignments while normalizing.
     pub align_fields: bool,
     /// `preserve`, `braces`, or `quotes`; applies only to safe literal value pieces.
@@ -35,12 +38,23 @@ impl Default for BibtexConfig {
     fn default() -> Self {
         Self {
             normalize: true,
+            name_case: "preserve".into(),
             align_fields: true,
             value_delimiters: "preserve".into(),
             field_order: Vec::new(),
             sort: false,
             sort_by: vec!["key".into()],
             case_sensitive: false,
+        }
+    }
+}
+
+impl BibtexConfig {
+    fn name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        match self.name_case.as_str() {
+            "lower" => Cow::Owned(name.to_ascii_lowercase()),
+            "upper" => Cow::Owned(name.to_ascii_uppercase()),
+            _ => Cow::Borrowed(name),
         }
     }
 }
@@ -95,6 +109,17 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
         if !matches!(bytes.get(open), Some(b'{' | b'(')) {
             if kind.eq_ignore_ascii_case("comment") {
                 cursor = line_end(source, cursor, source.len());
+                write_outside_protected(
+                    &mut output,
+                    source,
+                    copy_start..entry_start,
+                    maximum_blank_lines,
+                    &protected,
+                );
+                output.push('@');
+                output.push_str(&config.config.bibtex.name(kind));
+                output.push_str(&source[type_start + kind.len()..cursor]);
+                copy_start = cursor;
                 continue;
             }
             return Err(syntax_error(
@@ -116,7 +141,9 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
                 maximum_blank_lines,
                 &protected,
             );
-            output.push_str(&source[entry_start..cursor]);
+            output.push('@');
+            output.push_str(&config.config.bibtex.name(kind));
+            output.push_str(&source[type_start + kind.len()..cursor]);
             copy_start = cursor;
             continue;
         }
@@ -130,13 +157,7 @@ pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, Fo
         let base = entry_indent(source, entry_start);
         let indent = format!("{base}{}", config.config.indent.unit("bibtex", kind));
         let body_start = open + 1;
-        let normalized_kind;
-        let printed_kind = if config.config.bibtex.normalize {
-            normalized_kind = kind.to_ascii_lowercase();
-            normalized_kind.as_str()
-        } else {
-            kind
-        };
+        let printed_kind = config.config.bibtex.name(kind);
         let opening = format!("@{printed_kind}{}", char::from(bytes[open]));
         let closing = &source[close..close + 1];
         if kind.eq_ignore_ascii_case("preamble") {
@@ -523,6 +544,7 @@ fn format_fields(
 ) -> Result<String, FormatError> {
     if !string_definition
         && (config.normalize
+            || config.name_case != "preserve"
             || !config.field_order.is_empty()
             || config.value_delimiters != "preserve")
     {

@@ -33,11 +33,13 @@ pub struct ProjectContext {
     
     
     
+    
 }
 
 #[derive(Default)]
 struct InputGraph {
     source: String,
+    declaration_index: syntax::DeclarationIndex,
     // Keep the full source for positions, restoration and error diagnostics.
     // Independently neutral spans need only one newline in later inference.
     inference_source: String,
@@ -65,6 +67,9 @@ struct InputGraph {
     
     
     
+    
+    
+    
 }
 
 struct DeclarationMemo {
@@ -72,6 +77,7 @@ struct DeclarationMemo {
     options: Arc<Config>,
     safe: bool,
     independent_append_safe: bool,
+    reader_settled: bool,
     compiled: Option<Arc<syntax::CompiledSyntax>>,
 }
 
@@ -83,7 +89,7 @@ struct LiteralInputState {
 
 impl DeclarationMemo {
     fn neutral(&self, source: &str) -> bool {
-        (self.safe || self.independent_append_safe)
+        (self.safe || self.independent_append_safe || self.reader_settled)
             && self.compiled.as_ref().is_some_and(|compiled| {
                 syntax::declaration_neutral_segment_with_syntax(source, &self.options, compiled)
             })
@@ -180,30 +186,32 @@ impl InputGraph {
                 continue;
             };
             let name = name.trim_end_matches('*');
-            if !matches!(
-                name,
-                "def"
-                    | "gdef"
-                    | "edef"
-                    | "xdef"
-                    | "let"
-                    | "futurelet"
-                    | "newcommand"
-                    | "renewcommand"
-                    | "providecommand"
-                    | "NewDocumentCommand"
-                    | "RenewDocumentCommand"
-                    | "ProvideDocumentCommand"
-                    | "DeclareDocumentCommand"
-                    | "DeclareRobustCommand"
-                    | "DeclareMathOperator"
-                    | "newenvironment"
-                    | "renewenvironment"
-                    | "NewDocumentEnvironment"
-                    | "RenewDocumentEnvironment"
-                    | "ProvideDocumentEnvironment"
-                    | "DeclareDocumentEnvironment"
-            ) {
+            if !scalar_binding_command(name)
+                && !matches!(
+                    name,
+                    "def"
+                        | "gdef"
+                        | "edef"
+                        | "xdef"
+                        | "let"
+                        | "futurelet"
+                        | "newcommand"
+                        | "renewcommand"
+                        | "providecommand"
+                        | "NewDocumentCommand"
+                        | "RenewDocumentCommand"
+                        | "ProvideDocumentCommand"
+                        | "DeclareDocumentCommand"
+                        | "DeclareRobustCommand"
+                        | "DeclareMathOperator"
+                        | "newenvironment"
+                        | "renewenvironment"
+                        | "NewDocumentEnvironment"
+                        | "RenewDocumentEnvironment"
+                        | "ProvideDocumentEnvironment"
+                        | "DeclareDocumentEnvironment"
+                )
+            {
                 continue;
             }
             let mut target = trivia_end(source, end);
@@ -221,6 +229,12 @@ impl InputGraph {
             }
             if let Some((target, _)) = syntax::command_at(source, target) {
                 self.binding_targets.insert(target.to_owned());
+                if name == "newif"
+                    && let Some(flag) = target.strip_prefix("if")
+                {
+                    self.binding_targets.insert(format!("{flag}true"));
+                    self.binding_targets.insert(format!("{flag}false"));
+                }
             }
         }
     }
@@ -229,13 +243,46 @@ impl InputGraph {
         let Some(memo) = &self.last_options else {
             return false;
         };
+        let Some(compiled) = memo.compiled.as_ref() else {
+            return false;
+        };
+        let Ok(protected) = syntax::protected_ranges_with_syntax(source, &memo.options, compiled)
+        else {
+            return false;
+        };
+        let mut protected_index = 0;
         for (start, _) in source.match_indices('\\') {
+            while protected
+                .get(protected_index)
+                .is_some_and(|range| range.end <= start)
+            {
+                protected_index += 1;
+            }
+            if protected
+                .get(protected_index)
+                .is_some_and(|range| range.start < start)
+            {
+                continue;
+            }
             let Some((name, end)) = syntax::command_at(source, start) else {
                 return false;
             };
             let name = name.trim_end_matches('*');
             if self.binding_targets.contains(name)
                 || memo.options.syntax.commands.contains_key(name)
+                || scalar_binding_command(name)
+                || matches!(
+                    name,
+                    "count"
+                        | "dimen"
+                        | "skip"
+                        | "muskip"
+                        | "toks"
+                        | "globaldefs"
+                        | "advance"
+                        | "multiply"
+                        | "divide"
+                )
                 || matches!(
                     name,
                     "expandafter"
@@ -312,14 +359,17 @@ impl InputGraph {
         }
         
         
-        let result =
-            syntax::infer_declaration_config_with_continuation(&self.inference_source, config);
+        let result = syntax::infer_declaration_config_indexed(
+            &self.inference_source,
+            config,
+            &mut self.declaration_index,
+        );
         // Re-run failures against the full source so error positions and the
         // established diagnostic remain exact after neutral text compaction.
-        let (inferred, independent_append_safe) = result
+        let (inferred, independent_append_safe, inferred_boundary) = result
             .or_else(|error| {
                 if self.inference_source.len() != self.source.len() {
-                    syntax::infer_declaration_config_with_continuation(&self.source, config)
+                    syntax::infer_declaration_config_with_reuse(&self.source, config)
                 } else {
                     Err(error)
                 }
@@ -338,7 +388,11 @@ impl InputGraph {
             syntax::DeclarationReuseBoundary::PolicyRefused
         } else {
             
-            syntax::declaration_reuse_boundary_status(&self.source, config)
+            if self.inference_source.len() == self.source.len() {
+                inferred_boundary
+            } else {
+                syntax::declaration_reuse_boundary_status(&self.source, config)
+            }
         };
         
         self.boundary_policy_refused |= boundary == syntax::DeclarationReuseBoundary::PolicyRefused;
@@ -354,6 +408,7 @@ impl InputGraph {
             options: Arc::clone(&options),
             safe,
             independent_append_safe,
+            reader_settled: self.declaration_index.reader_settled(),
             compiled,
         });
         Ok(options)
@@ -382,18 +437,24 @@ impl InputGraph {
         self.inference_source.push_str(suffix);
         
         
-        let inferred =
-            syntax::infer_declaration_config(&self.inference_source, config).or_else(|error| {
-                if length != self.source.len() {
-                    let full_length = self.source.len();
-                    self.source.push_str(suffix);
-                    let result = syntax::infer_declaration_config(&self.source, config);
-                    self.source.truncate(full_length);
-                    result
-                } else {
-                    Err(error)
-                }
-            });
+        let mut preview_index = self.declaration_index.clone();
+        let inferred = syntax::infer_declaration_config_indexed(
+            &self.inference_source,
+            config,
+            &mut preview_index,
+        )
+        .map(|(options, _, _)| options)
+        .or_else(|error| {
+            if length != self.source.len() {
+                let full_length = self.source.len();
+                self.source.push_str(suffix);
+                let result = syntax::infer_declaration_config(&self.source, config);
+                self.source.truncate(full_length);
+                result
+            } else {
+                Err(error)
+            }
+        });
         
         self.inference_source.truncate(length);
         inferred
@@ -413,6 +474,34 @@ impl InputGraph {
         
         result
     }
+}
+
+fn scalar_binding_command(name: &str) -> bool {
+    matches!(
+        name,
+        "newif"
+            | "chardef"
+            | "mathchardef"
+            | "Umathchardef"
+            | "countdef"
+            | "dimendef"
+            | "skipdef"
+            | "muskipdef"
+            | "toksdef"
+            | "attributedef"
+            | "integerdef"
+            | "newcount"
+            | "newdimen"
+            | "newskip"
+            | "newmuskip"
+            | "newtoks"
+            | "newbox"
+            | "newread"
+            | "newwrite"
+            | "newfam"
+            | "newinsert"
+            | "newmarks"
+    )
 }
 
 impl ProjectContext {
@@ -716,6 +805,25 @@ impl ProjectContext {
             {
                 continue;
             }
+            // A literal loader without a local target contributes only its
+            // original source text. Leave it in the pending suffix instead of
+            // creating a declaration checkpoint and scanning the cumulative
+            // graph twice. Dynamic filenames still need prefix inference.
+            
+            let prune_unresolved = true;
+            
+            if prune_unresolved && !input.name.contains('\\') {
+                let mut local_target = false;
+                for name in input.name.split(',').filter(|name| !name.is_empty()) {
+                    if self.input_path(name, path, root)?.is_some() {
+                        local_target = true;
+                        break;
+                    }
+                }
+                if !local_target {
+                    continue;
+                }
+            }
             // Read only as far as this candidate. Later text can use raw
             // environments whose definitions have not been imported yet.
             let Ok((inputs, document_start)) = graph.literal_inputs(&source[..input.span.end])
@@ -777,6 +885,9 @@ impl ProjectContext {
         }
         graph.append_line(&source[cursor..]);
         if !graph.file_ends.contains_key(path) {
+            // Retain the exact first-inclusion state. Incomplete file tails
+            // keep lazy restoration; a later source may complete their reader.
+            let _ = graph.infer(path, config);
             graph
                 .file_ends
                 .insert(path.to_path_buf(), graph.source.len());
@@ -1018,8 +1129,8 @@ fn literal_inputs_with_syntax(
     compiled: &syntax::CompiledSyntax,
 ) -> Result<(Vec<Input>, Option<usize>), String> {
     let options = macro_protected_config(config);
-    let protected =
-        { syntax::protected_ranges(source, &options).map_err(|error| error.to_string())? };
+    let protected = syntax::protected_ranges_with_syntax(source, &options, compiled)
+        .map_err(|error| error.to_string())?;
     let tokens = {
         syntax::lex_with_ranges(source, &options, compiled, &protected)
             .map_err(|error| error.to_string())?

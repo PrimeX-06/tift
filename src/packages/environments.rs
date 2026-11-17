@@ -102,6 +102,7 @@ pub(crate) const ADDITIONAL_LIST_ENVIRONMENTS: &[&str] = &[
 
 pub(crate) fn is_package_item(name: &str, environment: &str) -> bool {
     name.trim_end_matches('*') == "task" && environment == "tasks"
+        || name == "qitem" && environment == "epigraphs"
         || crate::document_environments::is_item(name, environment)
 }
 
@@ -304,6 +305,7 @@ pub(crate) fn is_block(name: &str) -> bool {
     crate::packages::visual_science::is_block(name)
         || crate::packages::common_extensions::is_block(name)
         || crate::packages::common_more::is_block(name)
+        || crate::packages::classic::is_block(name)
         || (has_additional_signature(name) && !is_box(name))
         || crate::class_environments::header_signature(name).is_some()
         || crate::document_environments::header_signature(name).is_some()

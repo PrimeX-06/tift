@@ -135,6 +135,29 @@ fn default_package_commands() -> std::collections::BTreeMap<String, crate::confi
     use crate::config::CommandRule;
     let mut commands = default_biblatex_commands();
     super::add_extra_commands(&mut commands);
+    for (name, shape) in [
+        // natbib citations read two optional notes before the citation keys.
+        ("citet", "oom"),
+        ("citep", "oom"),
+        ("citeauthor", "oom"),
+        ("citeyear", "oom"),
+        // etoolbox targets are single TeX tokens or braced control sequences.
+        ("patchcmd", "ommmmm"),
+        ("apptocmd", "ommmm"),
+        ("pretocmd", "ommmm"),
+        ("ifpatchable", "mmmm"),
+        ("appto", "mm"),
+        ("preto", "mm"),
+    ] {
+        commands.insert(
+            name.into(),
+            CommandRule {
+                arguments: Some(shape.bytes().filter(|&slot| slot == b'm').count()),
+                optional_arguments: shape.contains('o'),
+                ..Default::default()
+            },
+        );
+    }
     for (name, count, optional) in [
         // adjustbox commands collect their final content argument.
         ("adjustbox", 2, false),
@@ -205,6 +228,55 @@ pub(crate) fn builtin_command_rule(name: &str) -> Option<&'static crate::config:
         .get_or_init(default_package_commands)
         .get(name.trim_end_matches('*'))
         .or_else(|| crate::document_environments::command_rule(name))
+}
+
+fn separated_star(source: &str, name: &str, end: usize) -> bool {
+    !name.ends_with('*') && source.as_bytes().get(trivia(source, end)) == Some(&b'*')
+}
+
+/// Ordered citation notes and delayed macro-patching arguments.
+pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    let separated = separated_star(source, name, end);
+    Some(match name.trim_end_matches('*') {
+        "citet" | "citep" | "citeauthor" | "citeyear" => {
+            if separated {
+                "moom"
+            } else {
+                "oom"
+            }
+        }
+        "patchcmd" => "ommmmm",
+        "apptocmd" | "pretocmd" => "ommmm",
+        "appto" | "preto" => "mm",
+        "ifpatchable" if separated => "mmmm",
+        "ifpatchable" if name.ends_with('*') => "mmm",
+        "ifpatchable" => "mmmm",
+        _ => return subcaption_command_signature(source, name, end),
+    })
+}
+
+pub(crate) fn is_metadata_command(name: &str) -> bool {
+    matches!(
+        name.trim_end_matches('*'),
+        "patchcmd" | "apptocmd" | "pretocmd" | "appto" | "preto" | "ifpatchable"
+    )
+}
+
+/// Search/replacement tokens and appended code retain their source bytes.
+/// Immediate success/failure branches remain available for nested formatting.
+pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    let shape = match name.trim_end_matches('*') {
+        "patchcmd" => "ommm",
+        "apptocmd" | "pretocmd" => "omm",
+        "appto" | "preto" => "mm",
+        "ifpatchable" if separated_star(source, name, end) => "mm",
+        "ifpatchable" if name.ends_with('*') => "m",
+        "ifpatchable" => "mm",
+        _ => return subcaption_command_header_end(source, name, end),
+    };
+    // Incomplete calls do not establish a metadata boundary.
+    crate::syntax::arguments::signature_end(source, end, command_signature(source, name, end)?)?;
+    crate::syntax::arguments::signature_end(source, end, shape).filter(|&finish| finish > end)
 }
 
 fn mandatory_argument_end(source: &str, start: usize) -> Option<usize> {

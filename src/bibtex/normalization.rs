@@ -96,6 +96,9 @@ fn valid_name(name: &str) -> bool {
 }
 
 pub(super) fn validate(config: &BibtexConfig) -> Result<(), String> {
+    if !matches!(config.name_case.as_str(), "preserve" | "lower" | "upper") {
+        return Err("bibtex.name-case must be preserve, lower, or upper".into());
+    }
     if !matches!(
         config.value_delimiters.as_str(),
         "preserve" | "braces" | "quotes"
@@ -379,15 +382,11 @@ pub(super) fn format_fields(
     for field in entry.fields {
         write_comments(&mut output, &field.before, indent, newline);
         output.push_str(indent);
-        let name = if config.normalize {
-            field.name.to_ascii_lowercase()
-        } else {
-            field.name.into()
-        };
+        let name = config.name(field.name);
         output.push_str(&name);
         output.extend(std::iter::repeat_n(
             ' ',
-            width.saturating_sub(UnicodeWidthStr::width(name.as_str())),
+            width.saturating_sub(UnicodeWidthStr::width(name.as_ref())),
         ));
         output.push_str(" = ");
         output.push_str(&normalize_value(

@@ -17,17 +17,29 @@ pub enum FileKind {
 impl FileKind {
     pub fn from_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?;
-        if extension.eq_ignore_ascii_case("tex") {
+        if ["tex", "ltx", "drv"]
+            .iter()
+            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        {
             Some(Self::Tex)
         } else if extension.eq_ignore_ascii_case("tikz") {
             Some(Self::Tikz)
-        } else if extension.eq_ignore_ascii_case("sty") {
+        } else if ["sty", "def", "cfg", "fd", "bbx", "cbx", "lbx", "dbx"]
+            .iter()
+            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        {
             Some(Self::Style)
-        } else if extension.eq_ignore_ascii_case("cls") {
+        } else if ["cls", "clo"]
+            .iter()
+            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        {
             Some(Self::Class)
         } else if extension.eq_ignore_ascii_case("bib") {
             Some(Self::Bibtex)
-        } else if extension.eq_ignore_ascii_case("dtx") {
+        } else if ["dtx", "fdd"]
+            .iter()
+            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        {
             Some(Self::Dtx)
         } else if extension.eq_ignore_ascii_case("ins") {
             Some(Self::Ins)
@@ -187,6 +199,20 @@ impl CompiledConfig {
 }
 
 fn validate_environment_arguments(config: &Config) -> Result<(), ConfigError> {
+    for (name, rule) in &config.syntax.commands {
+        if let Some(signature) = &rule.signature {
+            if rule.arguments.is_some() || rule.optional_arguments {
+                return Err(ConfigError(format!(
+                    "command signature for {name:?} cannot be combined with arguments or optional-arguments"
+                )));
+            }
+            if crate::syntax::xparse::Signature::parse(signature).is_none() {
+                return Err(ConfigError(format!(
+                    "invalid xparse command signature for {name:?}"
+                )));
+            }
+        }
+    }
     for (name, rule) in &config.syntax.environment_arguments {
         if rule.arguments > 256 {
             return Err(ConfigError(format!(
@@ -199,9 +225,14 @@ fn validate_environment_arguments(config: &Config) -> Result<(), ConfigError> {
                     "environment signature for {name:?} cannot be combined with arguments or optional-arguments"
                 )));
             }
-            if signature.len() > 256 || !signature.bytes().all(|slot| b"moOpgld".contains(&slot)) {
+            let valid = if crate::syntax::xparse::extended(signature) {
+                crate::syntax::xparse::Signature::parse(signature).is_some()
+            } else {
+                signature.len() <= 256
+            };
+            if !valid {
                 return Err(ConfigError(format!(
-                    "environment signature for {name:?} must contain at most 256 slots from m, o, O, p, g, l and d"
+                    "environment signature for {name:?} must use a valid xparse specification or at most 256 slots from m, o, O, p, g, l and d"
                 )));
             }
         }
@@ -615,6 +646,7 @@ impl Default for HeadingRule {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandRule {
+    pub signature: Option<String>,
     pub arguments: Option<usize>,
     pub optional_arguments: bool,
     pub verbatim: bool,

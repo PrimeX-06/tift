@@ -1,6 +1,8 @@
 //! Literal tabularray inner keys, applied in their original order.
 
 use super::{CellStyle, DeclaredTypes, Justification, MAX_COLUMNS, MAX_DEPTH, group, parts, skip};
+use std::collections::HashSet;
+use std::ops::Range;
 
 const MAX_RULES: usize = 256;
 
@@ -17,6 +19,167 @@ enum Rule {
         selected: Vec<(Selector, Selector)>,
         style: CellStyle,
     },
+}
+
+/// Table commands are extracted in row-major source order after inner keys.
+/// A later row or column command also applies to earlier source cells.
+pub(crate) struct BodyStyles {
+    rules: Vec<(BodySelection, CellStyle)>,
+    invalid_rows: HashSet<usize>,
+}
+
+enum BodySelection {
+    All,
+    Row(usize),
+    Column(usize),
+    Cell(usize, usize),
+}
+
+impl BodyStyles {
+    pub fn parse(
+        source: &str,
+        opaque: &[Range<usize>],
+        cells: impl Iterator<Item = (usize, usize, Range<usize>)>,
+    ) -> Result<Self, ()> {
+        let mut result = Self {
+            rules: Vec::new(),
+            invalid_rows: HashSet::new(),
+        };
+        for (row, column, range) in cells {
+            let text = &source[range.clone()];
+            let mut cursor = 0;
+            while cursor < text.len() {
+                cursor = skip(text, cursor);
+                let absolute = range.start + cursor;
+                let protected = opaque.partition_point(|item| item.end <= absolute);
+                if let Some(item) = opaque.get(protected)
+                    && item.start <= absolute
+                    && absolute < item.end
+                {
+                    cursor = item.end.min(range.end) - range.start;
+                    continue;
+                }
+                match text.as_bytes().get(cursor) {
+                    Some(b'{') => {
+                        cursor = group(text, cursor, b'{', b'}').ok_or(())?.end + 1;
+                    }
+                    Some(b'\\') => {
+                        let (name, end) = crate::syntax::command_at(text, cursor).ok_or(())?;
+                        cursor = end;
+                        if name == "begin" {
+                            cursor = nested_environment_end(text, cursor)?;
+                            continue;
+                        }
+                        if !super::TABULARRAY_STYLE_COMMANDS.contains(&name) {
+                            continue;
+                        }
+                        let parsed = body_command(text, cursor, name);
+                        let (style, end) = match parsed {
+                            Ok(value) => value,
+                            Err(()) if name == "SetCell" => {
+                                result.invalid_rows.insert(row);
+                                break;
+                            }
+                            Err(()) => return Err(()),
+                        };
+                        cursor = end;
+                        let selection = match name {
+                            "SetRow" => BodySelection::Row(row),
+                            "SetColumn" => BodySelection::Column(column),
+                            "SetCell" => BodySelection::Cell(row, column),
+                            _ => BodySelection::All,
+                        };
+                        result.rules.push((selection, style));
+                        if result.rules.len() > MAX_COLUMNS {
+                            return Err(());
+                        }
+                    }
+                    Some(_) => cursor += text[cursor..].chars().next().ok_or(())?.len_utf8(),
+                    None => break,
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn row_supported(&self, row: usize) -> bool {
+        !self.invalid_rows.contains(&row)
+    }
+
+    pub fn style(&self, row: usize, column: usize) -> CellStyle {
+        let mut result = CellStyle::default();
+        for (selection, style) in &self.rules {
+            let selected = match *selection {
+                BodySelection::All => true,
+                BodySelection::Row(selected) => selected == row,
+                BodySelection::Column(selected) => selected == column,
+                BodySelection::Cell(selected_row, selected_column) => {
+                    selected_row == row && selected_column == column
+                }
+            };
+            if selected {
+                result.overlay(*style);
+            }
+        }
+        result
+    }
+}
+
+fn nested_environment_end(source: &str, start: usize) -> Result<usize, ()> {
+    let name = group(source, skip(source, start), b'{', b'}').ok_or(())?;
+    let expected = &source[name.clone()];
+    let mut cursor = name.end + 1;
+    let mut depth = 1usize;
+    while cursor < source.len() {
+        cursor = skip(source, cursor);
+        match source.as_bytes().get(cursor) {
+            Some(b'{') => cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1,
+            Some(b'\\') => {
+                let (name, end) = crate::syntax::command_at(source, cursor).ok_or(())?;
+                cursor = end;
+                if matches!(name, "begin" | "end") {
+                    let environment = group(source, skip(source, cursor), b'{', b'}').ok_or(())?;
+                    if &source[environment.clone()] == expected {
+                        if name == "begin" {
+                            depth += 1;
+                            if depth > MAX_DEPTH {
+                                return Err(());
+                            }
+                        } else {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Ok(environment.end + 1);
+                            }
+                        }
+                    }
+                    cursor = environment.end + 1;
+                }
+            }
+            Some(_) => cursor += source[cursor..].chars().next().ok_or(())?.len_utf8(),
+            None => break,
+        }
+    }
+    Err(())
+}
+
+fn body_command(source: &str, start: usize, name: &str) -> Result<(CellStyle, usize), ()> {
+    let cell = matches!(name, "SetCell" | "SetCells");
+    let mut style = CellStyle {
+        colspan: cell.then_some(1),
+        rowspan: cell.then_some(1),
+        ..CellStyle::default()
+    };
+    let mut cursor = skip(source, start);
+    if source.as_bytes().get(cursor) == Some(&b'[') {
+        let options = group(source, cursor, b'[', b']').ok_or(())?;
+        if cell {
+            style.overlay(span_keys(&source[options.clone()])?);
+        }
+        cursor = skip(source, options.end + 1);
+    }
+    let body = group(source, cursor, b'{', b'}').ok_or(())?;
+    style.overlay(alignment_keys(&source[body.clone()])?);
+    Ok((style, body.end + 1))
 }
 
 impl Spec {
@@ -56,7 +219,7 @@ impl Spec {
                 }
                 "rowspec" => result
                     .rules
-                    .push(Rule::Rows(preamble(unbrace(value)?, declared)?)),
+                    .push(Rule::Rows(preamble(unbrace(value)?, &declared.for_rows())?)),
                 "columns" | "rows" | "cells" => {
                     let style = style_value(value, key == "cells")?;
                     result.rules.push(Rule::Cells {
@@ -260,34 +423,6 @@ fn span_keys(source: &str) -> Result<CellStyle, ()> {
     Ok(result)
 }
 
-pub(super) fn set_cell(source: &str) -> Result<CellStyle, ()> {
-    let mut cursor = skip(source, 0);
-    let mut result = CellStyle::default();
-    let mut count = 0;
-    while let Some((command, end)) = crate::syntax::command_at(source, cursor) {
-        if command != "SetCell" {
-            break;
-        }
-        count += 1;
-        if count > 32 {
-            return Err(());
-        }
-        // Each SetCell call resets both spans before applying its own keys.
-        result.colspan = Some(1);
-        result.rowspan = Some(1);
-        cursor = skip(source, end);
-        if source.as_bytes().get(cursor) == Some(&b'[') {
-            let options = group(source, cursor, b'[', b']').ok_or(())?;
-            result.overlay(span_keys(&source[options.clone()])?);
-            cursor = skip(source, options.end + 1);
-        }
-        let body = group(source, cursor, b'{', b'}').ok_or(())?;
-        result.overlay(alignment_keys(&source[body.clone()])?);
-        cursor = skip(source, body.end + 1);
-    }
-    Ok(result)
-}
-
 fn preamble(source: &str, declared: &DeclaredTypes) -> Result<Vec<CellStyle>, ()> {
     let mut result = Vec::new();
     preamble_into(source, declared, &mut result, 0)?;
@@ -313,6 +448,20 @@ fn preamble_into(
             break;
         };
         cursor += 1;
+        if let Some(column) = declared.literal_columns.get(&kind) {
+            for _ in 0..column.arguments {
+                cursor = skip(source, cursor);
+                cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+            }
+            result.push(CellStyle {
+                justification: Some(column.justification),
+                ..CellStyle::default()
+            });
+            if result.len() > MAX_COLUMNS {
+                return Err(());
+            }
+            continue;
+        }
         if declared.columns.contains(&kind) {
             return Err(());
         }
@@ -321,10 +470,28 @@ fn preamble_into(
                 justification: Some(alignment(&source[cursor - 1..cursor])?),
                 ..CellStyle::default()
             },
-            b'Q' | b'X' | b'S' | b's' => {
-                if matches!(kind, b'S' | b's') && !declared.tabularray_siunitx {
-                    return Err(());
+            b'L' | b'C' | b'R' => {
+                let justification = match kind {
+                    b'C' => Justification::Center,
+                    b'R' => Justification::Right,
+                    _ => Justification::Left,
+                };
+                let mut style = CellStyle {
+                    justification: Some(justification),
+                    ..CellStyle::default()
+                };
+                cursor = skip(source, cursor);
+                if source.as_bytes().get(cursor) == Some(&b'[') {
+                    let options = group(source, cursor, b'[', b']').ok_or(())?;
+                    style.overlay(alignment_keys(&source[options.clone()])?);
+                    cursor = skip(source, options.end + 1);
                 }
+                if source.as_bytes().get(cursor) == Some(&b'{') {
+                    cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+                }
+                style
+            }
+            b'Q' | b'X' | b'S' | b's' => {
                 cursor = skip(source, cursor);
                 let mut style = if matches!(kind, b'S' | b's') {
                     CellStyle {

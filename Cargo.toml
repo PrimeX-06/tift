@@ -2,7 +2,7 @@
 autotests = false
 autobenches = false
 name = "tift"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.90"
 description = "A configurable, fast LaTeX source formatter"
@@ -15,7 +15,6 @@ keywords = ["latex", "formatter", "tex", "bibtex"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-badness-formatter = "0.12.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_mangen = "0.2"
@@ -36,7 +35,7 @@ thiserror = "2"
 fs2 = "0.4"
 
 [profile.release]
-lto = "thin"
+lto = false
 codegen-units = 1
 
 [profile.dev]

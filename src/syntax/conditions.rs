@@ -9,6 +9,41 @@ use super::{
 };
 use crate::Config;
 
+/// Engine and output switches supplied by iftex and its compatibility packages.
+/// Their truth values depend on the TeX run and remain unknown to source layout.
+pub(super) fn package_condition(name: &str) -> bool {
+    matches!(
+        name,
+        "ifpdf"
+            | "ifxetex"
+            | "ifluatex"
+            | "ifpdftex"
+            | "ifptex"
+            | "ifuptex"
+            | "ifptexng"
+            | "ifvtex"
+            | "ifvtexdvi"
+            | "ifvtexpdf"
+            | "ifvtexps"
+            | "ifaleph"
+            | "iftex"
+            | "ifXeTeX"
+            | "ifLuaTeX"
+            | "ifPDFTeX"
+            | "ifpTeX"
+            | "ifupTeX"
+            | "ifpTeXng"
+            | "ifVTeX"
+            | "ifAleph"
+            | "ifluahbtex"
+            | "ifLuaHBTeX"
+            | "ifhint"
+            | "ifHINT"
+            | "ifetex"
+            | "ifeTeX"
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConditionalMeaning {
     True,

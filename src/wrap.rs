@@ -355,6 +355,16 @@ pub(crate) fn format_text_with_context(
     stage: Stage,
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, crate::FormatError> {
+    format_text_with_arguments(source, config, stage, parsing, true)
+}
+
+fn format_text_with_arguments(
+    source: &str,
+    config: &crate::CompiledConfig,
+    stage: Stage,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+    arguments: bool,
+) -> Result<String, crate::FormatError> {
     let wrap_here = config.config.wrap.mode != "preserve" && config.config.wrap.when == stage;
     let sentences_here = config.config.sentences.enabled && config.config.sentences.when == stage;
     if !wrap_here && !sentences_here {
@@ -774,11 +784,20 @@ pub(crate) fn format_text_with_context(
         sentences_active,
         &mut output,
     )?;
-    if wrap_active
+    if arguments
+        && wrap_active
         && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap")
         && !config.text.text_commands.is_empty()
     {
-        format_text_arguments(&output, config, parsing)
+        let (formatted, unblocked) = format_text_arguments(&output, config, parsing)?;
+        if unblocked && config.config.wrap.mode == "rewrap" {
+            // A formerly multiline inline atom no longer blocks its paragraph.
+            // Reflow that newly available prose with the final argument text;
+            // argument layout is already complete for this stage.
+            format_text_with_arguments(&formatted, config, stage, parsing, false)
+        } else {
+            Ok(formatted)
+        }
     } else {
         Ok(output)
     }
@@ -1039,7 +1058,7 @@ fn format_text_arguments(
     source: &str,
     config: &crate::CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
-) -> Result<String, crate::FormatError> {
+) -> Result<(String, bool), crate::FormatError> {
     // Custom grammar can assign these tokens another role or alter the group
     // ownership used for indentation. Preserve text arguments in that case.
     let grammar = &config.config.syntax;
@@ -1051,17 +1070,17 @@ fn format_text_arguments(
         || !grammar.special.is_empty()
         || !config.config.protect.dynamic_catcodes
     {
-        return Ok(source.to_owned());
+        return Ok((source.to_owned(), false));
     }
     if !memchr::memchr_iter(b'\\', source.as_bytes()).any(|offset| {
         crate::syntax::command_at(source, offset)
             .is_some_and(|(name, _)| config.text.text_commands.contains(name))
     }) {
-        return Ok(source.to_owned());
+        return Ok((source.to_owned(), false));
     }
     let mut protected = parsing.snapshot(source, false, false)?.protected.clone();
     let Ok(parsed) = parsing.snapshot(source, true, true) else {
-        return Ok(source.to_owned());
+        return Ok((source.to_owned(), false));
     };
     let blocks = parsed.blocks.as_deref().expect("text argument structure");
     for block in blocks {
@@ -1078,6 +1097,7 @@ fn format_text_arguments(
     let mut output = String::with_capacity(source.len());
     let mut copied = 0;
     let mut cursor = 0;
+    let mut unblocked = false;
     while cursor < source.len() {
         if let Some(range) = containing(cursor, &protected) {
             cursor = range.end;
@@ -1156,6 +1176,7 @@ fn format_text_arguments(
                     &declared,
                 );
                 if replacement != source[body.clone()] {
+                    unblocked |= source[body.clone()].contains('\n') && !replacement.contains('\n');
                     output.push_str(&source[copied..body.start]);
                     output.push_str(&replacement);
                     copied = body.end;
@@ -1179,7 +1200,7 @@ fn format_text_arguments(
         }
     }
     output.push_str(&source[copied..]);
-    Ok(output)
+    Ok((output, unblocked))
 }
 
 fn argument_continuation(
@@ -1565,7 +1586,11 @@ fn canonicalize(
     for region in regions {
         let text = &source[region.range.clone()];
         let start = region.range.start + text.len() - text.trim_start_matches([' ', '\t']).len();
-        let end = region.range.end - text.len() + text.trim_end_matches([' ', '\t']).len();
+        let mut end = region.range.end - text.len() + text.trim_end_matches([' ', '\t']).len();
+        if end < region.range.end && crate::syntax::is_escaped(source, end) {
+            // The first trailing whitespace belongs to a control-space token.
+            end += 1;
+        }
         if start >= end {
             continue;
         }

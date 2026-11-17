@@ -5,10 +5,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
-use badness_formatter::ast::{AstNode, Command, Environment};
-use badness_formatter::parser::{LatexFlavor, LexConfig, parse_with_flavor};
-use badness_formatter::syntax::{SyntaxKind, SyntaxNode};
-use badness_formatter::{FormatStyle, MathWrap, WrapMode};
+mod printer;
+mod scanner;
 
 use crate::{CompiledConfig, FileKind, FormatError, syntax};
 
@@ -36,32 +34,6 @@ pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
             && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
 }
 
-pub(crate) fn lex_config(kind: FileKind) -> LexConfig {
-    LexConfig {
-        flavor: if matches!(kind, FileKind::Style | FileKind::Class | FileKind::Ins) {
-            LatexFlavor::Package
-        } else {
-            LatexFlavor::Document
-        },
-        dtx: kind == FileKind::Dtx,
-    }
-}
-
-pub(crate) fn style(config: &CompiledConfig) -> FormatStyle {
-    FormatStyle {
-        indent_width: config.config.indent.width,
-        line_width: config.config.wrap.columns,
-        wrap: WrapMode::Preserve,
-        math_wrap: MathWrap::Preserve,
-        ..FormatStyle::default()
-    }
-}
-
-fn range(node: &SyntaxNode) -> Range<usize> {
-    let range = node.text_range();
-    usize::from(range.start())..usize::from(range.end())
-}
-
 fn overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
@@ -87,121 +59,105 @@ pub(crate) fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     result
 }
 
-/// Capture complete formulas, including math-domain arguments outside delimiters.
-/// The dedicated code printer receives opaque placeholders for these ranges.
-pub(crate) fn math_ranges(root: &SyntaxNode) -> Vec<Range<usize>> {
-    if mathematical_node(root) {
-        return vec![range(root)];
-    }
-    let mut ranges = Vec::new();
-    let mut pending = vec![root.children()];
-    while let Some(children) = pending.last_mut() {
-        let Some(node) = children.next() else {
-            pending.pop();
-            continue;
-        };
-        let mathematical = mathematical_node(&node);
-        if mathematical {
-            ranges.push(range(&node));
-        } else {
-            pending.push(node.children());
-        }
-    }
-    merged(ranges)
+/// Capture complete formulas and curated math-domain commands as opaque source.
+pub(crate) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
+    scanner::math_ranges(source, protected)
 }
 
-fn mathematical_node(node: &SyntaxNode) -> bool {
-    match node.kind() {
-        SyntaxKind::INLINE_MATH | SyntaxKind::DISPLAY_MATH => true,
-        SyntaxKind::ENVIRONMENT => Environment::cast(node.clone())
-            .and_then(|environment| environment.name())
-            .is_some_and(|name| math_environment(&name)),
-        SyntaxKind::COMMAND => Command::cast(node.clone())
-            .and_then(|command| command.name())
-            .is_some_and(|name| {
-                matches!(
-                    name.as_str(),
-                    "ensuremath"
-                        | "frac"
-                        | "dfrac"
-                        | "tfrac"
-                        | "binom"
-                        | "dbinom"
-                        | "tbinom"
-                        | "overset"
-                        | "underset"
-                        | "stackrel"
-                        | "sqrt"
-                        | "mathchoice"
-                        | "boxed"
-                        | "prescript"
-                        | "tensor"
-                        | "sideset"
-                        | "mathrel"
-                        | "mathbin"
-                        | "mathord"
-                        | "mathop"
-                        | "mathopen"
-                        | "mathclose"
-                        | "mathpunct"
-                        | "mathinner"
-                        | "smash"
-                        | "vphantom"
-                        | "hphantom"
-                        | "phantom"
-                )
-            }),
-        _ => false,
-    }
+fn mathematical_command(name: &str) -> bool {
+    crate::packages::math::command(name).is_some_and(|signature| signature.domains.contains('M'))
+        || matches!(
+            name,
+            "ensuremath"
+                | "frac"
+                | "dfrac"
+                | "tfrac"
+                | "binom"
+                | "dbinom"
+                | "tbinom"
+                | "overset"
+                | "underset"
+                | "stackrel"
+                | "sqrt"
+                | "mathchoice"
+                | "boxed"
+                | "prescript"
+                | "tensor"
+                | "sideset"
+                | "mathrel"
+                | "mathbin"
+                | "mathord"
+                | "mathop"
+                | "mathopen"
+                | "mathclose"
+                | "mathpunct"
+                | "mathinner"
+                | "smash"
+                | "vphantom"
+                | "hphantom"
+                | "phantom"
+        )
+}
+
+pub(crate) fn algorithm_environment(name: &str) -> bool {
+    matches!(
+        name.trim_end_matches('*'),
+        "algorithm" | "algorithm2e" | "algocf"
+    )
+}
+
+pub(crate) fn expl3_regions(source: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
+    scanner::expl3_regions(source, protected)
 }
 
 fn math_environment(name: &str) -> bool {
-    matches!(
-        name.trim_end_matches('*'),
-        "math"
-            | "displaymath"
-            | "equation"
-            | "align"
-            | "alignat"
-            | "aligned"
-            | "alignedat"
-            | "flalign"
-            | "gather"
-            | "gathered"
-            | "multline"
-            | "multlined"
-            | "split"
-            | "eqnarray"
-            | "array"
-            | "subarray"
-            | "cases"
-            | "dcases"
-            | "rcases"
-            | "drcases"
-            | "matrix"
-            | "pmatrix"
-            | "bmatrix"
-            | "Bmatrix"
-            | "vmatrix"
-            | "Vmatrix"
-            | "smallmatrix"
-            | "NiceMatrix"
-            | "pNiceMatrix"
-            | "bNiceMatrix"
-            | "BNiceMatrix"
-            | "vNiceMatrix"
-            | "VNiceMatrix"
-            | "NiceArray"
-            | "pNiceArray"
-            | "bNiceArray"
-            | "BNiceArray"
-            | "vNiceArray"
-            | "VNiceArray"
-            | "subequations"
-            | "empheq"
-            | "IEEEeqnarray"
-            | "IEEEeqnarraybox"
-    )
+    crate::packages::math::is_math_environment(name)
+        || matches!(
+            name.trim_end_matches('*'),
+            "math"
+                | "displaymath"
+                | "equation"
+                | "align"
+                | "alignat"
+                | "aligned"
+                | "alignedat"
+                | "flalign"
+                | "gather"
+                | "gathered"
+                | "multline"
+                | "multlined"
+                | "split"
+                | "eqnarray"
+                | "array"
+                | "subarray"
+                | "cases"
+                | "dcases"
+                | "rcases"
+                | "drcases"
+                | "matrix"
+                | "pmatrix"
+                | "bmatrix"
+                | "Bmatrix"
+                | "vmatrix"
+                | "Vmatrix"
+                | "smallmatrix"
+                | "NiceMatrix"
+                | "pNiceMatrix"
+                | "bNiceMatrix"
+                | "BNiceMatrix"
+                | "vNiceMatrix"
+                | "VNiceMatrix"
+                | "NiceArray"
+                | "pNiceArray"
+                | "bNiceArray"
+                | "BNiceArray"
+                | "vNiceArray"
+                | "VNiceArray"
+                | "subequations"
+                | "empheq"
+                | "IEEEeqnarray"
+                | "IEEEeqnarraybox"
+        )
 }
 
 pub(crate) struct Opaque {
@@ -396,41 +352,67 @@ fn indent_fragment(formatted: &str, original: &str, prefix: &str) -> String {
     output
 }
 
+pub(crate) struct CodeOutput {
+    pub text: String,
+    pub math_recheck: bool,
+}
+
 pub(crate) fn format_code(
     source: &str,
-    kind: FileKind,
+    _kind: FileKind,
     config: &CompiledConfig,
-) -> Result<String, FormatError> {
+) -> Result<CodeOutput, FormatError> {
     if !is_active(source, config) {
-        return Ok(source.to_owned());
+        return Ok(CodeOutput {
+            text: source.to_owned(),
+            math_recheck: false,
+        });
     }
-    let parsed = parse_with_flavor(source, lex_config(kind));
-    let root = parsed.syntax();
-    let protected = protected_ranges(source, config, config.config.code.expl3)?;
+    let mut protected = protected_ranges(source, config, config.config.code.expl3)?;
+    if config.config.code.expl3 {
+        // Keep module names opaque while exposing the key-definition command
+        // to the code printer. Explicit whole-invocation protection stays intact.
+        let prefixes = scanner::commands(source, &[])
+            .into_iter()
+            .filter(|(_, name, _)| *name == "keys_define:nn")
+            .filter_map(|(start, _, end)| {
+                let arguments = crate::layout::signature_argument_ranges(
+                    source,
+                    end..source.len(),
+                    "mm".bytes(),
+                );
+                arguments.first().map(|argument| (start, argument.clone()))
+            })
+            .collect::<Vec<_>>();
+        for range in &mut protected {
+            if let Some((_, argument)) = prefixes
+                .iter()
+                .find(|(_, argument)| range.start <= argument.start && range.end == argument.end)
+            {
+                // Leave the argument delimiters available to the expl3
+                // printer while preserving the module name byte for byte.
+                range.start = argument.start + 1;
+                range.end = argument.end - 1;
+            }
+        }
+    }
     // Declarations use the user's original protection policy. Validate it
     // even when there are no algorithm fragments, preserving prior errors.
-    let declaration_protection = if config.config.code.expl3 && config.config.protect.expl3 {
-        Cow::Owned(syntax::protected_ranges(source, &config.config)?)
+    let declaration_protection = if config.config.code.expl3 {
+        let mut scope_config = config.config.clone();
+        scope_config.protect.expl3 = true;
+        Cow::Owned(syntax::protected_ranges(source, &scope_config)?)
     } else {
         Cow::Borrowed(protected.as_slice())
     };
     let mut fragments = Vec::new();
     if config.config.code.algorithm2e {
-        for environment in root.descendants().filter_map(Environment::cast) {
-            let Some(name) = environment.name() else {
-                continue;
-            };
-            if !matches!(
-                name.as_str(),
-                "algorithm" | "algorithm*" | "algorithm2e" | "algorithm2e*" | "algocf" | "algocf*"
-            ) {
-                continue;
-            }
-            if environment.end().is_none() {
-                continue;
-            }
-            fragments.push((range(environment.syntax()), false));
-        }
+        fragments.extend(
+            scanner::environments(source, &protected)
+                .into_iter()
+                .filter(|(name, _)| algorithm_environment(name))
+                .map(|(_, range)| (range, false)),
+        );
         if !fragments.is_empty() {
             let definitions =
                 syntax::macro_definitions_with_ranges(source, &declaration_protection);
@@ -452,16 +434,62 @@ pub(crate) fn format_code(
     }
     if config.config.code.expl3 {
         fragments.extend(
-            badness_formatter::formatter::core::expl3_regions(&root)
+            expl3_regions(source, &protected)
                 .into_iter()
-                .map(|range| (usize::from(range.start())..usize::from(range.end()), true)),
+                .map(|mut range| {
+                    // Executed expl3 boundaries include local catcode restoration.
+                    if let Some(scope) = declaration_protection
+                        .iter()
+                        .find(|scope| scope.start <= range.start && range.start < scope.end)
+                    {
+                        range.end = range.end.min(scope.end);
+                        if source.as_bytes().get(range.end.saturating_sub(1)) == Some(&b'}') {
+                            range.end -= 1;
+                        }
+                    }
+                    (range, true)
+                }),
         );
     }
     fragments.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
     if fragments.is_empty() {
-        return Ok(source.to_owned());
+        return Ok(CodeOutput {
+            text: source.to_owned(),
+            math_recheck: false,
+        });
     }
-    let mathematics = math_ranges(&root);
+    let mathematics = math_ranges(source, &protected);
+    let recheck_ranges = if config.config.math.enabled {
+        mathematics
+            .iter()
+            .filter(|range| {
+                let body = &source[(*range).clone()];
+                body.starts_with("\\[") || body.starts_with("$$") || body.starts_with("\\begin")
+            })
+            .cloned()
+            .chain(
+                scanner::commands(source, &protected)
+                    .into_iter()
+                    .filter(|(_, name, _)| {
+                        matches!(
+                            *name,
+                            "mathbb"
+                                | "mathcal"
+                                | "mathfrak"
+                                | "mathrm"
+                                | "mathbf"
+                                | "mathit"
+                                | "mathsf"
+                                | "mathtt"
+                        )
+                    })
+                    .map(|(start, _, end)| start..end),
+            )
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut math_recheck = false;
     let mut output = String::with_capacity(source.len());
     let mut cursor = 0;
     for (fragment, expl3) in fragments {
@@ -487,33 +515,7 @@ pub(crate) fn format_code(
         // A conditional or catcode region is kept together with all of its bytes.
         opaque.retain(|range| !range.is_empty());
         let opaque = Opaque::new(original, opaque);
-        let input = if expl3 {
-            format!("\\ExplSyntaxOn\n{}\n\\ExplSyntaxOff\n", opaque.source())
-        } else {
-            opaque.source().to_owned()
-        };
-        let Ok(mut formatted) = badness_formatter::formatter::format_with_style_flavored(
-            &input,
-            style(config),
-            if expl3 {
-                LatexFlavor::Package
-            } else {
-                LatexFlavor::Document
-            },
-        ) else {
-            continue;
-        };
-        if expl3 {
-            let Some(start) = formatted.find('\n').map(|position| position + 1) else {
-                continue;
-            };
-            let Some(end) = formatted.rfind("\\ExplSyntaxOff") else {
-                continue;
-            };
-            formatted = formatted[start..end]
-                .trim_end_matches(['\r', '\n'])
-                .to_owned();
-        }
+        let formatted = printer::format(opaque.source(), expl3, config.config.indent.width);
         let line_start = source[..fragment.start]
             .rfind('\n')
             .map_or(0, |position| position + 1);
@@ -532,12 +534,20 @@ pub(crate) fn format_code(
         let Some(formatted) = opaque.restore(&formatted) else {
             continue;
         };
+        if formatted != original {
+            math_recheck |= !overlapping_ranges(&recheck_ranges, &fragment).is_empty();
+        }
+        // A successfully printed enclosing fragment owns its nested fragments
+        // even when its bytes already match the printer's output.
         output.push_str(&source[cursor..fragment.start]);
         output.push_str(&formatted);
         cursor = fragment.end;
     }
     output.push_str(&source[cursor..]);
-    Ok(output)
+    Ok(CodeOutput {
+        text: output,
+        math_recheck,
+    })
 }
 
 
