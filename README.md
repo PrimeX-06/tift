@@ -41,7 +41,7 @@ Label&Value\\Longer label&42\\
 </td></tr></tbody>
 </table>
 
-**[User guide](https://github.com/PrimeX-06/tift/wiki)** · **[Formatting examples](https://github.com/PrimeX-06/tift/wiki/Formatting-Examples)** · **[Changelog](https://github.com/PrimeX-06/tift/blob/main/CHANGELOG.md)** · **[Report an issue](https://github.com/PrimeX-06/tift/issues)**
+**[User guide](https://github.com/PrimeX-06/tift/wiki)** · **[Formatting examples](https://github.com/PrimeX-06/tift/wiki/Formatting-Examples)** · **[Report an issue](https://github.com/PrimeX-06/tift/issues)**
 
 ## Features
 
@@ -49,10 +49,8 @@ Label&Value\\Longer label&42\\
 - Align table columns, equations, and matrices, and format math spacing.
 - Format, sort, and optionally clean up BibTeX and BibLaTeX bibliographies.
 - Wrap long prose and captions to a chosen line width.
-- Configure formula spacing, display line breaks, and preferred break operators.
-- Optionally align multiline key/value assignments and expand table column specifications, literal `\foreach` lists, and bracket trees.
 - Support common LaTeX packages and CJK documents.
-- Preserve source in supported code blocks, inline literals, custom listings, and `algorithmic` pseudocode.
+- Preserve verbatim content and allow local formatting controls.
 - Format whole projects, preview changes, and check formatting in CI.
 
 ## Install
@@ -99,28 +97,6 @@ columns = 88
 tift discovers project settings automatically. The [configuration guide](https://github.com/PrimeX-06/tift/wiki/Configuration-Guide) explains setup; the [reference](https://github.com/PrimeX-06/tift/wiki/Configuration) lists all options.
 
 Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
-
-This example sets display math to 88 columns and prefers breaks at relations before additive operators. It also enables optional layout for multiline key/value assignments, literal `\foreach` lists, table column specifications, and bracket trees.
-
-```toml
-[math]
-spacing = true
-wrap = "break"
-columns = 88
-break-priority = ["relation", "additive"]
-
-[arguments]
-align-equals = true
-foreach-lists = "auto"
-
-[alignment]
-column-spec = "auto"
-
-[trees]
-mode = "auto"
-```
-
-By default, tift normalizes formula spacing and wraps eligible displays to `wrap.columns`. Key/value alignment is off, and the three structure layout options default to `"preserve"`. See the [formula guide](https://github.com/PrimeX-06/tift/wiki/Math-Formatting) and [structured source guide](https://github.com/PrimeX-06/tift/wiki/Structured-Source) for examples and limits.
 
 ## Editor
 
