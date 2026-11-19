@@ -10,6 +10,279 @@ mod tabularray;
 const MAX_COLUMNS: usize = 4096;
 const MAX_DEPTH: usize = 32;
 
+pub(crate) fn format_preambles(
+    source: &str,
+    config: &crate::CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, crate::FormatError> {
+    use super::ColumnSpecLayout;
+    use crate::syntax;
+    use unicode_width::UnicodeWidthStr;
+    if !source.contains("\\begin") {
+        return Ok(source.into());
+    }
+    let parsed = parsing.snapshot(source, true, false)?;
+    let tokens = parsed
+        .tokens
+        .as_deref()
+        .expect("column specification tokens");
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let environments =
+        syntax::environment_ranges_with_tokens(source, tokens, &parsed.protected, &config.config)?;
+    let mut declared = None;
+    let mut declared_environments = None;
+    let mut edits = Vec::new();
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    for env in environments {
+        let rule = config.config.alignment.rules.get(&env.name);
+        let mode = rule
+            .and_then(|rule| rule.column_spec)
+            .unwrap_or(config.config.alignment.column_spec);
+        if mode == ColumnSpecLayout::Preserve
+            || crate::packages::column_spec_slot(&env.name).is_none()
+            || config
+                .config
+                .syntax
+                .environment_arguments
+                .contains_key(&env.name)
+            || syntax::is_protected(env.begin.start, &parsed.protected)
+        {
+            continue;
+        }
+        if declared_environments.is_none() {
+            declared_environments = Some(analysis.declared_environments()?);
+        }
+        if declared_environments
+            .as_ref()
+            .is_some_and(|names| names.contains(&env.name))
+        {
+            continue;
+        }
+        let header_end = crate::layout::environment_header_end(
+            source,
+            env.body.clone(),
+            &env.name,
+            &config.config,
+            &analysis,
+        );
+        let header = &source[env.body.start..header_end];
+        let Some(Some(selected)) = header_columns(&env.name, header) else {
+            continue;
+        };
+        let outer = selected.start + env.body.start - 1..selected.end + env.body.start + 1;
+        let ray = crate::package_tables::is_tabularray(&env.name);
+        let Some((local, grouped)) = preamble_range(header, selected, ray) else {
+            continue;
+        };
+        let body = local.start + env.body.start..local.end + env.body.start;
+        let protected = parsed
+            .protected
+            .partition_point(|range| range.end <= body.start);
+        if parsed.protected[protected..]
+            .iter()
+            .take_while(|range| range.start < body.end)
+            .any(|range| *range != outer)
+            || has_format_directive(&source[outer])
+        {
+            continue;
+        }
+        let line = source[..body.start].rfind('\n').map_or(0, |at| at + 1);
+        if mode == ColumnSpecLayout::Auto
+            && !source[line..body.end]
+                .lines()
+                .any(|line| UnicodeWidthStr::width(line) > config.config.wrap.columns)
+        {
+            continue;
+        }
+        let text = &source[body.clone()];
+        let declared = declared.get_or_insert_with(|| declared_types(source, tokens));
+        let Some(columns) = layout_columns(text, declared, ray) else {
+            continue;
+        };
+        if columns.len() < 2 {
+            continue;
+        }
+        let indent: String = source[line..body.start]
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .collect();
+        let unit = config.config.indent.unit("environment", &env.name);
+        let mut replacement = String::new();
+        let mut previous = 0;
+        for (index, range) in columns.iter().enumerate() {
+            let gap = &text[previous..range.start];
+            if grouped || index > 0 {
+                preamble_boundary(&mut replacement, gap, newline, &indent, &unit);
+            } else {
+                replacement.push_str(gap);
+            }
+            replacement.push_str(&text[range.clone()]);
+            previous = range.end;
+        }
+        if grouped {
+            preamble_boundary(&mut replacement, &text[previous..], newline, &indent, "");
+        } else {
+            replacement.push_str(&text[previous..]);
+        }
+        edits.push((body, replacement));
+    }
+    crate::layout::apply_edits(source, edits)
+}
+
+fn has_format_directive(source: &str) -> bool {
+    // This pass alone may edit a table's built-in protected header. Disallow
+    // directives even when their ranges are subsumed by that exact header.
+    source.lines().any(|line| {
+        line.split_once('%').is_some_and(|(_, comment)| {
+            let Some((namespace, action)) = comment.trim().split_once(':') else {
+                return false;
+            };
+            matches!(namespace, "tift" | "tex-fmt")
+                && matches!(action.trim(), "off" | "on" | "skip")
+        })
+    })
+}
+
+fn preamble_boundary(output: &mut String, gap: &str, newline: &str, indent: &str, unit: &str) {
+    if let Some(end) = gap.rfind('\n') {
+        // Keep existing comments and paragraph boundaries. Only the indent of
+        // the following column belongs to this layout stage.
+        output.push_str(&gap[..end + 1]);
+    } else {
+        // Avoid inserting a TeX space token at a tight boundary.
+        if gap.is_empty() {
+            output.push('%');
+        }
+        output.push_str(newline);
+    }
+    output.push_str(indent);
+    output.push_str(unit);
+}
+
+/// Parse the built-in header once for both row alignment and preamble layout.
+/// `Some(None)` is a recognized header with an omitted optional argument.
+fn header_columns(name: &str, header: &str) -> Option<Option<Range<usize>>> {
+    if matches!(name, "tabu" | "longtabu") {
+        let group = crate::package_tables::tabu_column_spec(header, 0..header.len())?;
+        return Some(Some(group.start + 1..group.end - 1));
+    }
+    let signature = crate::packages::header_signature(name)?;
+    let slot = crate::packages::column_spec_slot(name)?;
+    let mut at = 0;
+    let mut selected = None;
+    for (index, kind) in signature.bytes().enumerate() {
+        let before = at;
+        at = skip(header, at);
+        let body = match kind {
+            b'o' | b'O'
+                if header.as_bytes().get(at) == Some(&b'[') && (kind == b'o' || before == at) =>
+            {
+                group(header, at, b'[', b']')?
+            }
+            b'o' | b'O' => continue,
+            b'm' => group(header, at, b'{', b'}')?,
+            _ => return None,
+        };
+        at = body.end + 1;
+        if index == slot {
+            selected = Some(body);
+        }
+    }
+    Some(selected)
+}
+
+fn preamble_range(header: &str, selected: Range<usize>, ray: bool) -> Option<(Range<usize>, bool)> {
+    if !ray {
+        return Some((selected, true));
+    }
+    // tabularray accepts a bare preamble, or inner options containing a
+    // colspec value. The literal preamble parser distinguishes bare data from
+    // arbitrary key lists. For a repeated key only the effective value matters.
+    let mut result = None;
+    let mut start = selected.start;
+    for part in parts(&header[selected.clone()])? {
+        let end = start + part.len();
+        let key = skip(header, start);
+        if key < end && header[key..end].starts_with("colspec") {
+            let equal = skip(header, key + "colspec".len());
+            if equal < end && header.as_bytes()[equal] == b'=' {
+                let value = skip(header, equal + 1);
+                let significant_end = start + part.trim_end().len();
+                if value >= significant_end {
+                    return None;
+                }
+                result = if header.as_bytes()[value] == b'{' {
+                    let body = group(header, value, b'{', b'}')?;
+                    if body.end >= end
+                        || crate::trivia::skip_until(header, body.end + 1, end) != end
+                    {
+                        return None;
+                    }
+                    Some((body, true))
+                } else {
+                    Some((value..significant_end, false))
+                };
+            }
+        }
+        start = end + 1;
+    }
+    result.or(Some((selected, true)))
+}
+
+#[derive(Default)]
+struct PreambleLayout {
+    columns: Vec<Range<usize>>,
+    pending: Option<Range<usize>>,
+}
+
+impl PreambleLayout {
+    /// A prefix or intervening rule belongs to the next column. A trailing
+    /// modifier belongs to the preceding one. Each repeat is one source unit.
+    fn record(&mut self, kind: u8, span: Range<usize>) -> Option<()> {
+        match kind {
+            b'|' | b':' | b'>' | b'@' | b'!' => {
+                self.pending.get_or_insert(span.clone()).end = span.end;
+            }
+            b'<' => {
+                if self.pending.is_some() {
+                    return None;
+                }
+                self.columns.last_mut()?.end = span.end;
+            }
+            _ => {
+                let start = self
+                    .pending
+                    .take()
+                    .map_or(span.start, |pending| pending.start);
+                self.columns.push(start..span.end);
+            }
+        }
+        Some(())
+    }
+}
+
+fn layout_columns(source: &str, declared: &DeclaredTypes, ray: bool) -> Option<Vec<Range<usize>>> {
+    let mut layout = PreambleLayout::default();
+    if ray {
+        tabularray::record_preamble(source, declared, &mut layout).ok()?;
+    } else {
+        parse_into(source, &mut Vec::new(), 0, declared, Some(&mut layout))?;
+    }
+    if let Some(pending) = layout.pending {
+        layout.columns.last_mut()?.end = pending.end;
+    }
+    Some(layout.columns)
+}
+
 pub(super) const TABULARRAY_STYLE_COMMANDS: &[&str] = &[
     "SetCell",
     "SetCells",
@@ -107,36 +380,38 @@ pub(super) fn declared_types(source: &str, tokens: &[crate::syntax::Token]) -> D
         if matches!(name, "SetTblrInner" | "SetTblrDefault") {
             declared.tabularray_defaults = true;
         }
-        if let Some(body) = group(source, skip(source, end), b'{', b'}') {
+        let selector = matches!(name, "NewTblrChildSelector" | "NewTblrChildIndexer");
+        let column = matches!(
+            name,
+            "newcolumntype"
+                | "renewcolumntype"
+                | "NewColumnType"
+                | "NewTblrColumnType"
+                | "NewTblrColumnRowType"
+                | "NewColumnRowType"
+        );
+        let row = matches!(
+            name,
+            "NewRowType" | "NewTblrRowType" | "NewTblrColumnRowType" | "NewColumnRowType"
+        );
+        if (selector || column || row)
+            && let Some(body) = group(source, skip(source, end), b'{', b'}')
+        {
             let letter = source[body.clone()].trim();
-            if matches!(name, "NewTblrChildSelector" | "NewTblrChildIndexer") {
+            if selector {
                 declared.selectors.insert(letter.to_owned());
-            } else if matches!(
-                name,
-                "newcolumntype"
-                    | "renewcolumntype"
-                    | "NewColumnType"
-                    | "NewTblrColumnType"
-                    | "NewTblrColumnRowType"
-                    | "NewColumnRowType"
-                    | "NewRowType"
-                    | "NewTblrRowType"
-            ) && let [byte] = letter.as_bytes()
-            {
+            } else if let [byte] = letter.as_bytes() {
                 // Complete local declarations take precedence over common
                 // column defaults; opaque declarations keep the fallback.
                 let literal = literal_column(source, body.end + 1);
-                if !matches!(name, "NewRowType" | "NewTblrRowType") {
+                if column {
                     declared.columns.insert(*byte);
                     declared.literal_columns.remove(byte);
                     if let Some(column) = literal {
                         declared.literal_columns.insert(*byte, column);
                     }
                 }
-                if matches!(
-                    name,
-                    "NewRowType" | "NewTblrRowType" | "NewTblrColumnRowType" | "NewColumnRowType"
-                ) {
+                if row {
                     declared.rows.insert(*byte);
                     declared.literal_rows.remove(byte);
                     if let Some(row) = literal {
@@ -154,42 +429,7 @@ pub(super) fn for_environment(
     header: &str,
     declared: &DeclaredTypes,
 ) -> Option<TableSpec> {
-    if matches!(name, "tabu" | "longtabu") {
-        let range = crate::package_tables::tabu_column_spec(header, 0..header.len())?;
-        return Some(TableSpec {
-            columns: parse(&header[range.start + 1..range.end - 1], declared)?,
-            ray: None,
-        });
-    }
-    let signature = crate::packages::header_signature(name)?;
-    let slot = crate::packages::column_spec_slot(name)?;
-    let mut cursor = 0;
-    let mut selected = None;
-    for (index, kind) in signature.bytes().enumerate() {
-        let before_space = cursor;
-        cursor = skip(header, cursor);
-        match kind {
-            b'o' | b'O' => {
-                if header.as_bytes().get(cursor) == Some(&b'[')
-                    && (kind == b'o' || before_space == cursor)
-                {
-                    let body = group(header, cursor, b'[', b']')?;
-                    cursor = body.end + 1;
-                    if index == slot {
-                        selected = Some(&header[body]);
-                    }
-                }
-            }
-            b'm' => {
-                let body = group(header, cursor, b'{', b'}')?;
-                cursor = body.end + 1;
-                if index == slot {
-                    selected = Some(&header[body]);
-                }
-            }
-            _ => return None,
-        }
-    }
+    let selected = header_columns(name, header)?.map(|body| &header[body]);
     if crate::package_tables::is_tabularray(name) {
         if declared.tabularray_defaults {
             return None;
@@ -238,7 +478,7 @@ pub(super) fn multicolumn(
 
 pub(super) fn parse(source: &str, declared: &DeclaredTypes) -> Option<Vec<Justification>> {
     let mut columns = Vec::new();
-    parse_into(source, &mut columns, 0, declared)?;
+    parse_into(source, &mut columns, 0, declared, None)?;
     (!columns.is_empty()).then_some(columns)
 }
 
@@ -247,6 +487,7 @@ fn parse_into(
     output: &mut Vec<Justification>,
     depth: usize,
     declared: &DeclaredTypes,
+    mut layout: Option<&mut PreambleLayout>,
 ) -> Option<()> {
     if depth >= MAX_DEPTH {
         return None;
@@ -257,11 +498,15 @@ fn parse_into(
         let Some(&byte) = source.as_bytes().get(cursor) else {
             break;
         };
+        let start = cursor;
         cursor += 1;
         if let Some(column) = declared.literal_columns.get(&byte) {
             for _ in 0..column.arguments {
                 cursor = skip(source, cursor);
                 cursor = group(source, cursor, b'{', b'}')?.end + 1;
+            }
+            if let Some(layout) = &mut layout {
+                layout.record(byte, start..cursor)?;
             }
             output.push(column.justification);
             if output.len() > MAX_COLUMNS {
@@ -318,10 +563,19 @@ fn parse_into(
                 }
                 Justification::Center
             }
-            b'|' | b':' => continue,
+            b'|' | b':' => {
+                if let Some(layout) = &mut layout {
+                    layout.record(byte, start..cursor)?;
+                }
+                continue;
+            }
+
             b'>' | b'<' | b'@' | b'!' => {
                 cursor = skip(source, cursor);
                 cursor = group(source, cursor, b'{', b'}')?.end + 1;
+                if let Some(layout) = &mut layout {
+                    layout.record(byte, start..cursor)?;
+                }
                 continue;
             }
             b'*' => {
@@ -331,7 +585,13 @@ fn parse_into(
                 cursor = skip(source, count.end + 1);
                 let body = group(source, cursor, b'{', b'}')?;
                 let mut repeated = Vec::new();
-                parse_into(&source[body.clone()], &mut repeated, depth + 1, declared)?;
+                parse_into(
+                    &source[body.clone()],
+                    &mut repeated,
+                    depth + 1,
+                    declared,
+                    None,
+                )?;
                 let additional = repeated.len().checked_mul(count_value)?;
                 if output.len().checked_add(additional)? > MAX_COLUMNS {
                     return None;
@@ -342,6 +602,9 @@ fn parse_into(
                     }
                 }
                 cursor = body.end + 1;
+                if let Some(layout) = &mut layout {
+                    layout.record(byte, start..cursor)?;
+                }
                 continue;
             }
             // Custom column letters can consume arbitrary arguments. Their
@@ -350,6 +613,9 @@ fn parse_into(
         };
         // The declared column type remains authoritative; modifier bodies
         // above are retained without evaluating arbitrary TeX commands.
+        if let Some(layout) = &mut layout {
+            layout.record(byte, start..cursor)?;
+        }
         output.push(align);
         if output.len() > MAX_COLUMNS {
             return None;

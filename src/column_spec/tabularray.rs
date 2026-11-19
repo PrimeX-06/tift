@@ -1,6 +1,9 @@
 //! Literal tabularray inner keys, applied in their original order.
 
-use super::{CellStyle, DeclaredTypes, Justification, MAX_COLUMNS, MAX_DEPTH, group, parts, skip};
+use super::{
+    CellStyle, DeclaredTypes, Justification, MAX_COLUMNS, MAX_DEPTH, PreambleLayout, group, parts,
+    skip,
+};
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -425,11 +428,19 @@ fn span_keys(source: &str) -> Result<CellStyle, ()> {
 
 fn preamble(source: &str, declared: &DeclaredTypes) -> Result<Vec<CellStyle>, ()> {
     let mut result = Vec::new();
-    preamble_into(source, declared, &mut result, 0)?;
+    preamble_into(source, declared, &mut result, 0, None)?;
     if result.is_empty() {
         return Err(());
     }
     Ok(result)
+}
+
+pub(super) fn record_preamble(
+    source: &str,
+    declared: &DeclaredTypes,
+    layout: &mut PreambleLayout,
+) -> Result<(), ()> {
+    preamble_into(source, declared, &mut Vec::new(), 0, Some(layout))
 }
 
 fn preamble_into(
@@ -437,6 +448,7 @@ fn preamble_into(
     declared: &DeclaredTypes,
     result: &mut Vec<CellStyle>,
     depth: usize,
+    mut layout: Option<&mut PreambleLayout>,
 ) -> Result<(), ()> {
     if depth >= MAX_DEPTH {
         return Err(());
@@ -447,11 +459,18 @@ fn preamble_into(
         let Some(&kind) = source.as_bytes().get(cursor) else {
             break;
         };
+        let start = cursor;
         cursor += 1;
+        // When parsing optional arguments, do not include trailing trivia in
+        // the lexical extent of a column or rule that has no optional group.
+        let mut end = cursor;
         if let Some(column) = declared.literal_columns.get(&kind) {
             for _ in 0..column.arguments {
                 cursor = skip(source, cursor);
                 cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+            }
+            if let Some(layout) = &mut layout {
+                layout.record(kind, start..cursor).ok_or(())?;
             }
             result.push(CellStyle {
                 justification: Some(column.justification),
@@ -484,10 +503,12 @@ fn preamble_into(
                 if source.as_bytes().get(cursor) == Some(&b'[') {
                     let options = group(source, cursor, b'[', b']').ok_or(())?;
                     style.overlay(alignment_keys(&source[options.clone()])?);
-                    cursor = skip(source, options.end + 1);
+                    end = options.end + 1;
+                    cursor = skip(source, end);
                 }
                 if source.as_bytes().get(cursor) == Some(&b'{') {
                     cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+                    end = cursor;
                 }
                 style
             }
@@ -507,18 +528,24 @@ fn preamble_into(
                         style.overlay(alignment_keys(&source[options.clone()])?);
                     }
                     cursor = options.end + 1;
+                    end = cursor;
                 }
                 style
             }
             b't' | b'p' | b'm' | b'b' | b'h' | b'f' => {
                 cursor = skip(source, cursor);
                 cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+                end = cursor;
                 CellStyle::default()
             }
             b'|' | b':' => {
                 cursor = skip(source, cursor);
                 if source.as_bytes().get(cursor) == Some(&b'[') {
                     cursor = group(source, cursor, b'[', b']').ok_or(())?.end + 1;
+                    end = cursor;
+                }
+                if let Some(layout) = &mut layout {
+                    layout.record(kind, start..end).ok_or(())?;
                 }
                 continue;
             }
@@ -528,6 +555,9 @@ fn preamble_into(
                     cursor = skip(source, group(source, cursor, b'[', b']').ok_or(())?.end + 1);
                 }
                 cursor = group(source, cursor, b'{', b'}').ok_or(())?.end + 1;
+                if let Some(layout) = &mut layout {
+                    layout.record(kind, start..cursor).ok_or(())?;
+                }
                 continue;
             }
             b'*' => {
@@ -540,7 +570,13 @@ fn preamble_into(
                 cursor = skip(source, count.end + 1);
                 let body = group(source, cursor, b'{', b'}').ok_or(())?;
                 let mut repeated = Vec::new();
-                preamble_into(&source[body.clone()], declared, &mut repeated, depth + 1)?;
+                preamble_into(
+                    &source[body.clone()],
+                    declared,
+                    &mut repeated,
+                    depth + 1,
+                    None,
+                )?;
                 let additional = repeated.len().checked_mul(count_value).ok_or(())?;
                 if result.len().checked_add(additional).ok_or(())? > MAX_COLUMNS {
                     return Err(());
@@ -551,10 +587,16 @@ fn preamble_into(
                     }
                 }
                 cursor = body.end + 1;
+                if let Some(layout) = &mut layout {
+                    layout.record(kind, start..cursor).ok_or(())?;
+                }
                 continue;
             }
             _ => return Err(()),
         };
+        if let Some(layout) = &mut layout {
+            layout.record(kind, start..end).ok_or(())?;
+        }
         result.push(style);
         if result.len() > MAX_COLUMNS {
             return Err(());

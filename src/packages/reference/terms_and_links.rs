@@ -63,6 +63,12 @@ commands! {
     "zlabel" | "zpageref" | "zrefused" => ("m", 0b1, None),
     "zkvlabel" => ("mm", 0b11, None),
     "zref" => ("om", 0b11, None),
+    // zref-clever.sty:793--810,2654--2664,2920,3460,3508. Label lists and
+    // settings are data even when they contain deferred LaTeX tokens.
+    "zcref" | "zcpageref" => ("om", 0b11, Star),
+    "zcsetup" => ("m", 0b1, None),
+    "zcDeclareLanguage" => ("om", 0b11, None),
+    "zcDeclareLanguageAlias" | "zcLanguageSetup" | "zcRefTypeSetup" => ("mm", 0b11, None),
     // xr-hyper 2026 delegates to tools/xr.sty:43--48. The final URL is
     // optional after the mandatory auxiliary-file name.
     "externaldocument" | "externalcitedocument" => ("oomo", 0b1111, None),

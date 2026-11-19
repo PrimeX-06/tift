@@ -52,9 +52,99 @@ impl<'a> ParseContext<'a> {
         }
     }
 
-    pub(crate) fn current_snapshot(&self, source: &str) -> Option<&ParsedText> {
-        let parsed = self.parsed.as_ref()?;
-        (parsed.fingerprint == blake3::hash(source.as_bytes())).then_some(parsed)
+    /// Preserve structural ownership across line indentation edits; semantic
+    /// metadata and lexical tokens are rebuilt for the updated source.
+    pub(crate) fn reuse_indented_snapshot(&mut self, before: &str, after: &str) -> bool {
+        if before == after {
+            return true;
+        }
+        let grammar = &self.config.config.syntax;
+        if grammar.command_pattern.is_some()
+            || grammar.environment_pattern.is_some()
+            || grammar.condition_pattern.is_some()
+            || grammar.item_pattern.is_some()
+            || grammar.argument_between.is_some()
+            || !grammar.special.is_empty()
+        {
+            return false;
+        }
+        let Some(parsed) = self.parsed.as_ref().filter(|parsed| {
+            parsed.blocks.is_some() && parsed.fingerprint == blake3::hash(before.as_bytes())
+        }) else {
+            return false;
+        };
+        let Some(edits) = IndentationMap::between(before, after) else {
+            return false;
+        };
+        let Some(tokens) = &parsed.tokens else {
+            return false;
+        };
+        for (range, _) in &edits.edits {
+            // At the end of a protected range, an insertion could belong to
+            // the following line. The position map uses right-biased ends.
+            let index = parsed.protected.partition_point(|r| {
+                r.end < range.start || (!range.is_empty() && r.end == range.start)
+            });
+            if parsed
+                .protected
+                .get(index)
+                .is_some_and(|r| r.start < range.end)
+            {
+                return false;
+            }
+            let first = tokens.partition_point(|token| token.span.end <= range.start);
+            if tokens[first..]
+                .iter()
+                .take_while(|token| token.span.start < range.end)
+                .any(|token| {
+                    !matches!(
+                        token.kind,
+                        syntax::TokenKind::Space | syntax::TokenKind::Text
+                    )
+                })
+                || range.is_empty()
+                    && tokens.get(first).is_some_and(|token| {
+                        token.span.start < range.start
+                            && !matches!(
+                                token.kind,
+                                syntax::TokenKind::Space | syntax::TokenKind::Text
+                            )
+                    })
+                || range.is_empty()
+                    && first.checked_sub(1).is_some_and(|previous| {
+                        let token = &tokens[previous];
+                        token.span.end == range.start
+                            && token.kind == syntax::TokenKind::Command
+                            && before[token.span.clone()].ends_with('\n')
+                    })
+            {
+                return false;
+            }
+        }
+        let mut parsed = self.parsed.take().expect("checked indentation snapshot");
+        let mut remap = || -> Option<()> {
+            for range in &mut parsed.protected {
+                edits.range(range)?;
+            }
+            for block in parsed.blocks.as_mut()? {
+                edits.range(&mut block.begin)?;
+                edits.range(&mut block.body)?;
+                edits.range(&mut block.end)?;
+                for (_, branch) in &mut block.branches {
+                    edits.range(branch)?;
+                }
+            }
+            Some(())
+        };
+        if remap().is_none() {
+            return false;
+        }
+        parsed.fingerprint = blake3::hash(after.as_bytes());
+        parsed.tokens = None;
+        parsed.metadata = Rc::default();
+        parsed.expl3_protected = None;
+        self.parsed = Some(parsed);
+        true
     }
 
     pub(crate) fn snapshot(
@@ -133,5 +223,74 @@ impl<'a> ParseContext<'a> {
             .expect("current source snapshot")
             .expl3_protected = Some(ranges.clone());
         Ok(ranges)
+    }
+}
+
+struct IndentationMap {
+    edits: Vec<(Range<usize>, usize)>,
+}
+
+impl IndentationMap {
+    fn between(before: &str, after: &str) -> Option<Self> {
+        let mut old_lines = before.split_inclusive('\n');
+        let mut new_lines = after.split_inclusive('\n');
+        let (mut old_offset, mut new_offset) = (0, 0);
+        let mut edits = Vec::new();
+        loop {
+            match (old_lines.next(), new_lines.next()) {
+                (None, None) => return Some(Self { edits }),
+                (Some(old), Some(new)) => {
+                    if old != new {
+                        let old_body = old.trim_end_matches(['\r', '\n']);
+                        let new_body = new.trim_end_matches(['\r', '\n']);
+                        if old[old_body.len()..] != new[new_body.len()..] {
+                            return None;
+                        }
+                        let old_start =
+                            old_body.len() - old_body.trim_start_matches([' ', '\t']).len();
+                        let new_start =
+                            new_body.len() - new_body.trim_start_matches([' ', '\t']).len();
+                        let old_end = old_body.trim_end_matches([' ', '\t']).len().max(old_start);
+                        let new_end = new_body.trim_end_matches([' ', '\t']).len().max(new_start);
+                        if old_body[old_start..old_end] != new_body[new_start..new_end] {
+                            return None;
+                        }
+                        if old_body[..old_start] != new_body[..new_start] {
+                            edits
+                                .push((old_offset..old_offset + old_start, new_offset + new_start));
+                        }
+                        if old_body[old_end..] != new_body[new_end..] {
+                            edits.push((
+                                old_offset + old_end..old_offset + old_body.len(),
+                                new_offset + new_body.len(),
+                            ));
+                        }
+                    }
+                    old_offset += old.len();
+                    new_offset += new.len();
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn position(&self, at: usize) -> Option<usize> {
+        let index = self.edits.partition_point(|(range, _)| range.end <= at);
+        if self
+            .edits
+            .get(index)
+            .is_some_and(|(range, _)| range.start < at)
+        {
+            return None;
+        }
+        match index.checked_sub(1).map(|index| &self.edits[index]) {
+            Some((range, new_end)) => new_end.checked_add(at - range.end),
+            None => Some(at),
+        }
+    }
+
+    fn range(&self, range: &mut Range<usize>) -> Option<()> {
+        *range = self.position(range.start)?..self.position(range.end)?;
+        Some(())
     }
 }

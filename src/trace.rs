@@ -71,10 +71,10 @@ pub struct DetailTrace {
 
 fn action(stage: &str) -> TraceAction {
     match stage {
-        "structure" => TraceAction::Structure,
+        "structure" | "trees" => TraceAction::Structure,
         "indentation" => TraceAction::Indentation,
-        "alignment" => TraceAction::Alignment,
-        "arguments" => TraceAction::Arguments,
+        "alignment" | "column-specs" => TraceAction::Alignment,
+        "arguments" | "foreach-lists" => TraceAction::Arguments,
         "text-before" | "text-after" | "docstrip-text" => TraceAction::Text,
         "math" | "math-final" => TraceAction::Math,
         "macro-bodies" => TraceAction::MacroBody,
@@ -133,7 +133,14 @@ fn context(block: &Block) -> String {
 fn rule(stage: &str, block: Option<&Block>, config: &CompiledConfig) -> Option<String> {
     let name = block.map(|block| block.name.trim_end_matches('*'));
     match stage {
-        "math" | "math-final" => Some("math.enabled / wrap.columns".into()),
+        "math" | "math-final" => Some(
+            "math.spacing / math.wrap / math.columns / math.break-priority / wrap.columns".into(),
+        ),
+        "trees" => Some("trees.mode / trees.columns / trees.forest / trees.qtree".into()),
+        "column-specs" => Some("alignment.column-spec / alignment.rules / wrap.columns".into()),
+        "foreach-lists" => {
+            Some("arguments.foreach-lists / arguments.columns / wrap.columns".into())
+        }
         "structure" => Some(name.map_or_else(
             || "breaks".into(),
             |name| {

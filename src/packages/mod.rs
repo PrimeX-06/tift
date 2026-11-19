@@ -15,6 +15,8 @@ pub(crate) mod cjk;
 pub(crate) mod classes;
 #[path = "literal/code.rs"]
 pub(crate) mod code;
+#[path = "literal/algorithms.rs"]
+pub(crate) mod code_algorithms;
 #[path = "literal/environments.rs"]
 pub(crate) mod code_environments;
 #[path = "foundation/commands.rs"]
@@ -32,6 +34,8 @@ pub(crate) mod indexing;
 pub(crate) mod keys;
 #[path = "layout/links_color_columns.rs"]
 pub(crate) mod links_color_columns;
+#[path = "literal/listing_wrappers.rs"]
+pub(crate) mod listing_wrappers;
 #[path = "literal/lua.rs"]
 pub(crate) mod lua;
 #[path = "scientific/math.rs"]
@@ -179,8 +183,10 @@ pub(crate) fn verbatim_environments() -> impl Iterator<Item = &'static str> {
         .iter()
         .chain(documents::VERBATIM_ENVIRONMENTS)
         .chain(lua::VERBATIM_ENVIRONMENTS)
+        .chain(code_algorithms::VERBATIM_ENVIRONMENTS)
         .chain(code_environments::VERBATIM_ENVIRONMENTS)
         .chain(code::VERBATIM_ENVIRONMENTS)
+        .chain(listing_wrappers::VERBATIM_ENVIRONMENTS)
         .chain(references::VERBATIM_ENVIRONMENTS)
         .copied()
 }

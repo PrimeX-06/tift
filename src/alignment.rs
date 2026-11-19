@@ -18,6 +18,17 @@ use crate::{CompiledConfig, FormatError};
 #[path = "column_spec.rs"]
 mod column_spec;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColumnSpecLayout {
+    #[default]
+    Preserve,
+    Auto,
+    Expand,
+}
+
+pub(crate) use column_spec::format_preambles;
+
 const DEFAULT_ENVIRONMENTS: &[&str] = &[
     "tabu",
     "matrix",
@@ -141,6 +152,7 @@ pub struct AlignmentConfig {
     pub spaces_after_row_break: usize,
     pub format_children: bool,
     pub multicolumn: bool,
+    pub column_spec: ColumnSpecLayout,
     pub short_rows: ShortRows,
     pub justification: Justification,
     pub delimiter_justification: Justification,
@@ -180,6 +192,7 @@ impl Default for AlignmentConfig {
             spaces_after_row_break: 1,
             format_children: true,
             multicolumn: false,
+            column_spec: ColumnSpecLayout::Preserve,
             short_rows: ShortRows::Align,
             justification: Justification::Columns,
             delimiter_justification: Justification::Left,
@@ -215,6 +228,7 @@ pub struct AlignmentRule {
     pub spaces_after_row_break: Option<usize>,
     pub format_children: Option<bool>,
     pub multicolumn: Option<bool>,
+    pub column_spec: Option<ColumnSpecLayout>,
     pub short_rows: Option<ShortRows>,
     pub justification: Option<Justification>,
     pub delimiter_justification: Option<Justification>,
@@ -279,6 +293,7 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
             spaces_after_row_break,
             format_children,
             multicolumn,
+            column_spec,
             short_rows,
             justification,
             delimiter_justification,
@@ -1239,6 +1254,7 @@ fn split_rows(
     let mut row_start = range.start;
     let mut cell_start = range.start;
     let mut cursor = range.start;
+    let mut next_syntax = range.start;
     let mut depth = 0usize;
     let bytes = source.as_bytes();
     while cursor < range.end {
@@ -1369,7 +1385,33 @@ fn split_rows(
                 depth = depth.saturating_sub(1);
                 cursor += 1;
             }
-            _ => cursor += source[cursor..].chars().next().unwrap().len_utf8(),
+            _ => {
+                cursor += source[cursor..].chars().next().unwrap().len_utf8();
+                // Ordinary cell bytes do not change nesting. Stop at the next
+                // delimiter candidate, protected span, or TeX syntax byte.
+                while candidates
+                    .get(candidate_index)
+                    .is_some_and(|candidate| candidate.0 < cursor)
+                {
+                    candidate_index += 1;
+                }
+                let stop = candidates
+                    .get(candidate_index)
+                    .map_or(range.end, |candidate| candidate.0)
+                    .min(
+                        opaque
+                            .get(opaque_index)
+                            .map_or(range.end, |opaque| opaque.start),
+                    );
+                // Keep the first search result across closing braces so a
+                // run of `}` does not rescan the rest of the cell each time.
+                if next_syntax < cursor {
+                    next_syntax = memchr::memchr3(b'\\', b'%', b'{', &bytes[cursor..stop])
+                        .map_or(stop, |at| cursor + at);
+                }
+                let stop = stop.min(next_syntax);
+                cursor = memchr::memchr(b'}', &bytes[cursor..stop]).map_or(stop, |at| cursor + at);
+            }
         }
     }
     if cell_start < range.end || !cells.is_empty() {

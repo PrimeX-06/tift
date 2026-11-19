@@ -410,8 +410,14 @@ pub(crate) fn preserves_tight_whitespace(name: &str) -> bool {
 pub(crate) struct VerbatimDeclaration {
     pub names: Vec<String>,
     pub end: usize,
-    /// comment.sty recognizes the terminator as a complete physical line.
-    pub line_delimited: bool,
+    pub terminator: VerbatimTerminator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerbatimTerminator {
+    AnyPosition,
+    UnindentedLine,
+    IndentedLine,
 }
 
 fn argument(source: &str, cursor: &mut usize, open: u8, close: u8) -> Option<Range<usize>> {
@@ -814,7 +820,7 @@ pub(crate) fn verbatim_declaration(
 ) -> Option<VerbatimDeclaration> {
     let mut cursor = end;
     let mut names = Vec::new();
-    let mut line_delimited = false;
+    let mut terminator = VerbatimTerminator::AnyPosition;
     match command {
         // minted.sty:1895--1910; the starred environment takes extra options.
         "newminted" => {
@@ -870,14 +876,14 @@ pub(crate) fn verbatim_declaration(
             for _ in 0..arguments {
                 mandatory(source, &mut cursor)?;
             }
-            line_delimited = true;
+            terminator = VerbatimTerminator::UnindentedLine;
         }
         _ => return crate::code_package_syntax::source_declaration(source, command, end),
     }
     Some(VerbatimDeclaration {
         names,
         end: cursor,
-        line_delimited,
+        terminator,
     })
 }
 

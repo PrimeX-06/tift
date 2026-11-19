@@ -31,7 +31,7 @@ jobs:
           from pathlib import Path
 
           allowed = {
-              ".gitignore", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md",
+              ".gitignore", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "CHANGELOG.md",
               "rust-toolchain.toml", ".github/workflows/ci.yml",
               ".github/workflows/release.yml", "examples/conform.lua",
               "examples/latex-workshop.json", "examples/pre-commit-config.yaml",
@@ -59,7 +59,7 @@ jobs:
           import os
           from pathlib import Path
 
-          allowed = {"Cargo.toml", "Cargo.toml.orig", "Cargo.lock", "README.md", "LICENSE", ".cargo_vcs_info.json"}
+          allowed = {"Cargo.toml", "Cargo.toml.orig", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", ".cargo_vcs_info.json"}
           for name in (Path(os.environ["RUNNER_TEMP"]) / "package-files.txt").read_text().splitlines():
               name = name.replace("\\", "/")
               if name not in allowed and not (name.startswith("src/") and name.endswith(".rs")):

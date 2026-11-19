@@ -59,6 +59,7 @@ pub(super) struct SignatureBindings {
 struct ScopedSignature {
     depth: usize,
     binding: Option<BoundSignature>,
+    inline_code: Option<crate::code_package_syntax::GeneratedInlineKind>,
 }
 
 struct BoundSignature {
@@ -116,6 +117,27 @@ impl SignatureBindings {
         self.values[usize::from(environment)].contains_key(name)
     }
 
+    pub(super) fn inline_code(
+        &self,
+        name: &str,
+    ) -> Option<crate::code_package_syntax::GeneratedInlineKind> {
+        self.values[0].get(name)?.last()?.inline_code
+    }
+
+    pub(super) fn assign_inline_code(
+        &mut self,
+        name: String,
+        kind: crate::code_package_syntax::GeneratedInlineKind,
+        global: bool,
+    ) {
+        self.assign(false, name.clone(), None, None, global);
+        self.values[0]
+            .get_mut(&name)
+            .and_then(|values| values.last_mut())
+            .expect("fresh inline declaration")
+            .inline_code = Some(kind);
+    }
+
     pub(super) fn assign(
         &mut self,
         environment: bool,
@@ -133,8 +155,13 @@ impl SignatureBindings {
         }
         if let Some(value) = values.last_mut().filter(|value| value.depth == depth) {
             value.binding = binding;
+            value.inline_code = None;
         } else {
-            values.push(ScopedSignature { depth, binding });
+            values.push(ScopedSignature {
+                depth,
+                binding,
+                inline_code: None,
+            });
         }
         self.scopes[depth][index].insert(name);
     }
@@ -228,6 +255,9 @@ pub(super) fn configured_signature(rule: &crate::config::CommandRule) -> Option<
 }
 
 pub(crate) fn invocation_cursor(source: &str, end: usize, shape: &str) -> usize {
+    if source.as_bytes().get(end.wrapping_sub(1)) != Some(&b'*') {
+        return end;
+    }
     xparse::Signature::parse(shape)
         .map_or(end, |signature| signature.invocation_cursor(source, end))
 }

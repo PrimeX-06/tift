@@ -18,6 +18,10 @@ pub struct ArgumentLayoutConfig {
     pub commands: Vec<String>,
     pub split_commas: bool,
     pub split_equals: bool,
+    /// Vertically align assignment operators in multiline key-value lists.
+    pub align_equals: bool,
+    /// Layout of literal pgffor data lists; separate from command options.
+    pub foreach_lists: ForeachListMode,
     pub rules: BTreeMap<String, ArgumentLayoutRule>,
 }
 
@@ -47,9 +51,20 @@ impl Default for ArgumentLayoutConfig {
             .into(),
             split_commas: true,
             split_equals: false,
+            align_equals: false,
+            foreach_lists: ForeachListMode::Preserve,
             rules: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForeachListMode {
+    #[default]
+    Preserve,
+    Auto,
+    Expand,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,6 +80,7 @@ pub struct ArgumentLayoutRule {
     pub optional_argument: Option<usize>,
     pub split_commas: Option<bool>,
     pub split_equals: Option<bool>,
+    pub align_equals: Option<bool>,
 }
 
 pub fn validate(config: &ArgumentLayoutConfig) -> Result<(), String> {
@@ -107,6 +123,7 @@ struct Settings<'a> {
     optional_argument: Option<usize>,
     commas: bool,
     equals: bool,
+    align_equals: bool,
 }
 
 fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> {
@@ -133,28 +150,34 @@ fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> 
             (matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap"))
                 .then_some(config.config.wrap.columns)
         });
-    (mode != "preserve" && (mode == "expand" || width.is_some())).then_some(Settings {
-        mode,
-        width,
-        argument: rule.map_or_else(
-            || {
-                usize::from(matches!(
-                    unstarred,
-                    "setkeys" | "keys_define:nn" | "keys_set:nn"
-                ))
-            },
-            |r| r.argument,
-        ),
-        optional_argument: rule
-            .and_then(|r| r.optional_argument)
-            .or(default_optional.then_some(0)),
-        commas: rule
-            .and_then(|r| r.split_commas)
-            .unwrap_or(base.split_commas),
-        equals: rule
-            .and_then(|r| r.split_equals)
-            .unwrap_or(base.split_equals),
-    })
+    let align_equals = rule
+        .and_then(|r| r.align_equals)
+        .unwrap_or(base.align_equals);
+    (mode != "preserve" && (mode == "expand" || width.is_some() || align_equals)).then_some(
+        Settings {
+            mode,
+            width,
+            argument: rule.map_or_else(
+                || {
+                    usize::from(matches!(
+                        unstarred,
+                        "setkeys" | "keys_define:nn" | "keys_set:nn"
+                    ))
+                },
+                |r| r.argument,
+            ),
+            optional_argument: rule
+                .and_then(|r| r.optional_argument)
+                .or(default_optional.then_some(0)),
+            commas: rule
+                .and_then(|r| r.split_commas)
+                .unwrap_or(base.split_commas),
+            equals: rule
+                .and_then(|r| r.split_equals)
+                .unwrap_or(base.split_equals),
+            align_equals,
+        },
+    )
 }
 
 fn protected_at(cursor: usize, protected: &[Range<usize>]) -> Option<&Range<usize>> {
@@ -467,6 +490,15 @@ fn punctuation(
     body: Range<usize>,
     protected: &[Range<usize>],
 ) -> Option<Punctuation> {
+    scan_punctuation(source, body, protected, false)
+}
+
+fn scan_punctuation(
+    source: &str,
+    body: Range<usize>,
+    protected: &[Range<usize>],
+    keep_comments: bool,
+) -> Option<Punctuation> {
     let mut result = Vec::new();
     let mut empty_comments = Vec::new();
     let mut cursor = body.start;
@@ -481,6 +513,10 @@ fn punctuation(
         match source.as_bytes()[cursor] {
             b'%' => {
                 let end = comment_end(source, cursor, body.end);
+                if keep_comments {
+                    cursor = end;
+                    continue;
+                }
                 // Empty comments suppress the newline and the following
                 // indentation. Preserve comments containing actual text.
                 if !source[cursor + 1..end]
@@ -543,11 +579,12 @@ fn punctuation(
                     cursor += 1;
                 }
                 // A blank physical line produces a TeX paragraph token.
-                if source[start..cursor]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    > 1
+                if !keep_comments
+                    && source[start..cursor]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        > 1
                 {
                     return None;
                 }
@@ -653,8 +690,7 @@ fn format_group(
     newline: &str,
 ) -> Option<String> {
     let tab = config.config.indent.width;
-    if settings.mode == "auto" {
-        let width = settings.width?;
+    let expand = if settings.mode == "auto" {
         let line_start = source[..group.start].rfind('\n').map_or(0, |pos| pos + 1);
         let after = source[group.end..]
             .split('\n')
@@ -662,13 +698,166 @@ fn format_group(
             .unwrap_or("")
             .trim_end_matches('\r');
         let original = &source[line_start..group.end + after.len()];
-        if original.lines().all(|line| column(line, tab) <= width) {
-            return None;
+        settings
+            .width
+            .is_some_and(|width| original.lines().any(|line| column(line, tab) > width))
+    } else {
+        true
+    };
+    let expanded = expand
+        .then(|| {
+            expand_group(
+                source,
+                group.clone(),
+                settings,
+                config,
+                protected,
+                newline,
+                children,
+            )
+        })
+        .flatten();
+    if settings.align_equals {
+        let mut text = expanded.unwrap_or_else(|| {
+            let mut text = String::new();
+            copy_children(&mut text, source, group, children);
+            text
+        });
+        text = align_group_equals(&text, config, settings.width, 0).unwrap_or(text);
+        Some(text)
+    } else {
+        expanded
+    }
+}
+
+/// Align only literal keys at their list's own level. Nested PGF styles are
+/// key-value lists; ordinary braced values (titles, code, formulas) stay opaque.
+fn align_group_equals(
+    source: &str,
+    config: &CompiledConfig,
+    width: Option<usize>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 64 || source.len() < 2 {
+        return None;
+    }
+    let protected = syntax::protected_ranges(source, &config.config).ok()?;
+    let body = 1..source.len() - 1;
+    let parsed = scan_punctuation(source, body.clone(), &protected, true)?;
+    let mut entries = Vec::new();
+    let mut start = body.start;
+    for &(position, byte) in &parsed.points {
+        if byte == b',' {
+            entries.push(start..position);
+            start = position + 1;
         }
     }
-    expand_group(
-        source, group, settings, config, protected, newline, children,
-    )
+    entries.push(start..body.end);
+    let mut edits = Vec::new();
+    let mut assignments = Vec::new();
+    let tab = config.config.indent.width;
+    for entry in entries {
+        let key_start = crate::trivia::skip(source, entry.start);
+        let first = parsed
+            .points
+            .partition_point(|&(position, _)| position < key_start);
+        let Some(&(equal, _)) = parsed.points[first..]
+            .iter()
+            .take_while(|&&(position, _)| position < entry.end)
+            .find(|&&(_, byte)| byte == b'=')
+        else {
+            continue;
+        };
+        let key = source[key_start..equal].trim_end_matches([' ', '\t']);
+        if key.is_empty() || key.contains(['\\', '{', '}', '[', ']', '$', '%', '\r', '\n']) {
+            continue;
+        }
+        let key_end = key_start + key.len();
+        let value_start = crate::trivia::skip(source, equal + 1);
+        if ["/.style", "/.append style", "/.prefix style"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+            && source.as_bytes().get(value_start) == Some(&b'{')
+            && let Some(end) = group_end(source, value_start, &protected)
+            && end <= entry.end
+            && crate::trivia::skip(source, end) >= entry.end
+            && let Some(value) =
+                align_group_equals(&source[value_start..end], config, width, depth + 1)
+            && value != source[value_start..end]
+        {
+            edits.push((value_start..end, value));
+        }
+        let line_start = source[..key_start]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        if !source[line_start..key_start]
+            .chars()
+            .all(|c| c == ' ' || c == '\t')
+        {
+            continue;
+        }
+        // Several entries on one physical line have no vertical assignment axis.
+        if source[equal..entry.end].contains('\n')
+            || entry.end == body.end
+            || source[entry.end..].starts_with(",\n")
+            || source[entry.end..].starts_with(",\r\n")
+            || source[entry.end + 1..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with(['%', '\r', '\n'])
+        {
+            let after = equal
+                + 1
+                + source[equal + 1..entry.end]
+                    .bytes()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                    .count();
+            assignments.push((key_end, equal, after, column(key, tab)));
+        }
+    }
+    if assignments.len() >= 2 {
+        let target = assignments.iter().map(|entry| entry.3).max().unwrap();
+        let mut padding = Vec::new();
+        let mut fits = target <= 4096;
+        for (key_end, equal, after, key_width) in assignments {
+            let before = " ".repeat(target.saturating_sub(key_width).min(4096) + 1);
+            let after_value = if source
+                .as_bytes()
+                .get(after)
+                .is_some_and(|c| matches!(c, b'\r' | b'\n' | b'%'))
+            {
+                &source[equal + 1..after]
+            } else {
+                " "
+            };
+            if let Some(width) = width {
+                let line_start = source[..equal].rfind('\n').map_or(0, |offset| offset + 1);
+                let line_end = source[equal..]
+                    .find('\n')
+                    .map_or(source.len(), |offset| equal + offset);
+                let mut line = source[line_start..key_end].to_owned();
+                line.push_str(&before);
+                line.push('=');
+                line.push_str(after_value);
+                line.push_str(&source[after..line_end]);
+                fits &= column(line.trim_end_matches('\r'), tab) <= width;
+            }
+            padding.push((key_end..equal, before));
+            padding.push((equal + 1..after, after_value.to_owned()));
+        }
+        if fits {
+            edits.extend(padding);
+        }
+    }
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut output = String::new();
+    let mut copied = 0;
+    for (range, value) in edits {
+        output.push_str(&source[copied..range.start]);
+        output.push_str(&value);
+        copied = range.end;
+    }
+    output.push_str(&source[copied..]);
+    Some(output)
 }
 
 fn expand_group(
@@ -855,6 +1044,24 @@ pub(crate) fn format_arguments_with_context(
     if !is_active(config) {
         return Ok(source.into());
     }
+    // Raw command candidates are a superset of executable invocations. A name
+    // inside a comment or literal may request extra work, but cannot hide one.
+    let selected: std::collections::HashSet<&str> = config
+        .config
+        .arguments
+        .commands
+        .iter()
+        .chain(config.config.arguments.rules.keys())
+        .map(String::as_str)
+        .chain(std::iter::once("includegraphics"))
+        .collect();
+    let selected_name =
+        |name: &str| selected.contains(name) || selected.contains(name.trim_end_matches('*'));
+    if !memchr::memchr_iter(b'\\', source.as_bytes())
+        .any(|at| syntax::command_at(source, at).is_some_and(|(name, _)| selected_name(name)))
+    {
+        return Ok(source.into());
+    }
     let parsed = parsing.snapshot(source, false, false)?;
     let analysis = crate::source_analysis::SourceAnalysis::with_memo(
         source,
@@ -898,7 +1105,10 @@ pub(crate) fn format_arguments_with_context(
             continue;
         }
         if let Some((name, end)) = syntax::command_at(source, cursor) {
-            if let Some(settings) = settings(name, config) {
+            if let Some(settings) = selected_name(name)
+                .then(|| settings(name, config))
+                .flatten()
+            {
                 let base = name.trim_end_matches('*');
                 let syntax_rule = config.config.syntax.commands.get(base).or_else(|| {
                     crate::package_commands::builtin_command_rule(base)

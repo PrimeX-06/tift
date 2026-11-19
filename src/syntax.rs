@@ -763,6 +763,51 @@ fn line_delimited_environment_end(
     None
 }
 
+/// alltt and semiverbatim keep TeX escapes and brace groups. A percent
+/// character is display text, so it does not hide the closing command.
+fn semiverbatim_environment_end(source: &str, mut cursor: usize, name: &str) -> Option<usize> {
+    let mut brace_depth = 0usize;
+    let mut environment_depth = 1usize;
+    while let Some(offset) = memchr::memchr3(b'\\', b'{', b'}', &source.as_bytes()[cursor..]) {
+        cursor += offset;
+        match source.as_bytes()[cursor] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {
+                let (command, finish) = command_at(source, cursor)?;
+                if brace_depth == 0
+                    && let Some((other, begin, end)) = env_at(source, cursor)
+                    && other == name
+                {
+                    if begin {
+                        environment_depth += 1;
+                    } else {
+                        environment_depth -= 1;
+                        if environment_depth == 0 {
+                            return Some(end);
+                        }
+                    }
+                    cursor = end;
+                    continue;
+                }
+                cursor = match command {
+                    "string" | "meaning" | "noexpand" => {
+                        let mut next = finish;
+                        while source.as_bytes().get(next) == Some(&b' ') {
+                            next += 1;
+                        }
+                        command_at(source, next).map_or(finish, |(_, end)| end)
+                    }
+                    _ => finish,
+                };
+                continue;
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
 fn primitive_condition(name: &str) -> bool {
     matches!(
         name,
@@ -1667,6 +1712,10 @@ fn context_factory_range(source: &str, range: &Range<usize>) -> bool {
             .or_else(|| {
                 crate::package_environments::verbatim_declaration(source, command, end)
                     .map(|declaration| declaration.end)
+            })
+            .or_else(|| {
+                crate::code_package_syntax::source_inline_declaration(source, command, end)
+                    .map(|(_, end)| end)
             });
         let Some(finish) = finish.filter(|finish| *finish <= range.end) else {
             return false;
@@ -1871,6 +1920,7 @@ fn declaration_protection_validation_needed(source: &str, config: &Config) -> bo
 fn context_declaration_command(command: &str) -> bool {
     let command = command.trim_end_matches('*');
     latex_macro_definition(command)
+        || crate::code_package_syntax::is_inline_factory(command)
         || matches!(
             command,
             "def"
@@ -2219,17 +2269,25 @@ pub(crate) fn infer_list_environments_with_definitions(
     let original: HashSet<String> = known.iter().cloned().collect();
     let mut inferred = original.clone();
     inferred.insert("trivlist".into());
-    loop {
-        let mut changed = false;
-        for (name, bases) in &dependencies {
-            if !name.is_empty() && bases.iter().any(|base| inferred.contains(base)) {
-                changed |= inferred.insert(name.clone());
+    let mut dependents = HashMap::<&str, Vec<&str>>::new();
+    for (name, bases) in &dependencies {
+        if !name.is_empty() {
+            for base in bases {
+                dependents.entry(base).or_default().push(name);
             }
         }
-        if !changed {
-            break;
+    }
+    let mut pending: std::collections::VecDeque<_> = inferred.iter().cloned().collect();
+    while let Some(base) = pending.pop_front() {
+        if let Some(names) = dependents.get(base.as_str()) {
+            for &name in names {
+                if inferred.insert(name.to_owned()) {
+                    pending.push_back(name.to_owned());
+                }
+            }
         }
     }
+    drop(dependents);
     let mut names: Vec<_> = dependencies
         .into_keys()
         .filter(|name| inferred.contains(name) && !original.contains(name))
@@ -2295,9 +2353,7 @@ pub(crate) fn format_macro_definitions_with_context(
     if !macro_layout_active(source, config) {
         return Ok(source.into());
     }
-    let Some(parsed) = parsing.current_snapshot(source) else {
-        return format_macro_definitions(source, config);
-    };
+    let parsed = parsing.snapshot(source, false, false)?;
     let analysis = crate::source_analysis::SourceAnalysis::with_memo(
         source,
         &config.config,
@@ -2313,7 +2369,12 @@ fn format_macro_definitions_parsed(
     config: &crate::CompiledConfig,
     definitions: Vec<MacroDefinition>,
 ) -> Result<String, FormatError> {
-    if definitions.is_empty() {
+    if !definitions.iter().any(|definition| {
+        definition
+            .bodies
+            .iter()
+            .any(|body| source[body.clone()].contains('\n'))
+    }) {
         return Ok(source.into());
     }
     let mut options = config.config.clone();
@@ -3721,7 +3782,8 @@ fn protected_ranges_with_inferred_environments(
     let mut pending_branches = std::collections::BTreeMap::new();
     let mut branch_ends = std::collections::BinaryHeap::new();
     let mut xparse_bindings = arguments::SignatureBindings::default();
-    let mut package_verbatim: HashMap<String, bool> = HashMap::new();
+    use crate::package_environments::VerbatimTerminator;
+    let mut package_verbatim = HashMap::new();
     let mut package_commands_redefined = HashSet::new();
     let mut visual_overrides = crate::packages::visual_languages::Overrides::default();
     let mut conditional_bindings = ConditionalBindings::default();
@@ -3881,10 +3943,23 @@ fn protected_ranges_with_inferred_environments(
                     pos = end;
                     continue;
                 }
+                let listing_header = if begin {
+                    crate::packages::listing_wrappers::context_header_signature(
+                        name,
+                        &package_context.at(pos),
+                    )
+                    .filter(|_| {
+                        !config.syntax.environment_arguments.contains_key(name)
+                            && !xparse_bindings.contains(true, name)
+                    })
+                } else {
+                    None
+                };
                 if begin
                     && (config.protect.environments.iter().any(|n| n == name)
                         || config.protect.file_contents.iter().any(|n| n == name)
                         || package_verbatim.contains_key(name)
+                        || listing_header.is_some()
                         || crate::package_environments::is_source_verbatim_environment_outside(
                             &source[..pos],
                             name,
@@ -3907,15 +3982,39 @@ fn protected_ranges_with_inferred_environments(
                         pos = end;
                         continue;
                     }
+                    let finish = listing_header
+                        .or_else(|| crate::packages::listing_wrappers::header_signature(name))
+                        .and_then(|signature| {
+                            // A leading bracket on the first code line of a
+                            // listings wrapper can be part of the payload.
+                            let limit = if signature == "o" {
+                                line_end(source, finish)
+                            } else {
+                                source.len()
+                            };
+                            crate::layout::signature_argument_ranges(
+                                source,
+                                finish..limit,
+                                signature.bytes(),
+                            )
+                            .last()
+                            .map(|range| range.end)
+                        })
+                        .unwrap_or(finish);
                     let terminator = format!("\\end{{{name}}}");
-                    let line_delimited =
-                        name == "comment" || package_verbatim.get(name) == Some(&true);
-                    let lua_line_delimited =
+                    let terminator_kind = package_verbatim.get(name).copied();
+                    let line_delimited = name == "comment"
+                        || terminator_kind == Some(VerbatimTerminator::UnindentedLine);
+                    let indented_line_delimited =
                         crate::luadraw_syntax::is_line_delimited_environment(name)
-                            || crate::code_environments::is_line_delimited_environment(name);
-                    let end = if crate::packages::visual_languages::has_exact_line_end(name) {
+                            || crate::code_environments::is_line_delimited_environment(name)
+                            || crate::code_package_syntax::is_line_delimited_environment(name)
+                            || terminator_kind == Some(VerbatimTerminator::IndentedLine);
+                    let end = if crate::code_package_syntax::obeys_tex_command_boundaries(name) {
+                        semiverbatim_environment_end(source, finish, name)
+                    } else if crate::packages::visual_languages::has_exact_line_end(name) {
                         crate::packages::visual_languages::exact_line_end(source, finish, name)
-                    } else if lua_line_delimited {
+                    } else if indented_line_delimited {
                         line_delimited_environment_end(source, finish, &terminator)
                     } else {
                         source[finish..]
@@ -4047,7 +4146,12 @@ fn protected_ranges_with_inferred_environments(
                         let exists = xparse_bindings
                             .contains(declaration.environment, &declaration.name)
                             || !declaration.environment
-                                && context_builtin_command(&declaration.name);
+                                && (context_builtin_command(&declaration.name)
+                                    || crate::code_package_syntax::is_pythontex_inline(
+                                        &declaration.name,
+                                    ) && package_context.at(pos).has_package("pythontex")
+                                    || crate::code_package_syntax::INLINE_CODE_COMMANDS
+                                        .contains(&declaration.name.as_str()));
                         let signature = declaration
                             .arguments
                             .and_then(|arguments| arguments.signature)
@@ -4125,6 +4229,82 @@ fn protected_ranges_with_inferred_environments(
                     );
                 }
                 let configured = config.syntax.commands.get(base);
+                if configured.is_none()
+                    && !config
+                        .protect
+                        .commands
+                        .iter()
+                        .any(|command| command == base || command == name)
+                {
+                    let finish = if let Some(kind) = xparse_bindings.inline_code(base) {
+                        let position =
+                            end - usize::from(kind.accepts_star_delimiter() && name.ends_with('*'));
+                        crate::code_package_syntax::generated_inline_end(source, kind, position)
+                    } else if crate::code_package_syntax::is_pythontex_inline(base)
+                        && !xparse_bindings.contains(false, base)
+                        && package_context.at(pos).has_package("pythontex")
+                    {
+                        // The lexer includes a trailing * in the name. Here * can
+                        // itself be the PythonTeX literal delimiter.
+                        crate::code_package_syntax::pythontex_inline_end(
+                            source,
+                            base,
+                            end - usize::from(name.ends_with('*') && !base.is_empty()),
+                        )
+                    } else if matches!(base, "VerbatimCopy" | "setOutputDir")
+                        && !xparse_bindings.contains(false, base)
+                        && package_context.at(pos).has_package("verbatimcopy")
+                    {
+                        crate::code_package_syntax::verbatim_copy_end(
+                            source,
+                            base,
+                            end - usize::from(name.ends_with('*')),
+                        )
+                    } else if matches!(base, "hll" | "pyth")
+                        && !xparse_bindings.contains(false, base)
+                    {
+                        crate::packages::listing_wrappers::inline_end(
+                            source,
+                            base,
+                            end - usize::from(name.ends_with('*')),
+                            &package_context.at(pos),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(finish) = finish {
+                        ranges.push(pos..finish);
+                        pos = finish;
+                        continue;
+                    }
+                    if !uncertain
+                        && !xparse_bindings.contains(false, base)
+                        && !package_commands_redefined.contains(base)
+                        && let Some((declarations, finish)) =
+                            crate::code_package_syntax::source_inline_declaration(source, base, end)
+                    {
+                        for (target, kind) in declarations {
+                            if base != "provideverbcommand"
+                                || !(xparse_bindings.contains(false, &target)
+                                    || context_builtin_command(&target)
+                                    || crate::code_package_syntax::INLINE_CODE_COMMANDS
+                                        .contains(&target.as_str()))
+                            {
+                                xparse_bindings.assign_inline_code(target, kind, global_catcode);
+                            }
+                        }
+                        if let Some(declaration) =
+                            crate::code_package_syntax::source_declaration(source, base, end)
+                        {
+                            for name in declaration.names {
+                                package_verbatim.insert(name, declaration.terminator);
+                            }
+                        }
+                        ranges.push(pos..finish);
+                        pos = finish;
+                        continue;
+                    }
+                }
                 let signature = configured.and_then(arguments::configured_signature);
                 let signature = signature.as_ref().or_else(|| {
                     configured
@@ -4147,7 +4327,14 @@ fn protected_ranges_with_inferred_environments(
                         delayed_key_ranges.extend(
                             arguments
                                 .into_iter()
-                                .filter(|range| range.start >= end)
+                                .filter(|range| {
+                                    range.start >= end
+                                        && !(configured
+                                            .is_some_and(|rule| rule.signature.is_none())
+                                            && command_at(source, range.start).is_some_and(
+                                                |(name, _)| matches!(name, "begin" | "end"),
+                                            ))
+                                })
                                 .map(|range| (range.start, range.end)),
                         );
                     }
@@ -4258,7 +4445,10 @@ fn protected_ranges_with_inferred_environments(
                                     )
                                     || config.protect.expl3 && command == "ExplSyntaxOn"
                                 {
-                                    package_verbatim.insert(declaration.name.clone(), false);
+                                    package_verbatim.insert(
+                                        declaration.name.clone(),
+                                        VerbatimTerminator::AnyPosition,
+                                    );
                                     break;
                                 }
                                 cursor = finish;
@@ -4344,7 +4534,7 @@ fn protected_ranges_with_inferred_environments(
                         crate::package_environments::verbatim_declaration(source, base, end)
                 {
                     for name in declaration.names {
-                        package_verbatim.insert(name, declaration.line_delimited);
+                        package_verbatim.insert(name, declaration.terminator);
                     }
                     ranges.push(pos..declaration.end);
                     pos = declaration.end;
@@ -4774,6 +4964,8 @@ fn lex_with_constructed_commands(
     let mut output = Vec::with_capacity((source.len() / 32).min(65_536));
     let mut pos = 0usize;
     let mut protected_index = 0usize;
+    let opaque = model.map_or(&[][..], |model| model.opaque_ranges());
+    let mut opaque_index = 0usize;
     let mut special_stack: Vec<usize> = Vec::new();
     let mut special_depths = Vec::new();
     let mut brace_depth = 0usize;
@@ -4782,12 +4974,12 @@ fn lex_with_constructed_commands(
     let mut pending_text_mode = false;
     let mut math_groups = Vec::new();
     while pos < source.len() {
-        if let Some(range) = model.and_then(|model| {
-            model
-                .opaque_ranges()
-                .iter()
-                .find(|range| range.start <= pos && pos < range.end)
-        }) {
+        // Both the semantic walk and this lexer advance in source order.
+        // Each opaque interval is visited once, including overlapping spans.
+        while opaque_index < opaque.len() && opaque[opaque_index].end <= pos {
+            opaque_index += 1;
+        }
+        if let Some(range) = opaque.get(opaque_index).filter(|range| range.start <= pos) {
             output.push(Token {
                 kind: TokenKind::Protected,
                 span: pos..range.end,
@@ -5390,7 +5582,11 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             .inferred_environment_arguments
                             .contains_key(name)
                     })
-                    .or_else(|| analysis.model().environment_arguments_at(token.span.start))
+                    .or_else(|| {
+                        analysis
+                            .model()
+                            .environment_arguments_at_begin(token.span.start)
+                    })
                 {
                     let limit = environment_ends
                         .get(&token.span.start)
@@ -5434,7 +5630,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         .copied()
                         .unwrap_or(source.len());
                     let body = token.span.end..limit;
-                    if let Some(rule) = analysis.box_arguments_at(name, token.span.start) {
+                    if let Some(rule) = analysis.box_arguments_at(name, token.span.end) {
                         configured_headers.insert(
                             i,
                             crate::layout::configured_environment_argument_ranges(
@@ -6112,6 +6308,35 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             .expect("token-data end");
                     }
                 }
+                // Keep complete opaque arguments in the public structure while
+                // their contents retain the package reader's literal grammar.
+                if let Some(owner) = pending
+                    && token.span.start >= blocks[owner].begin.end
+                    && let Some(arguments) = command_headers.get(&owner)
+                {
+                    for range in arguments.iter().filter(|range| {
+                        token.span.start <= range.start && range.end <= token.span.end
+                    }) {
+                        let kind = match source.as_bytes().get(range.start) {
+                            Some(b'{') if source.as_bytes().get(range.end - 1) == Some(&b'}') => {
+                                BlockKind::MandatoryArgument
+                            }
+                            Some(b'[') if source.as_bytes().get(range.end - 1) == Some(&b']') => {
+                                BlockKind::OptionalArgument
+                            }
+                            _ => continue,
+                        };
+                        blocks.push(StructuralBlock {
+                            kind,
+                            name: blocks[owner].name.clone(),
+                            begin: range.start..range.start + 1,
+                            body: range.start + 1..range.end - 1,
+                            end: range.end - 1..range.end,
+                            parent: Some(owner),
+                            branches: Vec::new(),
+                        });
+                    }
+                }
                 // Package metadata can cover complete leading arguments in a
                 // single opaque token. The invocation's fixed ranges still
                 // identify a later printable argument; retain its command
@@ -6459,6 +6684,10 @@ fn declaration_reuse_boundary_with_ranges(
                 .or_else(|| {
                     crate::package_environments::verbatim_declaration(source, base, end)
                         .map(|declaration| declaration.end)
+                })
+                .or_else(|| {
+                    crate::code_package_syntax::source_inline_declaration(source, base, end)
+                        .map(|(_, end)| end)
                 })
         } else {
             Some(end)

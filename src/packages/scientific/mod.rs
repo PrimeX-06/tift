@@ -61,7 +61,9 @@ macro_rules! specifications {
 mod arrows;
 mod calculus;
 mod chemistry;
+mod equations;
 mod fonts;
+mod physics;
 mod proofs;
 mod units;
 
@@ -80,13 +82,16 @@ macro_rules! domains {
     };
 }
 
-domains!(units, chemistry, proofs, calculus, fonts, arrows);
+domains!(
+    units, chemistry, proofs, calculus, fonts, arrows, equations, physics
+);
 
 fn contextual_specification(name: &str, context: &InvocationContext<'_>) -> Option<CommandSpec> {
     if context_ambiguous(name, context).is_some() {
         return Some(CommandSpec::EMPTY);
     }
     units::context_specification(name, context)
+        .or_else(|| chemistry::context_specification(name, context))
         .or_else(|| proofs::context_specification(name, context))
         .or_else(|| arrows::context_specification(name, context))
 }
@@ -94,7 +99,11 @@ fn contextual_specification(name: &str, context: &InvocationContext<'_>) -> Opti
 pub(crate) const ALIGNMENT_ENVIRONMENTS: &[&str] = arrows::ALIGNMENT_ENVIRONMENTS;
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
-    arrows::header_signature(name)
+    arrows::header_signature(name).or_else(|| proofs::mathpartir_environment(name).then_some("o"))
+}
+
+pub(crate) fn is_math_environment(name: &str) -> bool {
+    ALIGNMENT_ENVIRONMENTS.contains(&name) || proofs::mathpartir_environment(name)
 }
 
 pub(crate) fn environment_for_command(name: &str) -> Option<&str> {
@@ -116,6 +125,7 @@ pub(crate) fn factory_math_signature(name: &str) -> Option<math::Signature> {
 pub(crate) fn is_metadata_command(name: &str) -> bool {
     specification(name).is_some_and(|specification| specification.domains.contains('U'))
         || units::is_context_metadata(name)
+        || chemistry::is_context_metadata(name)
         || proofs::is_context_metadata(name)
         || arrows::is_context_metadata(name)
 }

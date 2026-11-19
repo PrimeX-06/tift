@@ -4,6 +4,7 @@
 !/Cargo.lock
 !/rust-toolchain.toml
 !/README.md
+!/CHANGELOG.md
 !/LICENSE
 !/.github/
 /.github/*

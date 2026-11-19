@@ -41,6 +41,15 @@ fn header_end(
     limit: usize,
     protected: &[Range<usize>],
 ) -> Option<usize> {
+    Some(header_list(source, start, limit, protected)?.end)
+}
+
+fn header_list(
+    source: &str,
+    start: usize,
+    limit: usize,
+    protected: &[Range<usize>],
+) -> Option<Range<usize>> {
     let (name, mut cursor) = syntax::command_at(source, start)?;
     if name != "foreach" {
         return None;
@@ -56,7 +65,7 @@ fn header_end(
                 return None;
             }
             let list = trivia(source, cursor + 2, limit);
-            return token_end(source, list, limit, protected);
+            return Some(list..token_end(source, list, limit, protected)?);
         }
         match source.as_bytes()[cursor] {
             b'[' => cursor = group_end(source, cursor, limit, protected)?,
@@ -69,6 +78,166 @@ fn header_end(
         }
     }
     None
+}
+
+pub(crate) fn format_lists(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, FormatError> {
+    use crate::argument_layout::ForeachListMode;
+    use unicode_width::UnicodeWidthStr;
+    if !source.contains("\\foreach") {
+        return Ok(source.into());
+    }
+    let parsed = parsing.snapshot(source, true, false)?;
+    let analysis = SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    if analysis.declared_commands()?.contains("foreach")
+        || config.config.syntax.commands.contains_key("foreach")
+    {
+        return Ok(source.into());
+    }
+    let settings = &config.config.arguments;
+    let width = settings.line_width.unwrap_or(config.config.wrap.columns);
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut edits = Vec::new();
+    for token in parsed.tokens.as_deref().expect("foreach tokens") {
+        if token.kind != TokenKind::Command
+            || syntax::is_protected(token.span.start, &parsed.protected)
+            || !syntax::command_at(source, token.span.start)
+                .is_some_and(|(name, _)| name == "foreach")
+        {
+            continue;
+        }
+        let Some(list) = header_list(source, token.span.start, source.len(), &parsed.protected)
+        else {
+            continue;
+        };
+        if source.as_bytes().get(list.start) != Some(&b'{')
+            || parsed
+                .protected
+                .iter()
+                .any(|range| range.start < list.end && list.start < range.end)
+        {
+            continue;
+        }
+        let line = source[..token.span.start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        if settings.foreach_lists == ForeachListMode::Auto
+            && !source[line..list.end]
+                .lines()
+                .any(|line| UnicodeWidthStr::width(line) > width)
+        {
+            continue;
+        }
+        let Some(items) = list_items(source, list.start + 1..list.end - 1, &parsed.protected)
+        else {
+            continue;
+        };
+        if items.len() < 2 {
+            continue;
+        }
+        // Common numeric or symbolic ranges remain compact, including in expand mode.
+        if items.len() <= 4
+            && items
+                .iter()
+                .any(|range| source[range.clone()].trim().trim_end_matches(',') == "...")
+        {
+            continue;
+        }
+        let prefix: String = source[line..token.span.start]
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .collect();
+        let unit = config.config.indent.unit("mandatory-argument", "argument");
+        let inner = format!("{prefix}{unit}");
+        let mut output = String::from("{");
+        let mut previous = list.start + 1;
+        for item in items {
+            let start = trivia(source, item.start, item.end);
+            let mut end = item.start
+                + source[item.clone()]
+                    .trim_end_matches([' ', '\t', '\r', '\n'])
+                    .len();
+            if end < item.end && syntax::is_escaped(source, end) {
+                end += 1;
+            }
+            if start >= end {
+                continue;
+            }
+            list_boundary(&mut output, &source[previous..start], newline, &inner);
+            output.push_str(&source[start..end]);
+            previous = end;
+        }
+        list_boundary(
+            &mut output,
+            &source[previous..list.end - 1],
+            newline,
+            &prefix,
+        );
+        output.push('}');
+        edits.push((list, output));
+    }
+    crate::layout::apply_edits(source, edits)
+}
+
+fn list_boundary(output: &mut String, gap: &str, newline: &str, indent: &str) {
+    if gap.contains('%') {
+        // Retain comment text, its line ending, and any intentional blank lines.
+        if let Some(end) = gap.rfind('\n') {
+            output.push_str(&gap[..end + 1]);
+        } else {
+            output.push_str(gap);
+            output.push_str(newline);
+        }
+    } else if gap.bytes().filter(|&byte| byte == b'\n').count() > 1 {
+        output.push_str(&gap[..gap.rfind('\n').expect("blank line") + 1]);
+    } else {
+        if gap.is_empty() {
+            output.push('%');
+        }
+        output.push_str(newline);
+    }
+    output.push_str(indent);
+}
+
+fn list_items(
+    source: &str,
+    body: Range<usize>,
+    protected: &[Range<usize>],
+) -> Option<Vec<Range<usize>>> {
+    let mut items = Vec::new();
+    let mut start = body.start;
+    let mut at = start;
+    while at < body.end {
+        match source.as_bytes()[at] {
+            b'{' => at = group_end(source, at, body.end, protected)?,
+            // pgffor.code.tex's scanround shields a leading coordinate's comma.
+            b'(' if trivia(source, start, at) == at => {
+                at = syntax::balanced_end(source, at, b'(', b')').filter(|end| *end <= body.end)?
+            }
+            b'\\' => at = syntax::command_at(source, at)?.1,
+            b'%' => at = comment_end(source, at, body.end),
+            b',' => {
+                items.push(start..at + 1);
+                at += 1;
+                start = at;
+            }
+            _ => at += source[at..].chars().next()?.len_utf8(),
+        }
+    }
+    items.push(start..body.end);
+    Some(items)
 }
 
 fn statement_end(

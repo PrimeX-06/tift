@@ -1,9 +1,9 @@
 //! Built-in providers and statically ordered capability dispatch.
 use super::{
     InvocationContext, authoring, circuits_timing, cjk, classes, code, code_environments, commands,
-    documents, environments, equation_floats, indexing, keys, links_color_columns, lua, math,
-    multilingual, page_styles, references, scientific, tables, tikz_diagrams, tikz_utilities,
-    typography, visual_languages,
+    documents, environments, equation_floats, indexing, keys, links_color_columns,
+    listing_wrappers, lua, math, multilingual, page_styles, references, scientific, tables,
+    tikz_diagrams, tikz_utilities, typography, visual_languages,
 };
 use crate::config::CommandRule;
 use std::collections::BTreeMap;
@@ -71,6 +71,7 @@ macro_rules! providers {
             Documents {
                 headers: (3, documents::header_signature),
                 commands: (1, document_command),
+                context_command: (1, documents::context_command_signature),
             }
             Documents {
                 headers: (17, authoring::header_signature),
@@ -176,6 +177,10 @@ macro_rules! providers {
             Literal {
                 headers: (5, lua::header_signature),
                 adders: (1, lua::add_command_rules),
+            }
+            Literal {
+                headers: (19, listing_wrappers::header_signature),
+                context_header: (1, listing_wrappers::context_header_signature),
             }
             Scientific {
                 headers: (0, math::header_signature),

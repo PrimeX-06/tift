@@ -21,9 +21,58 @@ pub(crate) struct MathModes {
     source_overrides: HashSet<usize>,
     signatures: HashMap<usize, math::Signature>,
     arguments: HashMap<usize, Vec<MathArgument>>,
+    environments: HashMap<usize, usize>,
 }
 
 impl MathModes {
+    pub(super) fn remap(&mut self, positions: &super::PositionMap) -> Option<()> {
+        for region in &mut self.regions {
+            positions.remap_range(&mut region.body)?;
+            if let Some((at, _)) = &mut region.display {
+                *at = positions.position(*at, true)?;
+            }
+            if let Some(range) = &mut region.environment {
+                positions.remap_range(range)?;
+            }
+        }
+        self.environments = self
+            .environments
+            .drain()
+            .map(|(at, index)| Some((positions.position(at, true)?, index)))
+            .collect::<Option<_>>()?;
+        self.source_overrides = self
+            .source_overrides
+            .iter()
+            .map(|&at| positions.position(at, true))
+            .collect::<Option<_>>()?;
+        self.signatures = self
+            .signatures
+            .drain()
+            .map(|(at, signature)| Some((positions.position(at, true)?, signature)))
+            .collect::<Option<_>>()?;
+        self.arguments = self
+            .arguments
+            .drain()
+            .map(|(at, mut arguments)| {
+                for argument in &mut arguments {
+                    positions.remap_range(&mut argument.range)?;
+                    positions.remap_range(&mut argument.body)?;
+                }
+                Some((positions.position(at, true)?, arguments))
+            })
+            .collect::<Option<_>>()?;
+        Some(())
+    }
+
+    pub(super) fn environment_at(&self, at: usize, limit: usize) -> Option<&MathRegion> {
+        let region = &self.regions[*self.environments.get(&at)?];
+        region
+            .environment
+            .as_ref()
+            .filter(|range| range.end <= limit)
+            .map(|_| region)
+    }
+
     pub(crate) fn signature_at(&self, name: &str, at: usize) -> Option<math::Signature> {
         if self.source_overrides.contains(&at) {
             return None;
@@ -230,12 +279,19 @@ impl MathModes {
         }
         regions.sort_by_key(|region| (region.body.start, std::cmp::Reverse(region.body.end)));
         regions.dedup_by(|left, right| left.body == right.body);
+        let mut environments = HashMap::new();
+        for (index, region) in regions.iter().enumerate() {
+            if let Some(range) = &region.environment {
+                environments.entry(range.start).or_insert(index);
+            }
+        }
         Ok(Self {
             regions,
             declared,
             signatures,
             arguments,
             source_overrides,
+            environments,
         })
     }
 }

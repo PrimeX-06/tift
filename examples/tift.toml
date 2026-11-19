@@ -30,6 +30,7 @@ align-last-row-break = true
 align-content-after-row-break = false
 format-children = true
 multicolumn = true
+column-spec = "preserve" # "expand" puts each literal column on its own line; "auto" uses wrap.columns.
 short-rows = "align"
 justification = "columns" # Follow recognized l/c/r specifications; "left" uses uniform left alignment.
 regex-engine = "enhanced"
@@ -67,6 +68,8 @@ long-words = "overflow" # "break" allows grapheme-safe splitting of long plain w
 mode = "auto"
 split-commas = true
 split-equals = false
+align-equals = false # Align assignments in multiline option lists.
+foreach-lists = "preserve" # "expand" uses one record per line; "auto" checks columns or wrap.columns.
 # columns = 88
 # [arguments.rules.customkeys]
 # argument = 1 # Select the second mandatory brace group.
@@ -194,6 +197,16 @@ expl3 = true # Format explicit or package-declared expl3 regions.
 
 [math]
 enabled = true # Set false to retain formula-internal spacing and line breaks.
+spacing = true # Normalize formula whitespace independently of display wrapping.
+wrap = "break" # break, preserve, or single-line; applies to single-formula displays.
+# columns = 80 # Omit to inherit wrap.columns.
+# break-priority = ["relation", "additive", "multiplicative", "binary"] # First choice first.
+
+[trees]
+mode = "preserve" # "expand" indents subtrees; "auto" expands trees exceeding the width.
+forest = true
+qtree = true
+# columns = 80 # Omit to inherit wrap.columns.
 
 [protect]
 # Package raw environments and literal code factories receive protection.

@@ -114,6 +114,7 @@ pub struct SourceModel {
     environment_declarations: Vec<EnvironmentDeclaration>,
     environment_declaration_names: HashSet<String>,
     environment_arguments: HashMap<usize, EnvironmentArguments>,
+    environment_header_starts: HashMap<usize, usize>,
     context: crate::packages::context::ContextIndex,
     conditionals: Vec<Conditional>,
     rules: Vec<SyntaxRule>,
@@ -362,6 +363,7 @@ impl SourceModel {
             environment_declarations: Vec::new(),
             environment_declaration_names: HashSet::new(),
             environment_arguments: HashMap::new(),
+            environment_header_starts: HashMap::new(),
             context: crate::packages::context::ContextIndex::with_config(source, config),
             conditionals: Vec::new(),
             rules: Vec::new(),
@@ -410,10 +412,23 @@ impl SourceModel {
     pub fn environment_declarations(&self) -> &[EnvironmentDeclaration] {
         &self.environment_declarations
     }
-    /// Header signatures resolved where an environment begins. The closing
-    /// offset of the begin token is also accepted by layout consumers.
+    /// Header signatures resolved where an environment begins. A begin offset
+    /// takes priority when adjacent begin tokens share a boundary.
     pub fn environment_arguments_at(&self, at: usize) -> Option<&EnvironmentArguments> {
+        self.environment_arguments_at_begin(at)
+            .or_else(|| self.environment_arguments_after(at))
+    }
+
+    pub(crate) fn environment_arguments_at_begin(
+        &self,
+        at: usize,
+    ) -> Option<&EnvironmentArguments> {
         self.environment_arguments.get(&at)
+    }
+
+    pub(crate) fn environment_arguments_after(&self, at: usize) -> Option<&EnvironmentArguments> {
+        self.environment_arguments
+            .get(self.environment_header_starts.get(&at)?)
     }
     pub(crate) fn invocation_context_at(
         &self,
@@ -698,15 +713,15 @@ impl SourceModel {
             let constructed = self.constructed.get(&start);
             let end = constructed.map_or(end, |(_, finish)| *finish);
             let control = constructed.map_or(control, |(name, _)| name.as_str());
-            let name = control.trim_end_matches('*').to_owned();
+            let name = control.trim_end_matches('*');
             if foreach_variables
-                .get(&name)
+                .get(name)
                 .is_some_and(|&finish| start < finish)
             {
                 self.invocations.insert(
                     start,
                     SyntaxRule {
-                        name,
+                        name: name.to_owned(),
                         meaning: RuleMeaning::Unknown,
                         origin: RuleOrigin::Source,
                         span: Some(start..end),
@@ -716,8 +731,8 @@ impl SourceModel {
                 continue;
             }
             if name == "foreach"
-                && !config.syntax.commands.contains_key(&name)
-                && !bindings.contains_key(&name)
+                && !config.syntax.commands.contains_key(name)
+                && !bindings.contains_key(name)
                 && let Some(binding) = syntax::arguments::foreach_binding(&self.source, end, |at| {
                     let index = self.tokens.partition_point(|token| token.span.start < at);
                     pairs.get(&index).map(|&close| self.tokens[close].span.end)
@@ -730,8 +745,8 @@ impl SourceModel {
                         .or_insert(binding.end);
                 }
             }
-            if !config.syntax.commands.contains_key(&name)
-                && !bindings.contains_key(&name)
+            if !config.syntax.commands.contains_key(name)
+                && !bindings.contains_key(name)
                 && let Some(environment) = crate::packages::scoped_environment_for_command(control)
             {
                 self.context.observe_environment(
@@ -740,8 +755,8 @@ impl SourceModel {
                     end,
                 );
             }
-            if !config.syntax.commands.contains_key(&name)
-                && !bindings.contains_key(&name)
+            if !config.syntax.commands.contains_key(name)
+                && !bindings.contains_key(name)
                 && let Some(branches) =
                     crate::packages::command_branch_ranges(&self.source, control, end)
             {
@@ -769,29 +784,27 @@ impl SourceModel {
                     }
                 }
             }
-            if name == "global" && !bindings.contains_key(&name) {
+            if name == "global" && !bindings.contains_key(name) {
                 global_prefix = true;
                 pos += 1;
                 continue;
             }
-            if matches!(name.as_str(), "long" | "outer" | "protected")
-                && !bindings.contains_key(&name)
-            {
+            if matches!(name, "long" | "outer" | "protected") && !bindings.contains_key(name) {
                 pos += 1;
                 continue;
             }
-            if matches!(name.as_str(), "begingroup" | "bgroup") {
+            if matches!(name, "begingroup" | "bgroup") {
                 scopes.push(HashMap::new());
                 pos += 1;
                 continue;
             }
-            if matches!(name.as_str(), "endgroup" | "egroup") {
+            if matches!(name, "endgroup" | "egroup") {
                 restore_scope(&mut bindings, &mut scopes);
                 pos += 1;
                 continue;
             }
-            if !config.syntax.commands.contains_key(&name)
-                && !bindings.contains_key(&name)
+            if !config.syntax.commands.contains_key(name)
+                && !bindings.contains_key(name)
                 && let Some(reason) =
                     crate::packages::context_ambiguous(control, &self.context.at(start))
             {
@@ -807,9 +820,9 @@ impl SourceModel {
                     .partition_point(|token| token.span.start < finish);
                 continue;
             }
-            let invocation = if let Some(rule) = config.syntax.commands.get(&name) {
+            let invocation = if let Some(rule) = config.syntax.commands.get(name) {
                 Some(SyntaxRule {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     meaning: RuleMeaning::Arguments(EnvironmentArguments {
                         arguments: rule.arguments.unwrap_or(0),
                         optional_arguments: rule.optional_arguments,
@@ -818,10 +831,10 @@ impl SourceModel {
                     origin: RuleOrigin::Configuration,
                     span: Some(start..end),
                 })
-            } else if let Some(binding) = bindings.get(&name) {
-                let meaning = binding_meaning(&name, binding, &bindings);
+            } else if let Some(binding) = bindings.get(name) {
+                let meaning = binding_meaning(name, binding, &bindings);
                 Some(SyntaxRule {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     meaning,
                     origin: RuleOrigin::Source,
                     span: Some(start..end),
@@ -834,7 +847,7 @@ impl SourceModel {
                     &self.context.at(start),
                 )
                 .map(|signature| SyntaxRule {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     meaning: RuleMeaning::Arguments(EnvironmentArguments {
                         signature: Some(signature.into()),
                         ..Default::default()
@@ -846,7 +859,7 @@ impl SourceModel {
             if let Some(rule) = invocation {
                 if rule.origin == RuleOrigin::Source
                     && let Some(signature) = bindings
-                        .get(&name)
+                        .get(name)
                         .and_then(|binding| binding.math_signature)
                 {
                     self.inferred_math_signatures.insert(start, signature);
@@ -880,6 +893,8 @@ impl SourceModel {
                     && let Some(signature) = arguments.signature.as_deref()
                     && let Some(span) =
                         syntax::arguments::unclosed_argument(&self.source, end, signature)
+                    && !(rule.origin == RuleOrigin::Builtin
+                        && crate::packages::command_data_end(&self.source, control, end).is_some())
                 {
                     self.diagnostics.push(Diagnostic {
                         severity: Severity::Error,
@@ -889,7 +904,7 @@ impl SourceModel {
                 }
                 self.invocations.insert(start, rule);
             }
-            if matches!(name.as_str(), "begin" | "end") {
+            if matches!(name, "begin" | "end") {
                 let argument = skip(&self.source, end);
                 if let Some(finish) = syntax::balanced_end(&self.source, argument, b'{', b'}') {
                     let alias = EnvironmentAlias {
@@ -935,7 +950,7 @@ impl SourceModel {
                             });
                         if let Some(arguments) = arguments {
                             self.environment_arguments.insert(start, arguments.clone());
-                            self.environment_arguments.insert(finish, arguments.clone());
+                            self.environment_header_starts.insert(finish, start);
                         } else if bindings.contains_key(&key) {
                             let invocation_end = syntax::inferred_environment_end(
                                 &self.source,
@@ -965,7 +980,7 @@ impl SourceModel {
                         }
                     }
                     self.rules.push(SyntaxRule {
-                        name,
+                        name: name.to_owned(),
                         meaning: RuleMeaning::Environment(alias),
                         origin: RuleOrigin::Builtin,
                         span: Some(start..finish),
@@ -974,12 +989,15 @@ impl SourceModel {
                     continue;
                 }
             }
-            if !bindings.contains_key(&name)
+            if !bindings.contains_key(name)
                 && let Some(declaration) =
                     syntax::source_environment_declaration(&self.source, start, control, end)
             {
                 let key = format!("environment:{}", declaration.name);
-                if !declaration.provide || !bindings.contains_key(&key) {
+                let provided_builtin = declaration.provide
+                    && !bindings.contains_key(&key)
+                    && crate::packages::header_signature(&declaration.name).is_some();
+                if !declaration.provide || !bindings.contains_key(&key) && !provided_builtin {
                     let signature = if certain {
                         declaration.signature.clone()
                     } else {
@@ -1005,19 +1023,21 @@ impl SourceModel {
                     );
                 }
                 let finish = declaration.span.end;
-                self.environment_declaration_names
-                    .insert(declaration.name.clone());
-                self.environment_declarations.push(declaration);
+                if !provided_builtin {
+                    self.environment_declaration_names
+                        .insert(declaration.name.to_owned());
+                    self.environment_declarations.push(declaration);
+                }
                 global_prefix = false;
                 pos = self
                     .tokens
                     .partition_point(|token| token.span.start < finish);
                 continue;
             }
-            if !bindings.contains_key(&name)
+            if !bindings.contains_key(name)
                 && (name.ends_with("environment")
                     || name.ends_with("DocumentEnvironment")
-                    || matches!(name.as_str(), "NewEnviron" | "RenewEnviron"))
+                    || matches!(name, "NewEnviron" | "RenewEnviron"))
                 && let Some(finish) = syntax::delayed_data_end(&self.source, control, end)
             {
                 self.opaque.push(start..finish);
@@ -1031,7 +1051,7 @@ impl SourceModel {
                     .partition_point(|token| token.span.start < finish);
                 continue;
             }
-            if !bindings.contains_key(&name)
+            if !bindings.contains_key(name)
                 && let Some(definition) = definition(&self.source, &self.tokens, &pairs, pos)
             {
                 let (declaration, finish, global, provide) = definition;
@@ -1072,7 +1092,7 @@ impl SourceModel {
                 } else {
                     Replacement::Unknown
                 };
-                if matches!(name.as_str(), "edef" | "xdef")
+                if matches!(name, "edef" | "xdef")
                     && let Replacement::Forward(target) = &replacement
                 {
                     replacement = resolve(target, &bindings)
@@ -1099,7 +1119,7 @@ impl SourceModel {
                             condition: None,
                             literal_arguments,
                             math_signature: certain
-                                .then(|| crate::packages::scientific::factory_math_signature(&name))
+                                .then(|| crate::packages::scientific::factory_math_signature(name))
                                 .flatten()
                                 .map(|signature| (signature.shape, signature.domains)),
                         },
@@ -1108,7 +1128,7 @@ impl SourceModel {
                 }
                 if let Some(signature) = &declaration.signature {
                     self.rules.push(SyntaxRule {
-                        name: declaration.name.clone(),
+                        name: declaration.name.to_owned(),
                         meaning: RuleMeaning::Arguments(signature.clone()),
                         origin: RuleOrigin::Source,
                         span: Some(declaration.span.clone()),
@@ -1121,7 +1141,7 @@ impl SourceModel {
                 pos = finish;
                 continue;
             }
-            if matches!(name.as_str(), "let" | "futurelet") {
+            if matches!(name, "let" | "futurelet") {
                 let target = next(&self.tokens, pos + 1);
                 if let Some(target_token) = self.tokens.get(target)
                     && let Some((target_name, _)) =
@@ -1192,9 +1212,9 @@ impl SourceModel {
                 .syntax
                 .conditions
                 .iter()
-                .any(|condition| condition == &name);
+                .any(|condition| condition == name);
             if let Some(binding) = bindings
-                .get(&name)
+                .get(name)
                 .filter(|binding| binding.literal_arguments)
                 && let Some(signature) = &binding.signature
                 && let Some(arguments) = invocation_arguments(&self.source, end, signature)
@@ -1209,13 +1229,13 @@ impl SourceModel {
                 continue;
             }
             if configured_condition
-                || bindings.get(&name).map_or_else(
-                    || syntax::is_condition_command(&name, config),
+                || bindings.get(name).map_or_else(
+                    || syntax::is_condition_command(name, config),
                     |binding| binding.condition.is_some(),
                 )
             {
                 let reader = bindings
-                    .get(&name)
+                    .get(name)
                     .and_then(|binding| binding.condition.as_deref())
                     .unwrap_or(control);
                 let operand_end =
@@ -1226,13 +1246,13 @@ impl SourceModel {
                 conditions.push((start, Vec::new(), operand_end));
                 let origin = if configured_condition {
                     RuleOrigin::Configuration
-                } else if bindings.contains_key(&name) {
+                } else if bindings.contains_key(name) {
                     RuleOrigin::Source
                 } else {
                     RuleOrigin::Builtin
                 };
                 self.rules.push(SyntaxRule {
-                    name,
+                    name: name.to_owned(),
                     meaning: RuleMeaning::Condition,
                     origin,
                     span: Some(start..end),
@@ -1240,7 +1260,7 @@ impl SourceModel {
                 pos = self.tokens.partition_point(|t| t.span.start < operand_end);
                 continue;
             }
-            if matches!(name.as_str(), "else" | "or") {
+            if matches!(name, "else" | "or") {
                 if let Some((_, branches, branch_start)) = conditions.last_mut() {
                     branches.push(*branch_start..start);
                     *branch_start = end;
@@ -1259,7 +1279,7 @@ impl SourceModel {
                 pos += 1;
                 continue;
             }
-            if let Some(alias) = resolve(&name, &bindings) {
+            if let Some(alias) = resolve(name, &bindings) {
                 self.context
                     .observe_environment(&alias.environment, alias.begin, end);
                 if alias.begin {
@@ -1269,12 +1289,12 @@ impl SourceModel {
                 }
                 self.boundaries.insert(start, alias.clone());
                 self.rules.push(SyntaxRule {
-                    name,
+                    name: name.to_owned(),
                     meaning: RuleMeaning::Environment(alias),
                     origin: RuleOrigin::Source,
                     span: Some(start..end),
                 });
-            } else if bindings.get(&name).is_some_and(|binding| {
+            } else if bindings.get(name).is_some_and(|binding| {
                 binding.candidate
                     && !(matches!(binding.replacement, Replacement::NeutralWrapper)
                         && binding.signature.as_ref().is_some_and(|signature| {
@@ -1291,11 +1311,11 @@ impl SourceModel {
                 if self.opaque.is_empty() {
                     self.opaque.push(start..self.source.len());
                 }
-            } else if seen_builtins.insert(name.clone())
-                && let Some(rule) = crate::package_commands::builtin_command_rule(&name)
+            } else if seen_builtins.insert(name)
+                && let Some(rule) = crate::package_commands::builtin_command_rule(name)
             {
                 self.rules.push(SyntaxRule {
-                    name,
+                    name: name.to_owned(),
                     meaning: RuleMeaning::Arguments(EnvironmentArguments {
                         arguments: rule.arguments.unwrap_or(0),
                         optional_arguments: rule.optional_arguments,

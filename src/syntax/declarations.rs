@@ -382,7 +382,9 @@ fn infer_declaration_config_impl(
                     crate::package_environments::verbatim_declaration(source, base, end)
                 {
                     finish = declaration.end;
-                    if !declaration.line_delimited {
+                    if declaration.terminator
+                        == crate::package_environments::VerbatimTerminator::AnyPosition
+                    {
                         for name in declaration.names {
                             declarations.push(ContextDeclaration {
                                 name,

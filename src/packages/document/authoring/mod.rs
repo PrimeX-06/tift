@@ -15,18 +15,22 @@ macro_rules! commands {
 
 mod review;
 mod theorems;
+mod writing;
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     theorems::header_signature(name).or_else(|| review::header_signature(name))
 }
 
 fn specification(name: &str) -> Option<(&'static str, &'static str)> {
-    theorems::specification(name).or_else(|| review::specification(name))
+    theorems::specification(name)
+        .or_else(|| review::specification(name))
+        .or_else(|| writing::specification(name))
 }
 
 pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
     theorems::add_command_rules(commands);
     review::add_command_rules(commands);
+    writing::add_command_rules(commands);
 }
 
 fn starred(source: &str, name: &str, cursor: usize) -> bool {
@@ -34,9 +38,13 @@ fn starred(source: &str, name: &str, cursor: usize) -> bool {
 }
 
 pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Option<&'static str> {
+    let (shape, _) = specification(name)?;
     let base = name.trim_end_matches('*');
     let star = starred(source, name, cursor);
     let separated = star && !name.ends_with('*');
+    if separated && let Some(shape) = writing::separated_star_shape(base) {
+        return Some(shape);
+    }
     if matches!(
         base,
         "fxnote" | "fxwarning" | "fxerror" | "fxfatal" | "fixme"
@@ -44,7 +52,7 @@ pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Opti
     {
         return Some(if separated { "momm" } else { "omm" });
     }
-    specification(name).map(|(shape, _)| shape)
+    Some(shape)
 }
 
 pub(crate) fn is_metadata_command(name: &str) -> bool {
@@ -64,6 +72,12 @@ pub(crate) fn command_header_end(source: &str, name: &str, cursor: usize) -> Opt
     {
         prefix = "mo";
     }
-    signature_end(source, cursor, command_signature(source, name, cursor)?)?;
+    let shape = command_signature(source, name, cursor)?;
+    if let Some(extended) = writing::separated_star_shape(name)
+        && shape == extended
+    {
+        prefix = extended;
+    }
+    signature_end(source, cursor, shape)?;
     signature_end(source, cursor, prefix).filter(|finish| *finish > cursor)
 }

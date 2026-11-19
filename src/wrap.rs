@@ -424,6 +424,7 @@ fn format_text_with_arguments(
         .collect();
     let mut output = String::with_capacity(source.len() + source.len() / 16);
     let mut paragraph: Option<Paragraph> = None;
+    let mut blocked_item: Option<(usize, String)> = None;
     let mut offset = 0;
     let mut previous_content = "";
     for line in source.split_inclusive('\n') {
@@ -435,6 +436,11 @@ fn format_text_with_arguments(
         let indent_len = content.len() - content.trim_start_matches([' ', '\t']).len();
         let body_start = start + indent_len;
         let body = &source[body_start..content_end];
+        let exterior_continuation = if blocked_item.as_ref().is_some_and(|(end, _)| *end <= start) {
+            blocked_item.take().map(|(_, prefix)| prefix)
+        } else {
+            None
+        };
         let follows = config
             .text
             .block_follow
@@ -464,6 +470,24 @@ fn format_text_with_arguments(
             || containing(start, &opaque).is_some_and(|range| range.end >= content_end)
             || body.is_empty();
         if blocked_line {
+            if wrap_active
+                && let Some(length) = item_body(body, &config.config.syntax.items)
+                && !contains_definition(body)
+                && let Some(atom) = blocked
+                    .get(blocked.partition_point(|range| range.end <= body_start))
+                    .filter(|range| body_start < range.start && range.start < content_end)
+            {
+                // The inline atom can span several lines, while the following
+                // prose still belongs to the item's hanging paragraph.
+                blocked_item = Some((
+                    atom.end,
+                    item_continuation(
+                        &source[start..body_start],
+                        &body[..length],
+                        config.config.indent.width,
+                    ),
+                ));
+            }
             let continuation = if let Some(current) = paragraph.as_ref().filter(|paragraph| {
                 !paragraph.comment && paragraph.prefix != paragraph.continuation
             }) {
@@ -722,17 +746,18 @@ fn format_text_with_arguments(
             output.push_str(line);
             continue;
         }
-        let prefix = &source[start..text_start];
+        let exterior_continuation = exterior_continuation.filter(|_| item.is_none());
+        let prefix = exterior_continuation
+            .as_deref()
+            .unwrap_or(&source[start..text_start]);
         let continuation = if let Some(item_length) = item {
-            format!(
-                "{}{}",
+            item_continuation(
                 &source[start..body_start],
-                " ".repeat(display_width(
-                    &body[..item_length],
-                    0,
-                    config.config.indent.width
-                ))
+                &body[..item_length],
+                config.config.indent.width,
             )
+        } else if let Some(prefix) = &exterior_continuation {
+            prefix.clone()
         } else {
             source[start..body_start].to_owned()
         };
@@ -1094,9 +1119,12 @@ fn format_text_arguments(
         }
     }
     merge_ranges(&mut protected);
-    let definitions = crate::syntax::macro_definitions_with_ranges(source, &protected);
-    let declared =
-        crate::syntax::declared_command_names_with_ranges(source, &protected, &definitions);
+    let declared = if crate::syntax::has_analysis_declaration_tokens(source) {
+        let definitions = crate::syntax::macro_definitions_with_ranges(source, &protected);
+        crate::syntax::declared_command_names_with_ranges(source, &protected, &definitions)
+    } else {
+        HashSet::new()
+    };
     let mut output = String::with_capacity(source.len());
     let mut copied = 0;
     let mut cursor = 0;
@@ -1624,28 +1652,45 @@ fn canonicalize(
             continue;
         }
         let mut position = start;
+        let mut opaque_index = opaque.partition_point(|range| range.end <= start);
         while position < end {
-            if let Some(range) = containing(position, opaque) {
+            while opaque
+                .get(opaque_index)
+                .is_some_and(|range| range.end <= position)
+            {
+                opaque_index += 1;
+            }
+            if let Some(range) = opaque
+                .get(opaque_index)
+                .filter(|range| range.start <= position)
+            {
                 let stop = range.end.min(end);
                 let destination = result.text.len();
                 result.text.push_str(&source[position..stop]);
                 result.opaque.push(destination..result.text.len());
                 position = stop;
             } else {
-                let character = source[position..].chars().next().unwrap();
-                if character == ' ' || character == '\t' {
-                    let whitespace_start = position;
-                    while position < end && matches!(source.as_bytes()[position], b' ' | b'\t') {
-                        position += 1;
-                    }
-                    if collapse {
+                let stop = opaque
+                    .get(opaque_index)
+                    .map_or(end, |range| range.start.min(end));
+                if !collapse {
+                    result.text.push_str(&source[position..stop]);
+                    position = stop;
+                    continue;
+                }
+                while position < stop {
+                    let plain_end =
+                        memchr::memchr2(b' ', b'\t', &source.as_bytes()[position..stop])
+                            .map_or(stop, |offset| position + offset);
+                    result.text.push_str(&source[position..plain_end]);
+                    position = plain_end;
+                    if position < stop {
                         result.text.push(' ');
-                    } else {
-                        result.text.push_str(&source[whitespace_start..position]);
+                        while position < stop && matches!(source.as_bytes()[position], b' ' | b'\t')
+                        {
+                            position += 1;
+                        }
                     }
-                } else {
-                    result.text.push(character);
-                    position += character.len_utf8();
                 }
             }
         }
@@ -1743,11 +1788,10 @@ fn visit_atoms(
 ) {
     let mut position = sentence.start;
     let mut previous_end = position;
+    let mut opaque_index = text.opaque.partition_point(|range| range.end <= position);
     while position < sentence.end {
-        while position < sentence.end
-            && matches!(text.text[position..].chars().next().unwrap(), ' ' | '\t')
-        {
-            position += text.text[position..].chars().next().unwrap().len_utf8();
+        while position < sentence.end && matches!(text.text.as_bytes()[position], b' ' | b'\t') {
+            position += 1;
         }
         if position >= sentence.end {
             break;
@@ -1755,14 +1799,32 @@ fn visit_atoms(
         let word_start = position;
         let mut atomic = false;
         while position < sentence.end {
-            if let Some(range) = containing(position, &text.opaque) {
+            while text
+                .opaque
+                .get(opaque_index)
+                .is_some_and(|range| range.end <= position)
+            {
+                opaque_index += 1;
+            }
+            if let Some(range) = text
+                .opaque
+                .get(opaque_index)
+                .filter(|range| range.start <= position)
+            {
                 atomic = true;
                 position = range.end.min(sentence.end);
             } else {
-                if matches!(text.text.as_bytes()[position], b' ' | b'\t') {
+                let stop = text
+                    .opaque
+                    .get(opaque_index)
+                    .map_or(sentence.end, |range| range.start.min(sentence.end));
+                if let Some(offset) =
+                    memchr::memchr2(b' ', b'\t', &text.text.as_bytes()[position..stop])
+                {
+                    position += offset;
                     break;
                 }
-                position += 1;
+                position = stop;
             }
         }
         if atomic || (text.text[word_start..position].is_ascii() && break_chars.is_empty()) {
@@ -1990,7 +2052,7 @@ fn emit_layout(
 }
 
 fn display_width(text: &str, start: usize, tab_width: usize) -> usize {
-    if text.is_ascii() && text.bytes().all(|byte| (32..127).contains(&byte)) {
+    if text.bytes().all(|byte| (32..127).contains(&byte)) {
         return text.len();
     }
     let mut column = start;
@@ -2065,6 +2127,13 @@ fn comment_prefix(body: &str) -> Option<usize> {
     let marks = body.bytes().take_while(|&byte| byte == b'%').count();
     let spaces = body[marks..].len() - body[marks..].trim_start_matches([' ', '\t']).len();
     Some(marks + spaces)
+}
+
+fn item_continuation(prefix: &str, marker: &str, tab_width: usize) -> String {
+    format!(
+        "{prefix}{}",
+        " ".repeat(display_width(marker, 0, tab_width))
+    )
 }
 
 fn item_body(body: &str, items: &[String]) -> Option<usize> {

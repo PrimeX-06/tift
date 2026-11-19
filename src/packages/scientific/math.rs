@@ -74,7 +74,7 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 
 pub(crate) fn is_math_environment(name: &str) -> bool {
     ALIGNMENT_ENVIRONMENTS.contains(&name)
-        || super::scientific::ALIGNMENT_ENVIRONMENTS.contains(&name)
+        || super::scientific::is_math_environment(name)
         || matches!(name, "dmath" | "dmath*")
 }
 

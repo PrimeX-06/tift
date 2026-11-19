@@ -1,6 +1,6 @@
 //! Literal xparse argument specifications and invocation boundaries.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use super::{balanced_end, command_at};
 use crate::trivia;
@@ -9,11 +9,11 @@ use crate::trivia;
 enum Kind {
     Mandatory,
     Optional {
-        open: String,
-        close: String,
+        open: Cow<'static, str>,
+        close: Cow<'static, str>,
         required: bool,
     },
-    Token(String),
+    Token(Cow<'static, str>),
     Embellishments(Vec<String>),
     Until(String),
     Verbatim,
@@ -28,8 +28,36 @@ struct Slot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Signature {
-    slots: Vec<Slot>,
+    slots: Cow<'static, [Slot]>,
 }
+
+const MANDATORY: Slot = Slot {
+    kind: Kind::Mandatory,
+    skip_space: true,
+};
+const OPTIONAL: Slot = Slot {
+    kind: Kind::Optional {
+        open: Cow::Borrowed("["),
+        close: Cow::Borrowed("]"),
+        required: false,
+    },
+    skip_space: true,
+};
+const STAR: Slot = Slot {
+    kind: Kind::Token(Cow::Borrowed("*")),
+    skip_space: true,
+};
+static MANDATORY_SLOTS: [Slot; 9] = [MANDATORY; 9];
+static OPTIONAL_SLOTS: [Slot; 9] = [
+    OPTIONAL, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY,
+    MANDATORY,
+];
+static STAR_SLOTS: [Slot; 9] = [
+    STAR, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY,
+];
+static STAR_OPTIONAL_SLOTS: [Slot; 9] = [
+    STAR, OPTIONAL, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY, MANDATORY,
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ArgumentSlot {
@@ -66,7 +94,7 @@ impl Signature {
         if source.as_bytes().get(end.wrapping_sub(1)) != Some(&b'*') {
             return end;
         }
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             match &slot.kind {
                 Kind::Token(token) if token == "*" => return end - 1,
                 Kind::Optional {
@@ -80,6 +108,24 @@ impl Signature {
     }
 
     pub(crate) fn parse(source: &str) -> Option<Self> {
+        // Built-in and compact declaration grammars share immutable slots.
+        // Extended grammars keep the full parser and its validation below.
+        if source.len() <= 9 {
+            let (slots, tail) = if let Some(tail) = source.strip_prefix("so") {
+                (&STAR_OPTIONAL_SLOTS, tail)
+            } else if let Some(tail) = source.strip_prefix('s') {
+                (&STAR_SLOTS, tail)
+            } else if let Some(tail) = source.strip_prefix('o') {
+                (&OPTIONAL_SLOTS, tail)
+            } else {
+                (&MANDATORY_SLOTS, source)
+            };
+            if tail.bytes().all(|byte| byte == b'm') {
+                return Some(Self {
+                    slots: Cow::Borrowed(&slots[..source.len()]),
+                });
+            }
+        }
         let mut cursor = 0;
         let mut slots = Vec::new();
         let mut arguments = 0;
@@ -115,8 +161,8 @@ impl Signature {
                         group(source, &mut cursor)?;
                     }
                     Kind::Optional {
-                        open: "[".into(),
-                        close: "]".into(),
+                        open: Cow::Borrowed("["),
+                        close: Cow::Borrowed("]"),
                         required: false,
                     }
                 }
@@ -125,8 +171,8 @@ impl Signature {
                         group(source, &mut cursor)?;
                     }
                     Kind::Optional {
-                        open: "{".into(),
-                        close: "}".into(),
+                        open: Cow::Borrowed("{"),
+                        close: Cow::Borrowed("}"),
                         required: false,
                     }
                 }
@@ -137,13 +183,13 @@ impl Signature {
                         group(source, &mut cursor)?;
                     }
                     Kind::Optional {
-                        open,
-                        close,
+                        open: open.into(),
+                        close: close.into(),
                         required: matches!(kind, b'r' | b'R'),
                     }
                 }
-                b's' => Kind::Token("*".into()),
-                b't' => Kind::Token(token(source, &mut cursor)?),
+                b's' => Kind::Token(Cow::Borrowed("*")),
+                b't' => Kind::Token(token(source, &mut cursor)?.into()),
                 b'e' | b'E' => {
                     let range = group(source, &mut cursor)?;
                     let mut position = range.start;
@@ -192,7 +238,9 @@ impl Signature {
             }
             slots.push(Slot { kind, skip_space });
         }
-        Some(Self { slots })
+        Some(Self {
+            slots: Cow::Owned(slots),
+        })
     }
 
     /// Retain compact signatures for existing m/o/O declaration consumers.
@@ -253,7 +301,7 @@ impl Signature {
     ) -> Option<usize> {
         let mut cursor = body.start;
         let mut argument_slot = 0;
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             let start = if slot.skip_space {
                 trivia::skip_until(source, cursor, body.end)
             } else {
@@ -278,7 +326,7 @@ impl Signature {
                     close,
                     required,
                 } => {
-                    if source.get(start..body.end)?.starts_with(open) {
+                    if source.get(start..body.end)?.starts_with(open.as_ref()) {
                         let end = delimited_end(source, start, body.end, open, close)?;
                         visit(
                             ArgumentSlot {

@@ -31,6 +31,7 @@ pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
     "pylabconverbatim",
     "pylabconsole",
     "pythontexcustomcode",
+    "pygments",
     // scontents.sty:172--177; scontents-code.tex:634--688 stores raw lines
     // and tracks nested occurrences of the same literal environment name.
     "scontents",
@@ -70,7 +71,7 @@ pub(crate) fn ignores_end_line_tail(name: &str) -> bool {
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
-        "pythontexcustomcode" => "om",
+        "pythontexcustomcode" | "pygments" => "om",
         "filecontentsdef"
         | "filecontentsdef*"
         | "filecontentsdefstarred"
@@ -143,6 +144,10 @@ pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
             ("setpythontexpygopt", 1, true),
             ("setpythontexprettyprinter", 1, true),
             ("makepythontexfamily", 1, true),
+            ("inputpygments", 2, true),
+            ("setpygmentsfv", 1, true),
+            ("setpygmentspygopt", 1, true),
+            ("setpygmentsprettyprinter", 1, false),
             // scontents-code.tex:937,1060,1241,1289,1421--1440.
             ("getstored", 1, true),
             ("foreachsc", 1, true),

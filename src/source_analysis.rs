@@ -232,7 +232,7 @@ impl<'a> SourceAnalysis<'a> {
         name: &str,
         at: usize,
     ) -> Option<Cow<'_, EnvironmentArguments>> {
-        if let Some(arguments) = self.model().environment_arguments_at(at) {
+        if let Some(arguments) = self.model().environment_arguments_after(at) {
             return Some(Cow::Borrowed(arguments));
         }
         // A later declaration cannot supply an earlier call's header, and a

@@ -21,6 +21,7 @@ pub mod syntax;
 mod tikz;
 mod tikz_scan;
 pub mod trace;
+pub mod tree_layout;
 mod trivia;
 pub mod wrap;
 

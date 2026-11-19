@@ -135,11 +135,7 @@ fn invocation_shape(source: &str, name: &str, cursor: usize, shape: &'static str
     {
         return without_trailing;
     }
-    if name.ends_with('*') {
-        shape.strip_prefix("s ").unwrap_or(shape)
-    } else {
-        shape
-    }
+    shape
 }
 
 pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Option<&'static str> {
@@ -157,11 +153,17 @@ pub(crate) fn is_metadata_command(name: &str) -> bool {
 
 pub(crate) fn command_header_end(source: &str, name: &str, cursor: usize) -> Option<usize> {
     let (shape, data) = specification(name)?;
+    let shape = invocation_shape(source, name, cursor, shape);
+    let data = invocation_shape(source, name, cursor, data);
     signature_end(
         source,
-        cursor,
-        invocation_shape(source, name, cursor, shape),
+        crate::syntax::arguments::invocation_cursor(source, cursor, shape),
+        shape,
     )?;
-    signature_end(source, cursor, invocation_shape(source, name, cursor, data))
-        .filter(|&end| end > cursor)
+    signature_end(
+        source,
+        crate::syntax::arguments::invocation_cursor(source, cursor, data),
+        data,
+    )
+    .filter(|&end| end > cursor)
 }

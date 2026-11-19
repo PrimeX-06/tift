@@ -1,7 +1,8 @@
 //! Lossless mathematical whitespace edits and native display-line planning.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,13 +16,61 @@ use symbols::{DelimiterRole, MathClass};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct MathConfig {
+    /// Master switch for mathematical whitespace and display layout.
     pub enabled: bool,
+    /// Normalize horizontal whitespace inside recognized mathematics.
+    pub spacing: bool,
+    /// Layout policy for single-formula displays; inline and grid math stay atomic.
+    pub wrap: MathWrap,
+    /// Display column budget. None inherits `wrap.columns`.
+    pub columns: Option<usize>,
+    /// Preferred operator classes, highest first. Empty keeps greedy wrapping.
+    pub break_priority: Vec<MathBreakKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MathBreakKind {
+    Relation,
+    Additive,
+    Multiplicative,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MathWrap {
+    Preserve,
+    SingleLine,
+    #[default]
+    Break,
 }
 
 impl Default for MathConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            spacing: true,
+            wrap: MathWrap::Break,
+            columns: None,
+            break_priority: Vec::new(),
+        }
     }
+}
+
+pub fn validate(config: &MathConfig) -> Result<(), String> {
+    for (index, kind) in config.break_priority.iter().enumerate() {
+        if config.break_priority[..index].contains(kind) {
+            return Err("math.break-priority must not contain duplicate operator classes".into());
+        }
+    }
+    if config
+        .columns
+        .is_some_and(|columns| !(1..=1_000_000).contains(&columns))
+    {
+        return Err("math.columns must be between 1 and 1000000".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
@@ -64,6 +113,60 @@ pub(crate) fn format_math_with_context(
     config: &CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
+    let formatted_bodies = if config.config.math.enabled
+        && config.config.code.expl3
+        && config.config.protect.format_macro_bodies
+        && matches!(kind, FileKind::Tex | FileKind::Style | FileKind::Class)
+        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
+    {
+        let protected = parsing.expl3_protected_ranges(source)?;
+        let parsed = parsing.snapshot(source, false, false)?;
+        let model = parsed
+            .metadata
+            .exposed_model(source, &config.config, &protected);
+        let mut output = String::new();
+        let mut cursor = 0;
+        for declaration in model.declarations() {
+            if declaration.body.start < cursor
+                || !syntax::command_at(source, declaration.span.start)
+                    .is_some_and(|(name, _)| name.starts_with("cs_"))
+            {
+                continue;
+            }
+            let body = &source[declaration.body.clone()];
+            let mut inner = crate::parse_context::ParseContext::new(config);
+            let Ok(formatted) = format_math_with_context(body, kind, config, &mut inner) else {
+                continue;
+            };
+            if formatted != body {
+                output.push_str(&source[cursor..declaration.body.start]);
+                output.push_str(&formatted);
+                cursor = declaration.body.end;
+            }
+        }
+        if cursor > 0 {
+            output.push_str(&source[cursor..]);
+            Some(output)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    format_math_snapshot(
+        formatted_bodies.as_deref().unwrap_or(source),
+        kind,
+        config,
+        parsing,
+    )
+}
+
+fn format_math_snapshot(
+    source: &str,
+    kind: FileKind,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, FormatError> {
     if !config.config.math.enabled || kind == FileKind::Bibtex {
         return Ok(source.into());
     }
@@ -75,25 +178,83 @@ pub(crate) fn format_math_with_context(
         protected.extend(crate::docstrip::preamble_ranges(source, &protected));
         protected = code_layout::merged(protected);
     }
-    let modes = MathModes::build(source, config, &protected, parsing)?;
+    let mut modes = MathModes::build(source, config, &protected, parsing)?;
     let mut editor = Editor {
         source,
         config,
         modes: &modes,
         protected: &protected,
-        edits: BTreeMap::new(),
-        visited: BTreeSet::new(),
+        edits: Vec::new(),
+        visited: HashSet::new(),
     };
-    for region in &modes.regions {
-        if valid_sized_delimiters(source, &region.body, &modes) {
-            editor.sequence(region.body.clone(), false, region.text_cases);
+    if config.config.math.spacing {
+        for region in &modes.regions {
+            if valid_sized_delimiters(source, &region.body, &modes) {
+                editor.sequence(region.body.clone(), false, region.text_cases);
+            }
         }
     }
-    let normalized = editor.finish(source);
+    if config.config.math.wrap == MathWrap::Preserve
+        || !modes.regions.iter().any(|region| region.display.is_some())
+    {
+        return Ok(editor.finish(source));
+    }
+    if editor.edits.is_empty() {
+        return layout_displays(source, config, &modes, &protected);
+    }
+    let (normalized, positions) = editor.finish_mapped(source);
     if normalized == source {
         return layout_displays(source, config, &modes, &protected);
     }
+    // Whitespace edits preserve math tokens and their argument domains. Inline
+    // documents need no display pass; displays reuse the already parsed modes
+    // after projecting their byte positions through the effective edits.
+    if modes.remap(&positions).is_some()
+        && protected
+            .iter_mut()
+            .try_for_each(|range| positions.remap_range(range))
+            .is_some()
+    {
+        return layout_displays(&normalized, config, &modes, &protected);
+    }
     break_displays(&normalized, kind, config, parsing)
+}
+
+/// Effective, nonoverlapping whitespace edits in source order. A boundary
+/// inside replaced whitespace is ambiguous and requests the full-parser path.
+struct PositionMap {
+    edits: Vec<(Range<usize>, usize)>,
+}
+
+impl PositionMap {
+    fn position(&self, at: usize, after_insertion: bool) -> Option<usize> {
+        let index = self.edits.partition_point(|(range, _)| {
+            range.end < at || range.end == at && (!range.is_empty() || after_insertion)
+        });
+        if self
+            .edits
+            .get(index)
+            .is_some_and(|(range, _)| range.start < at && at < range.end)
+        {
+            return None;
+        }
+        match index.checked_sub(1).map(|index| &self.edits[index]) {
+            Some((range, new_end)) => new_end.checked_add(at - range.end),
+            None => Some(at),
+        }
+    }
+
+    fn remap_range(&self, range: &mut Range<usize>) -> Option<()> {
+        // Inserted gaps at a token boundary belong outside that token. This
+        // also keeps an unbraced argument from absorbing the following space.
+        let start = self.position(range.start, range.start != range.end)?;
+        let end = self.position(range.end, false)?;
+        if start > end {
+            return None;
+        }
+        *range = start..end;
+        Some(())
+    }
 }
 
 fn format_documented_math(
@@ -114,6 +275,9 @@ fn format_documented_math(
     let documentation_config =
         crate::docstrip::documentation_config(analysis.model().document_class(), config)?;
     let documentation_config = documentation_config.as_ref().unwrap_or(config);
+    if !documentation_config.config.math.spacing {
+        return Ok(code);
+    }
     let (documentation, margins) = documentation_source(&code);
     let model = crate::source_model::SourceModel::analyze(&documentation, documentation_config);
     let mut protected = model.protected_ranges().to_vec();
@@ -132,8 +296,8 @@ fn format_documented_math(
         config: documentation_config,
         modes: &modes,
         protected: &protected,
-        edits: BTreeMap::new(),
-        visited: BTreeSet::new(),
+        edits: Vec::new(),
+        visited: HashSet::new(),
     };
     for region in &modes.regions {
         if valid_sized_delimiters(&documentation, &region.body, &modes) {
@@ -257,6 +421,13 @@ fn documentation_source(source: &str) -> (String, Vec<Range<usize>>) {
 }
 
 fn valid_sized_delimiters(source: &str, range: &Range<usize>, modes: &MathModes) -> bool {
+    let bytes = source[range.clone()].as_bytes();
+    if ![b"\\left".as_slice(), b"\\right", b"\\middle"]
+        .iter()
+        .any(|name| memchr::memmem::find(bytes, name).is_some())
+    {
+        return true;
+    }
     let mut depth = 0usize;
     let mut scopes = Vec::new();
     let mut literal = BTreeMap::new();
@@ -320,8 +491,8 @@ struct Editor<'a> {
     config: &'a CompiledConfig,
     modes: &'a MathModes,
     protected: &'a [Range<usize>],
-    edits: BTreeMap<usize, (usize, String)>,
-    visited: BTreeSet<(usize, usize)>,
+    edits: Vec<(Range<usize>, Cow<'static, str>)>,
+    visited: HashSet<(usize, usize)>,
 }
 
 impl Editor<'_> {
@@ -339,11 +510,20 @@ impl Editor<'_> {
     }
 
     fn edit(&mut self, range: Range<usize>, value: &str) {
-        if !self.blocked(&range)
-            && whitespace(&self.source[range.clone()])
-            && &self.source[range.clone()] != value
+        let authored = &self.source[range.clone()];
+        if authored != value
+            && self.config.config.math.spacing
+            && !(self.config.config.math.wrap == MathWrap::Preserve
+                && authored.contains(['\r', '\n']))
+            && !self.blocked(&range)
+            && whitespace(authored)
         {
-            self.edits.insert(range.start, (range.end, value.into()));
+            let value = match value {
+                "" => Cow::Borrowed(""),
+                " " => Cow::Borrowed(" "),
+                value => Cow::Owned(value.into()),
+            };
+            self.edits.push((range, value));
         }
     }
 
@@ -452,17 +632,7 @@ impl Editor<'_> {
                     crate::layout::row_terminator_end(self.source, command_end, end, name == "\\");
             }
             if name == "begin"
-                && let Some(region) = self
-                    .modes
-                    .regions
-                    .iter()
-                    .find(|region| {
-                        region
-                            .environment
-                            .as_ref()
-                            .is_some_and(|range| range.start == cursor && range.end <= end)
-                    })
-                    .cloned()
+                && let Some(region) = self.modes.environment_at(cursor, end).cloned()
             {
                 self.sequence(region.body.clone(), script, region.text_cases);
                 range.end = region.environment.unwrap().end;
@@ -636,19 +806,30 @@ impl Editor<'_> {
             }
             atoms.push(current);
         }
-        let mut index = 0;
-        while index + 1 < atoms.len() {
-            if &self.source[atoms[index].range.clone()] == "\\not"
-                && atoms[index + 1].class == MathClass::Rel
-                && whitespace(&self.source[atoms[index].range.end..atoms[index + 1].range.start])
+        let mut read = 0;
+        let mut write = 0;
+        while read < atoms.len() {
+            if read + 1 < atoms.len()
+                && &self.source[atoms[read].range.clone()] == "\\not"
+                && atoms[read + 1].class == MathClass::Rel
+                && whitespace(&self.source[atoms[read].range.end..atoms[read + 1].range.start])
             {
-                let next = atoms.remove(index + 1);
-                atoms[index].range.end = next.range.end;
-                atoms[index].class = MathClass::Rel;
-                atoms[index].delimiter = None;
+                atoms[read].range.end = atoms[read + 1].range.end;
+                atoms[read].class = MathClass::Rel;
+                atoms[read].delimiter = None;
+                if write != read {
+                    atoms.swap(write, read);
+                }
+                read += 2;
+            } else {
+                if write != read {
+                    atoms.swap(write, read);
+                }
+                read += 1;
             }
-            index += 1;
+            write += 1;
         }
+        atoms.truncate(write);
         let mut previous = MathClass::Rel;
         let mut opener = false;
         for atom in &mut atoms {
@@ -669,18 +850,23 @@ impl Editor<'_> {
         atoms
     }
 
-    fn sequence(&mut self, range: Range<usize>, script: bool, text_cases: bool) {
-        if !self.visited.insert((range.start, range.end)) {
-            return;
+    fn retained_gaps(&self, atoms: &[Atom]) -> Vec<bool> {
+        // Ordinary expressions need no delimiter/slash propagation buffers.
+        if atoms.len() < 3
+            || !atoms.iter().any(|atom| {
+                atom.delimiter == Some(DelimiterRole::Open)
+                    || &self.source[atom.range.clone()] == "/"
+            })
+        {
+            return Vec::new();
         }
-        let atoms = self.atoms(range.clone(), script, text_cases);
-        if let Some(first) = atoms.first() {
-            self.collapse(range.start..first.range.start)
-        }
-        if let Some(last) = atoms.last() {
-            self.collapse(last.range.end..range.end)
-        }
-        let mut paired_gaps = vec![Vec::new(); atoms.len().saturating_sub(1)];
+        // A gap has at most one delimiter partner and two slash neighbours.
+        // Store (delimiter index + 1) above two slash bits. Zero is the common
+        // unconstrained gap, which needs no propagation or text comparisons.
+        const SLASH_PREVIOUS: usize = 1;
+        const SLASH_NEXT: usize = 2;
+        const DELIMITER_SHIFT: usize = 2;
+        let mut gap_links = vec![0usize; atoms.len().saturating_sub(1)];
         let mut keep_gap: Vec<_> = atoms
             .windows(2)
             .map(|pair| {
@@ -696,16 +882,16 @@ impl Editor<'_> {
                 && let Some(open) = delimiters.pop()
                 && open + 1 < index
             {
-                paired_gaps[open].push(index - 1);
-                paired_gaps[index - 1].push(open);
+                gap_links[open] |= index << DELIMITER_SHIFT;
+                gap_links[index - 1] |= (open + 1) << DELIMITER_SHIFT;
             }
             if &self.source[atom.range.clone()] == "/" {
                 if index > 0 && index + 1 < atoms.len() {
-                    paired_gaps[index - 1].push(index);
-                    paired_gaps[index].push(index - 1);
+                    gap_links[index - 1] |= SLASH_NEXT;
+                    gap_links[index] |= SLASH_PREVIOUS;
                 } else if index > 0 {
                     keep_gap[index - 1] = false
-                } else if index + 1 < atoms.len() {
+                } else if index == 0 && index + 1 < atoms.len() {
                     keep_gap[index] = false
                 }
             }
@@ -715,16 +901,50 @@ impl Editor<'_> {
         let mut removed: Vec<_> = keep_gap
             .iter()
             .enumerate()
-            .filter_map(|(index, keep)| (!keep).then_some(index))
+            .filter_map(|(index, keep)| (!keep && gap_links[index] != 0).then_some(index))
             .collect();
         while let Some(index) = removed.pop() {
-            for &partner in &paired_gaps[index] {
-                if keep_gap[partner] {
+            let links = gap_links[index];
+            if links == 0 {
+                continue;
+            }
+            for partner in [
+                (links >> DELIMITER_SHIFT).wrapping_sub(1),
+                if links & SLASH_PREVIOUS != 0 {
+                    index - 1
+                } else {
+                    usize::MAX
+                },
+                if links & SLASH_NEXT != 0 {
+                    index + 1
+                } else {
+                    usize::MAX
+                },
+            ] {
+                if keep_gap.get(partner).copied() == Some(true) {
                     keep_gap[partner] = false;
                     removed.push(partner)
                 }
             }
         }
+        for (keep, links) in keep_gap.iter_mut().zip(gap_links) {
+            *keep &= links != 0;
+        }
+        keep_gap
+    }
+
+    fn sequence(&mut self, range: Range<usize>, script: bool, text_cases: bool) {
+        if !self.visited.insert((range.start, range.end)) {
+            return;
+        }
+        let atoms = self.atoms(range.clone(), script, text_cases);
+        if let Some(first) = atoms.first() {
+            self.collapse(range.start..first.range.start)
+        }
+        if let Some(last) = atoms.last() {
+            self.collapse(last.range.end..range.end)
+        }
+        let retained = self.retained_gaps(&atoms);
         for (index, pair) in atoms.windows(2).enumerate() {
             let left = &pair[0];
             let right = &pair[1];
@@ -735,7 +955,7 @@ impl Editor<'_> {
             }
             let left_text = &self.source[left.range.clone()];
             let right_text = &self.source[right.range.clone()];
-            if keep_gap[index] && !paired_gaps[index].is_empty() {
+            if retained.get(index).copied().unwrap_or(false) {
                 self.collapse(gap);
                 continue;
             }
@@ -781,18 +1001,40 @@ impl Editor<'_> {
     }
 
     fn finish(self, original: &str) -> String {
+        self.finish_with_mapping::<false>(original).0
+    }
+
+    fn finish_mapped(self, original: &str) -> (String, PositionMap) {
+        self.finish_with_mapping::<true>(original)
+    }
+
+    fn finish_with_mapping<const MAPPED: bool>(mut self, original: &str) -> (String, PositionMap) {
+        // Stable sorting retains insertion order for equal starts. The last
+        // edit at a start wins, as in the original ordered map.
+        self.edits.sort_by_key(|(range, _)| range.start);
         let mut output = String::with_capacity(original.len());
+        let mut positions = PositionMap {
+            edits: Vec::with_capacity(if MAPPED { self.edits.len() } else { 0 }),
+        };
         let mut cursor = 0;
-        for (start, (end, value)) in self.edits {
+        let mut edits = self.edits.into_iter().peekable();
+        while let Some((range, value)) = edits.next() {
+            let (start, end) = (range.start, range.end);
+            if edits.peek().is_some_and(|(next, _)| next.start == start) {
+                continue;
+            }
             if start < cursor {
                 continue;
             }
             output.push_str(&original[cursor..start]);
             output.push_str(&value);
+            if MAPPED {
+                positions.edits.push((start..end, output.len()));
+            }
             cursor = end;
         }
         output.push_str(&original[cursor..]);
-        output
+        (output, positions)
     }
 }
 
@@ -811,8 +1053,11 @@ fn control_word_seam(left: &str, right: &str) -> bool {
 struct BreakLayout<'a> {
     prefix: &'a str,
     unit: &'a str,
+    ending: &'a str,
     unit_width: usize,
     line_width: usize,
+    spacing: bool,
+    priority: &'a [MathBreakKind],
 }
 
 fn break_displays(
@@ -836,25 +1081,29 @@ fn layout_displays(
     modes: &MathModes,
     protected: &[Range<usize>],
 ) -> Result<String, FormatError> {
+    if config.config.math.wrap == MathWrap::Preserve {
+        return Ok(source.into());
+    }
     let mut editor = Editor {
         source,
         config,
         modes,
         protected,
-        edits: BTreeMap::new(),
-        visited: BTreeSet::new(),
+        edits: Vec::new(),
+        visited: HashSet::new(),
     };
     let mut replacements = Vec::new();
+    let ending = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     for region in &modes.regions {
         let Some((start, name)) = &region.display else {
             continue;
         };
         let body = &source[region.body.clone()];
-        if overlaps(protected, &region.body)
-            || !valid_sized_delimiters(source, &region.body, modes)
-            || body.contains('%')
-            || body.contains("\\\\")
-        {
+        if body.contains('%') || body.contains("\\\\") || overlaps(protected, &region.body) {
             continue;
         }
         let line_start = source[..*start].rfind('\n').map_or(0, |offset| offset + 1);
@@ -866,12 +1115,12 @@ fn layout_displays(
             continue;
         }
         let prefix_width = indent_width(prefix, config.config.indent.width);
-        let line_width = config
+        let columns = config
             .config
-            .wrap
+            .math
             .columns
-            .saturating_sub(prefix_width)
-            .max(1);
+            .unwrap_or(config.config.wrap.columns);
+        let line_width = columns.saturating_sub(prefix_width).max(1);
         let category = if matches!(name.as_str(), "$$" | "displayMath") {
             "special"
         } else {
@@ -882,9 +1131,43 @@ fn layout_displays(
         let layout = BreakLayout {
             prefix,
             unit: &unit,
+            ending,
             unit_width,
             line_width,
+            spacing: config.config.math.spacing,
+            priority: &config.config.math.break_priority,
         };
+        if config.config.math.wrap == MathWrap::SingleLine {
+            if !valid_sized_delimiters(source, &region.body, modes) {
+                continue;
+            }
+            let atoms = editor.atoms(region.body.clone(), false, false);
+            if let Some((first, last)) = atoms.first().zip(atoms.last())
+                && let Some(flat) = flat_piece(source, &atoms, &(first.range.start..last.range.end))
+            {
+                let leading = &source[region.body.start..first.range.start];
+                let trailing = &source[last.range.end..region.body.end];
+                let mut replacement = String::new();
+                if leading.contains('\n') {
+                    replacement.push_str(ending);
+                    replacement.push_str(prefix);
+                    replacement.push_str(&unit);
+                } else {
+                    replacement.push_str(leading);
+                }
+                replacement.push_str(&flat);
+                if trailing.contains('\n') {
+                    replacement.push_str(ending);
+                    replacement.push_str(prefix);
+                } else {
+                    replacement.push_str(trailing);
+                }
+                if replacement != body {
+                    replacements.push((region.body.clone(), replacement));
+                }
+            }
+            continue;
+        }
         let first_prefix = &source[line_start..region.body.start];
         let overflows = body.lines().enumerate().any(|(index, line)| {
             UnicodeWidthStr::width(line)
@@ -893,13 +1176,16 @@ fn layout_displays(
                 } else {
                     0
                 }
-                > config.config.wrap.columns
+                > columns
         });
         if !overflows && flat_display_width(body) + unit_width <= line_width {
             continue;
         }
+        if !valid_sized_delimiters(source, &region.body, modes) {
+            continue;
+        }
         let atoms = editor.atoms(region.body.clone(), false, false);
-        let candidates = break_candidates(source, &atoms);
+        let candidates = break_candidates(source, &atoms, layout.priority);
         if let Some(replacement) = greedy_breaks(source, &atoms, &candidates, &layout)
             && replacement != body
         {
@@ -933,7 +1219,7 @@ fn flat_display_width(body: &str) -> usize {
         .sum()
 }
 
-fn break_candidates(source: &str, atoms: &[Atom]) -> BTreeSet<usize> {
+fn break_candidates(source: &str, atoms: &[Atom], priority: &[MathBreakKind]) -> BTreeSet<usize> {
     let mut candidates = BTreeSet::new();
     let mut depth = 0usize;
     let mut conditional = false;
@@ -943,7 +1229,8 @@ fn break_candidates(source: &str, atoms: &[Atom]) -> BTreeSet<usize> {
             && depth == 0
             && (atom.class == MathClass::Bin && !atom.unary
                 || atom.class == MathClass::Rel && !conditional)
-            && !matches!(text, "\\cdot" | "\\mid")
+            && text != "\\mid"
+            && (text != "\\cdot" || priority.contains(&MathBreakKind::Multiplicative))
         {
             candidates.insert(atom.range.start);
         }
@@ -996,35 +1283,108 @@ fn greedy_breaks(
                 .map(|text| layout.unit_width + UnicodeWidthStr::width(text.as_str()))
         })
         .unwrap_or(layout.unit_width);
-    let ending = if source.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
+    let ending = layout.ending;
     let mut output = format!("{ending}{}{}", layout.prefix, layout.unit);
+    let gap_before = |index: usize| {
+        let authored = &source[pieces[index - 1].end..pieces[index].start];
+        if layout.spacing || authored.contains(['\r', '\n']) {
+            " "
+        } else {
+            authored
+        }
+    };
+    let atom_at = |index: usize| {
+        let index = atoms.partition_point(|atom| atom.range.start < pieces[index].start);
+        &atoms[index]
+    };
+    let indent_at = |index: usize, piece_width: usize| {
+        let preferred = if atom_at(index).class == MathClass::Rel {
+            relation_indent
+        } else {
+            rhs_indent
+        };
+        if preferred + piece_width <= layout.line_width {
+            preferred
+        } else {
+            layout.unit_width
+        }
+    };
+    if !layout.priority.is_empty() {
+        let mut ranked = vec![Vec::new(); layout.priority.len()];
+        let mut rendered = Vec::with_capacity(pieces.len());
+        let mut ends = Vec::with_capacity(pieces.len());
+        let mut column = 0;
+        for (index, range) in pieces.iter().enumerate() {
+            let gap = if index == 0 { "" } else { gap_before(index) };
+            column += UnicodeWidthStr::width(gap);
+            let text = flat_piece(source, atoms, range)?;
+            let width = UnicodeWidthStr::width(text.as_str());
+            rendered.push((text, width, column, gap));
+            column += width;
+            ends.push(column);
+            if index > 0 {
+                let kind = break_kind(source, atom_at(index));
+                if let Some(rank) = layout.priority.iter().position(|&entry| entry == kind) {
+                    ranked[rank].push(index);
+                }
+            }
+        }
+        let mut start = 0;
+        while start < rendered.len() {
+            let (_, width, column, _) = &rendered[start];
+            let indent = if start == 0 {
+                layout.unit_width
+            } else {
+                indent_at(start, *width)
+            };
+            let limit = column + layout.line_width.saturating_sub(indent);
+            let farthest = ends.partition_point(|&end| end <= limit).max(start + 1);
+            // Find the latest acceptable position in each class by searching its
+            // own index. A short preferred line does not repeatedly scan its tail.
+            let stop = if farthest == rendered.len() {
+                farthest
+            } else {
+                ranked
+                    .iter()
+                    .find_map(|positions| {
+                        let count = positions.partition_point(|&position| position <= farthest);
+                        count
+                            .checked_sub(1)
+                            .map(|last| positions[last])
+                            .filter(|&position| position > start)
+                    })
+                    .unwrap_or(farthest)
+            };
+            if start > 0 {
+                output.push_str(ending);
+                output.push_str(layout.prefix);
+                output.push_str(layout.unit);
+                output.push_str(&" ".repeat(indent.saturating_sub(layout.unit_width)));
+            }
+            for (index, (text, _, _, gap)) in rendered[start..stop].iter().enumerate() {
+                if index > 0 {
+                    output.push_str(gap);
+                }
+                output.push_str(text);
+            }
+            start = stop;
+        }
+        output.push_str(ending);
+        output.push_str(layout.prefix);
+        return Some(output);
+    }
     let mut width = layout.unit_width;
     for (index, range) in pieces.iter().enumerate() {
         let text = flat_piece(source, atoms, range)?;
         let piece_width = UnicodeWidthStr::width(text.as_str());
         if index > 0 {
-            if width + 1 + piece_width <= layout.line_width {
-                output.push(' ');
-                width += 1
+            let gap = gap_before(index);
+            let gap_width = UnicodeWidthStr::width(gap);
+            if width + gap_width + piece_width <= layout.line_width {
+                output.push_str(gap);
+                width += gap_width
             } else {
-                let relation = atoms
-                    .binary_search_by_key(&range.start, |atom| atom.range.start)
-                    .ok()
-                    .is_some_and(|index| atoms[index].class == MathClass::Rel);
-                let wanted = if relation {
-                    relation_indent
-                } else {
-                    rhs_indent
-                };
-                let indent = if wanted + piece_width <= layout.line_width {
-                    wanted
-                } else {
-                    layout.unit_width
-                };
+                let indent = indent_at(index, piece_width);
                 output.push_str(ending);
                 output.push_str(layout.prefix);
                 output.push_str(layout.unit);
@@ -1038,6 +1398,20 @@ fn greedy_breaks(
     output.push_str(ending);
     output.push_str(layout.prefix);
     Some(output)
+}
+
+fn break_kind(source: &str, atom: &Atom) -> MathBreakKind {
+    if atom.class == MathClass::Rel {
+        MathBreakKind::Relation
+    } else {
+        match &source[atom.range.clone()] {
+            "+" | "-" | "−" | "±" | "∓" | "\\pm" | "\\mp" => MathBreakKind::Additive,
+            "*" | "×" | "÷" | "·" | "\\cdot" | "\\times" | "\\div" => {
+                MathBreakKind::Multiplicative
+            }
+            _ => MathBreakKind::Binary,
+        }
+    }
 }
 
 fn flat_piece(source: &str, atoms: &[Atom], range: &Range<usize>) -> Option<String> {

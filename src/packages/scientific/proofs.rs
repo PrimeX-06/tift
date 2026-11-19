@@ -1,8 +1,14 @@
-//! ebproof and bussproofs statements, including scoped proof-tree names.
+//! Inference rules and proof trees, including scoped statement names.
 
 use super::{CommandSpec, InvocationContext};
 
 specifications! {
+    // mathpartir's starred form uses keys in place of the rule name.
+    "inferrule" => ("s o m m", "UUMM", "s o"),
+    "mprset" => ("m", "U", "m"),
+    "TirName" | "LeftTirName" | "RightTirName" | "LabTirName" | "DefTirName"
+        | "RefTirName" => ("m", "T", ""),
+
     // ebproof exports prefixed statements globally and short names locally.
     "ebproofnewrulestyle" | "ebproofnewstyle" => ("mm", "UU", "mm"),
     "ebproofset" | "ebproofrewrite" => ("m", "U", "m"),
@@ -23,6 +29,10 @@ specifications! {
         | "solidLine" | "alwaysSolidLine" | "dottedLine" | "alwaysDottedLine"
         | "dashedLine" | "alwaysDashedLine" | "rootAtBottom" | "alwaysRootAtBottom"
         | "rootAtTop" | "alwaysRootAtTop" => ("", "", ""),
+}
+
+pub(super) fn mathpartir_environment(name: &str) -> bool {
+    matches!(name, "mathpar" | "mathparpagebreakable")
 }
 
 pub(super) fn is_context_metadata(name: &str) -> bool {

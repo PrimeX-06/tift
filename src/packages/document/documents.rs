@@ -1,4 +1,4 @@
-//! Literal environment and command grammar from exam-zh and ltx-talk.
+//! Literal environment and command grammar from exam, exam-zh and ltx-talk.
 //! Metadata applies to matching syntax independently of document-class loading.
 
 use crate::config::CommandRule;
@@ -11,6 +11,13 @@ pub(crate) const LIST_ENVIRONMENTS: &[&str] = &[
     "select",
     "calculations",
     "multifigures",
+    "questions",
+    "parts",
+    "subparts",
+    "subsubparts",
+    "oneparchoices",
+    "checkboxes",
+    "oneparcheckboxes",
 ];
 
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &["frame*"];
@@ -29,6 +36,11 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         | "poem" | "writingbox" => "o",
         // notice: O{}O{}; calculations and multifigures: O{}+O{}.
         "notice" | "calculations" | "multifigures" => "oo",
+        // exam.cls:2917,3263,3385,3401,4199--4395,7711--8066.
+        "questions" | "parts" | "subparts" | "subsubparts" | "oneparchoices" | "checkboxes"
+        | "oneparcheckboxes" | "coverpages" => "",
+        "solutionorbox" | "solutionorlines" | "solutionordottedlines" | "solutionorgrid" => "o",
+        "solutionbox" => "m",
         // ltx-talk.cls frame, column, block and overlay declarations.
         // The frame-title-arg setting adds a required title; explicit configured
         // signature "dom" disambiguates that form from a braced first body token.
@@ -48,14 +60,40 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn is_item(name: &str, environment: &str) -> bool {
-    matches!(
-        (name.trim_end_matches('*'), environment),
-        ("sitem", "select")
-            | (
-                "item",
-                "notice" | "choices" | "calculations" | "multifigures"
-            )
-    )
+    exam_item(name).is_some_and(|(scopes, _)| scopes.contains(&environment))
+        || matches!(
+            (name.trim_end_matches('*'), environment),
+            ("sitem", "select")
+                | (
+                    "item",
+                    "notice" | "choices" | "calculations" | "multifigures"
+                )
+        )
+}
+
+fn exam_item(name: &str) -> Option<(&'static [&'static str], &'static str)> {
+    Some(match name {
+        "question" | "bonusquestion" => (&["questions"], "o"),
+        "part" | "bonuspart" => (&["parts"], "o"),
+        "subpart" | "bonussubpart" => (&["subparts"], "o"),
+        "subsubpart" | "bonussubsubpart" => (&["subsubparts"], "o"),
+        "titledquestion" | "bonustitledquestion" => (&["questions"], "mo"),
+        "choice" | "CorrectChoice" | "correctchoice" => (
+            &["choices", "oneparchoices", "checkboxes", "oneparcheckboxes"],
+            "",
+        ),
+        _ => return None,
+    })
+}
+
+pub(crate) fn context_command_signature(
+    _: &str,
+    name: &str,
+    _: usize,
+    context: &crate::packages::InvocationContext<'_>,
+) -> Option<&'static str> {
+    let (scopes, shape) = exam_item(name)?;
+    scopes.contains(&context.environment()?).then_some(shape)
 }
 
 // One declaration generates both the fast signature match and command registry.

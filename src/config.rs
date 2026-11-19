@@ -58,6 +58,7 @@ pub struct Config {
     pub bibtex: crate::bibtex::BibtexConfig,
     pub code: crate::code_layout::CodeConfig,
     pub math: crate::math_layout::MathConfig,
+    pub trees: crate::tree_layout::TreeConfig,
     pub arguments: crate::argument_layout::ArgumentLayoutConfig,
     pub wrap: crate::wrap::WrapConfig,
     pub sentences: crate::wrap::SentenceConfig,
@@ -141,6 +142,8 @@ impl CompiledConfig {
         validate_environment_arguments(&config)?;
         crate::bibtex::validate(&config.bibtex).map_err(ConfigError)?;
         crate::argument_layout::validate(&config.arguments).map_err(ConfigError)?;
+        crate::math_layout::validate(&config.math).map_err(ConfigError)?;
+        crate::tree_layout::validate(&config.trees).map_err(ConfigError)?;
         Ok(Self {
             replacements: Arc::new(
                 crate::replacements::compile(&config.replacements).map_err(ConfigError)?,
@@ -304,6 +307,7 @@ impl Config {
             ("arguments", "Command argument layout"),
             ("alignment", "Table and equation alignment"),
             ("math", "Mathematical layout"),
+            ("trees", "Bracket tree layout"),
             ("code", "Package source and algorithm layout"),
             ("bibtex", "Bibliography layout and optional data cleanup"),
             ("syntax", "Source recognition and custom grammar"),
@@ -443,6 +447,30 @@ impl Default for IndentRule {
 }
 
 impl IndentConfig {
+    pub(crate) fn unit_with_spaces<'a>(
+        &'a self,
+        category: &str,
+        name: &str,
+        spaces: &'a str,
+    ) -> &'a str {
+        let rule = self
+            .rules
+            .get(name)
+            .or_else(|| self.categories.get(category));
+        if rule.is_some_and(|rule| !rule.additional) {
+            return "";
+        }
+        if let Some(value) = rule.and_then(|rule| rule.indent.as_deref()) {
+            return value;
+        }
+        match self.style {
+            IndentStyle::Spaces => {
+                &spaces[..rule.and_then(|rule| rule.width).unwrap_or(self.width)]
+            }
+            IndentStyle::Tabs => "\t",
+        }
+    }
+
     pub fn unit(&self, category: &str, name: &str) -> String {
         let rule = self
             .rules

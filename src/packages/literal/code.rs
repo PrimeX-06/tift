@@ -1,9 +1,9 @@
-//! Literal grammar for fancyvrb, fvextra, listings and minted code utilities.
+//! Literal grammar for source listings, display environments and inline code.
 
 use std::collections::BTreeMap;
 
 use crate::config::CommandRule;
-use crate::package_environments::VerbatimDeclaration;
+use crate::package_environments::{VerbatimDeclaration, VerbatimTerminator};
 
 // fancyvrb.sty:1143--1207 and fvextra.sty:1638--1703.
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
@@ -22,9 +22,43 @@ pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
     "SideBySideExample",
     "PCenterExample",
     "PSideBySideExample",
+    // alltt.sty and beamerbaseverbatim.sty:56,124 preserve visual source
+    // spacing while retaining normal TeX command execution.
+    "alltt",
+    "semiverbatim",
+    // verbatimbox.sty:71--146,233--250.
+    "origverbbox",
+    "verbbox",
+    "myverbbox",
+    "verbnobox",
+    // codehigh.sty:83--160, pygmentex.sty:226--270 and verbments.sty:81--130.
+    "codehigh",
+    "codehigh*",
+    "demohigh",
+    "demohigh*",
+    "pygmented",
+    "pyglist",
 ];
 
-pub(crate) const INLINE_CODE_COMMANDS: &[&str] = &["Verb", "SaveVerb"];
+pub(crate) fn obeys_tex_command_boundaries(name: &str) -> bool {
+    matches!(name, "alltt" | "semiverbatim")
+}
+
+pub(crate) fn is_line_delimited_environment(name: &str) -> bool {
+    matches!(name, "pygmented" | "pyglist")
+}
+
+pub(crate) const INLINE_CODE_COMMANDS: &[&str] = &[
+    "Verb",
+    "SaveVerb",
+    "pyginline",
+    "qverb",
+    "fverb",
+    "collectverb",
+    "Collectverb",
+    "verbdef",
+    "Verbdef",
+];
 
 /// Fixed catcode setters in expl3-code.tex:9200--9230. Their N operand is a
 /// character token; expanding arbitrary token-list operands is left to TeX.
@@ -122,6 +156,10 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         // Pst@@Example takes one required coordinate pair and optionally a
         // second pair. xparse's delimited grammar expresses that distinction.
         "PCenterExample" | "PSideBySideExample" => "o r() d()",
+        "myverbbox" => "om",
+        "verbbox" | "origverbbox" | "verbnobox" | "codehigh" | "codehigh*" | "demohigh"
+        | "demohigh*" | "pygmented" | "pyglist" => "o",
+        "alltt" | "semiverbatim" => "",
         _ => return None,
     })
 }
@@ -166,6 +204,48 @@ pub(crate) fn inline_code_end(source: &str, name: &str, position: usize) -> Opti
     if !INLINE_CODE_COMMANDS.contains(&base) {
         return None;
     }
+    if base == "pyginline" {
+        let mut cursor = position;
+        optional_argument(source, &mut cursor);
+        cursor = crate::trivia::skip(source, cursor);
+        // The first mandatory argument supplies the opener itself, either
+        // as a character token (|code|) or a braced token ({|}code|).
+        let delimiter = if source.as_bytes().get(cursor) == Some(&b'{') {
+            let value = argument(source, &mut cursor)?;
+            let mut chars = value.chars();
+            let delimiter = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            delimiter
+        } else {
+            let delimiter = source.get(cursor..)?.chars().next()?;
+            cursor += delimiter.len_utf8();
+            delimiter
+        };
+        return delimited_end(source, cursor, delimiter);
+    }
+    if matches!(base, "qverb" | "fverb") {
+        return generated_inline_end(source, GeneratedInlineKind::Delimited, position);
+    }
+    if matches!(base, "collectverb" | "Collectverb" | "verbdef" | "Verbdef") {
+        let mut cursor = crate::trivia::skip(source, position);
+        if source.as_bytes().get(cursor) == Some(&b'*') {
+            cursor = crate::trivia::skip(source, cursor + 1);
+        }
+        // Collectverb takes a TeX token/group callback; verbdef takes one
+        // control sequence. Then braces become a pair of literal delimiters.
+        if source.as_bytes().get(cursor) == Some(&b'{') {
+            argument(source, &mut cursor)?;
+        } else if let Some((name, end)) = crate::syntax::command_at(source, cursor) {
+            cursor = end - usize::from(name.len() > 1 && name.ends_with('*'));
+        } else {
+            return None;
+        }
+        let delimiter = source.get(cursor..)?.chars().next()?;
+        let close = if delimiter == '{' { '}' } else { delimiter };
+        return delimited_end(source, cursor + delimiter.len_utf8(), close);
+    }
     let mut cursor = skip_space(source, position);
     if source.as_bytes().get(cursor) == Some(&b'*') {
         cursor = skip_space(source, cursor + 1);
@@ -189,13 +269,7 @@ pub(crate) fn inline_code_end(source: &str, name: &str, position: usize) -> Opti
     if delimiter.is_whitespace() {
         return None;
     }
-    let body = cursor + delimiter.len_utf8();
-    let line_end = source[body..]
-        .find(['\r', '\n'])
-        .map_or(source.len(), |offset| body + offset);
-    source[body..line_end]
-        .find(delimiter)
-        .map(|offset| body + offset + delimiter.len_utf8())
+    delimited_end(source, cursor + delimiter.len_utf8(), delimiter)
 }
 
 /// All counts describe the fixed public arguments in the installed sources.
@@ -230,8 +304,273 @@ pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
             ("setmintedinline", 1, true),
             ("usemintedstyle", 1, true),
             ("newmintedfile", 2, true),
+            ("CodeHigh", 1, true),
+            ("NewCodeHighEnv", 2, false),
+            ("NewCodeHighInput", 2, false),
+            ("dochighinput", 1, true),
+            ("inputpygmented", 1, true),
+            ("setpygmented", 1, false),
+            ("plset", 1, false),
+            ("verbfilebox", 1, true),
+            ("verbfilenobox", 1, true),
+            ("theverbbox", 0, true),
+            ("listofpyglistings", 0, false),
+            ("listofpyglistingsname", 1, false),
         ],
     );
+}
+
+/// verbatimcopy makes backslashes, comment characters, and filename spaces
+/// ordinary under its default reader. A closed brace group also works in
+/// compatibility mode, which uses the original TeX argument parser.
+pub(crate) fn verbatim_copy_end(source: &str, name: &str, mut cursor: usize) -> Option<usize> {
+    let count = match name {
+        "VerbatimCopy" => 2,
+        "setOutputDir" => 1,
+        _ => return None,
+    };
+    for _ in 0..count {
+        cursor = skip_space(source, cursor);
+        let delimiter = source.get(cursor..)?.chars().next()?;
+        cursor = if delimiter == '{' {
+            raw_group_end(source, cursor)?
+        } else {
+            let body = cursor + delimiter.len_utf8();
+            body + source[body..].find(delimiter)? + delimiter.len_utf8()
+        };
+    }
+    Some(cursor)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeneratedInlineKind {
+    Delimited,
+    FancyVerb,
+    Minted,
+    PythonTex,
+}
+
+impl GeneratedInlineKind {
+    pub(crate) fn accepts_star_delimiter(self) -> bool {
+        matches!(self, Self::Minted | Self::PythonTex)
+    }
+}
+
+pub(crate) fn is_inline_factory(name: &str) -> bool {
+    matches!(
+        name,
+        "newverbcommand"
+            | "renewverbcommand"
+            | "provideverbcommand"
+            | "makepythontexfamily"
+            | "newmint"
+            | "newmintinline"
+    )
+}
+
+pub(crate) fn pythontex_inline_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    match name {
+        // PythonTeX: default families, including the restricted console forms.
+        "py" | "pyb" | "pyc" | "pys" | "pyv" | "pycon" | "pyconc" | "pyconv" | "sympy"
+        | "sympyb" | "sympyc" | "sympys" | "sympyv" | "sympycon" | "sympyconc" | "sympyconv"
+        | "pylab" | "pylabb" | "pylabc" | "pylabs" | "pylabv" | "pylabcon" | "pylabconc"
+        | "pylabconv" => generated_inline_end(source, GeneratedInlineKind::PythonTex, end),
+        // Both call the inline reader with the session already supplied.
+        "pygment" | "pythontexcustomc" => {
+            let mut cursor = end;
+            if name == "pythontexcustomc" {
+                optional_argument(source, &mut cursor);
+            }
+            argument(source, &mut cursor)?;
+            braced_or_delimited_code_end(source, cursor)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn is_pythontex_inline(name: &str) -> bool {
+    matches!(
+        name,
+        "py" | "pyb"
+            | "pyc"
+            | "pys"
+            | "pyv"
+            | "pycon"
+            | "pyconc"
+            | "pyconv"
+            | "sympy"
+            | "sympyb"
+            | "sympyc"
+            | "sympys"
+            | "sympyv"
+            | "sympycon"
+            | "sympyconc"
+            | "sympyconv"
+            | "pylab"
+            | "pylabb"
+            | "pylabc"
+            | "pylabs"
+            | "pylabv"
+            | "pylabcon"
+            | "pylabconc"
+            | "pylabconv"
+            | "pygment"
+            | "pythontexcustomc"
+    )
+}
+
+/// Parse the small set of source-level factories that create known inline
+/// verbatim commands. Unknown reader macros stay outside the inferred set.
+pub(crate) fn source_inline_declaration(
+    source: &str,
+    command: &str,
+    end: usize,
+) -> Option<(Vec<(String, GeneratedInlineKind)>, usize)> {
+    let mut cursor = end;
+    let declarations = match command {
+        "newverbcommand" | "renewverbcommand" | "provideverbcommand" => {
+            let target = command_argument_name(source, &mut cursor)?;
+            let reader = optional_argument(source, &mut cursor)
+                .map(|range| source[range].trim())
+                .unwrap_or("\\verb");
+            let kind = match reader {
+                "\\verb" => GeneratedInlineKind::Delimited,
+                "\\Verb" => GeneratedInlineKind::FancyVerb,
+                _ => return None,
+            };
+            argument(source, &mut cursor)?;
+            argument(source, &mut cursor)?;
+            vec![(target, kind)]
+        }
+        "makepythontexfamily" => {
+            let (family, console) = pythontex_family(source, &mut cursor)?;
+            (if console {
+                &["", "c", "s", "v"][..]
+            } else {
+                &["", "c", "s", "v", "b"]
+            })
+            .iter()
+            .map(|suffix| (format!("{family}{suffix}"), GeneratedInlineKind::PythonTex))
+            .collect()
+        }
+        "newmint" | "newmintinline" => {
+            let explicit = optional_argument(source, &mut cursor)
+                .map(|range| source[range].trim().trim_start_matches('\\').to_owned());
+            let language = argument(source, &mut cursor)?.trim();
+            argument(source, &mut cursor)?;
+            let target = explicit.filter(|name| !name.is_empty()).unwrap_or_else(|| {
+                if command == "newmint" {
+                    language.to_owned()
+                } else {
+                    format!("{language}inline")
+                }
+            });
+            let target = literal_control_word(&target)?.to_owned();
+            vec![(target, GeneratedInlineKind::Minted)]
+        }
+        _ => return None,
+    };
+    Some((declarations, cursor))
+}
+
+fn command_argument_name(source: &str, cursor: &mut usize) -> Option<String> {
+    let start = crate::trivia::skip(source, *cursor);
+    if source.as_bytes().get(start) == Some(&b'{') {
+        let end = crate::syntax::balanced_end(source, start, b'{', b'}')?;
+        let inner = source[start + 1..end - 1].trim();
+        let name = inner.strip_prefix('\\')?;
+        literal_control_word(name)?;
+        *cursor = end;
+        Some(name.into())
+    } else {
+        let (name, end) = crate::syntax::command_at(source, start)?;
+        literal_control_word(name)?;
+        *cursor = end;
+        Some(name.into())
+    }
+}
+
+fn optional_argument(source: &str, cursor: &mut usize) -> Option<std::ops::Range<usize>> {
+    let start = crate::trivia::skip(source, *cursor);
+    if source.as_bytes().get(start) != Some(&b'[') {
+        return None;
+    }
+    let end = crate::syntax::balanced_end(source, start, b'[', b']')?;
+    *cursor = end;
+    Some(start + 1..end - 1)
+}
+
+fn literal_control_word(value: &str) -> Option<&str> {
+    let name = value.trim();
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || byte == b'@'))
+    .then_some(name)
+}
+
+fn pythontex_family<'a>(source: &'a str, cursor: &mut usize) -> Option<(&'a str, bool)> {
+    let options = optional_argument(source, cursor);
+    let family = literal_control_word(argument(source, cursor)?)?;
+    let console = options.is_some_and(|range| {
+        source[range]
+            .split(',')
+            .rev()
+            .filter_map(|option| option.split_once('='))
+            .find(|(key, _)| key.trim() == "console")
+            .is_some_and(|(_, value)| value.trim() == "true")
+    });
+    Some((family, console))
+}
+
+/// End of one generated command body. PythonTeX takes an optional session
+/// bracket before a braced or delimiter-terminated code argument.
+pub(crate) fn generated_inline_end(
+    source: &str,
+    kind: GeneratedInlineKind,
+    position: usize,
+) -> Option<usize> {
+    if kind == GeneratedInlineKind::FancyVerb {
+        return inline_code_end(source, "Verb", position);
+    }
+    if kind == GeneratedInlineKind::Minted {
+        let mut cursor = position;
+        optional_argument(source, &mut cursor);
+        return braced_or_delimited_code_end(source, skip_space(source, cursor));
+    }
+    let mut cursor = skip_space(source, position);
+    if kind == GeneratedInlineKind::PythonTex && source.as_bytes().get(cursor) == Some(&b'[') {
+        // [ is read with backslash and percent as ordinary characters.
+        cursor += source.get(cursor..)?.find(']')? + 1;
+    }
+    if kind == GeneratedInlineKind::PythonTex {
+        return braced_or_delimited_code_end(source, cursor);
+    }
+    if source.as_bytes().get(cursor) == Some(&b'*') {
+        cursor = skip_space(source, cursor + 1);
+    }
+    let delimiter = source[cursor..].chars().next()?;
+    delimited_end(source, cursor + delimiter.len_utf8(), delimiter)
+}
+
+fn braced_or_delimited_code_end(source: &str, cursor: usize) -> Option<usize> {
+    if source.as_bytes().get(cursor) == Some(&b'{') {
+        return raw_group_end(source, cursor);
+    }
+    let delimiter = source.get(cursor..)?.chars().next()?;
+    delimited_end(source, cursor + delimiter.len_utf8(), delimiter)
+}
+
+fn delimited_end(source: &str, body: usize, delimiter: char) -> Option<usize> {
+    if delimiter.is_whitespace() {
+        return None;
+    }
+    let line_end = source[body..]
+        .find(['\r', '\n'])
+        .map_or(source.len(), |offset| body + offset);
+    source[body..line_end]
+        .find(delimiter)
+        .map(|offset| body + offset + delimiter.len_utf8())
 }
 
 fn argument<'a>(source: &'a str, cursor: &mut usize) -> Option<&'a str> {
@@ -257,20 +596,49 @@ pub(crate) fn source_declaration(
     command: &str,
     end: usize,
 ) -> Option<VerbatimDeclaration> {
-    if !matches!(
-        command,
-        "DefineVerbatimEnvironment" | "CustomVerbatimEnvironment" | "RecustomVerbatimEnvironment"
-    ) {
-        return None;
-    }
     let mut cursor = end;
-    let name = literal_name(argument(source, &mut cursor)?)?;
-    let base = literal_name(argument(source, &mut cursor)?)?;
-    header_signature(base)?;
-    argument(source, &mut cursor)?;
-    Some(VerbatimDeclaration {
-        names: vec![name.into(), format!("{name}*")],
-        end: cursor,
-        line_delimited: false,
-    })
+    match command {
+        "DefineVerbatimEnvironment"
+        | "CustomVerbatimEnvironment"
+        | "RecustomVerbatimEnvironment" => {
+            let name = literal_name(argument(source, &mut cursor)?)?;
+            let base = literal_name(argument(source, &mut cursor)?)?;
+            header_signature(base)?;
+            argument(source, &mut cursor)?;
+            Some(VerbatimDeclaration {
+                names: vec![name.into(), format!("{name}*")],
+                end: cursor,
+                terminator: VerbatimTerminator::AnyPosition,
+            })
+        }
+        // codehigh.sty creates each starred or unstarred name separately.
+        "NewCodeHighEnv" => {
+            let name = literal_name(argument(source, &mut cursor)?)?;
+            argument(source, &mut cursor)?;
+            Some(VerbatimDeclaration {
+                names: vec![name.into()],
+                end: cursor,
+                terminator: VerbatimTerminator::AnyPosition,
+            })
+        }
+        // The console family adds a `sole` suffix to names such as `pycon`.
+        "makepythontexfamily" => {
+            let (family, console) = pythontex_family(source, &mut cursor)?;
+            let names = [
+                "code",
+                "verbatim",
+                "sub",
+                if console { "sole" } else { "block" },
+            ]
+            .into_iter()
+            .map(|suffix| format!("{family}{suffix}"))
+            .collect();
+            Some(VerbatimDeclaration {
+                names,
+                end: cursor,
+                terminator: VerbatimTerminator::IndentedLine,
+            })
+        }
+        _ => None,
+    }
 }

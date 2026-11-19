@@ -388,6 +388,40 @@ fn format_document_stages(
                     crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
                 },
             )?;
+            optional_stage(
+                "column-specs",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.alignment.column_spec != crate::alignment::ColumnSpecLayout::Preserve
+                    || config
+                        .config
+                        .alignment
+                        .rules
+                        .values()
+                        .any(|rule| rule.column_spec.is_some()),
+                |text| crate::alignment::format_preambles(text, config, &mut parsing),
+            )?;
+            optional_stage(
+                "trees",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.trees.mode != crate::tree_layout::TreeMode::Preserve,
+                |text| crate::tree_layout::format_with_context(text, config, &mut parsing),
+            )?;
+            optional_stage(
+                "foreach-lists",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.arguments.foreach_lists
+                    != crate::argument_layout::ForeachListMode::Preserve,
+                |text| crate::foreach::format_lists(text, config, &mut parsing),
+            )?;
         }
     }
     optional_stage(
@@ -505,6 +539,49 @@ pub(crate) fn clean_whitespace(
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
 ) -> Result<String, FormatError> {
+    // Most layout stages leave trailing whitespace and blank-line runs clean.
+    // Check the bytes before rebuilding semantic protection for a new snapshot.
+    // Protected text can trigger this conservative check, but cannot hide work.
+    if !whitespace_cleanup_needed(source, config) {
+        return Ok(source.into());
+    }
+    clean_whitespace_parsed(source, config, parsing)
+}
+
+fn whitespace_cleanup_needed(source: &str, config: &CompiledConfig) -> bool {
+    let options = &config.config.whitespace;
+    let maximum = if options.preserve_blank_lines {
+        options.max_blank_lines
+    } else {
+        Some(0)
+    };
+    if !options.remove_trailing && maximum.is_none() {
+        return false;
+    }
+    let mut blanks = 0usize;
+    for line in source.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        if options.remove_trailing && body.ends_with([' ', '\t']) {
+            return true;
+        }
+        if maximum.is_some() && body.trim_matches([' ', '\t']).is_empty() {
+            blanks += 1;
+            if maximum.is_some_and(|maximum| blanks > maximum) {
+                return true;
+            }
+        } else {
+            blanks = 0;
+        }
+    }
+    false
+}
+
+fn clean_whitespace_parsed(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut ParseContext<'_>,
+) -> Result<String, FormatError> {
     let protected = &parsing.snapshot(source, false, false)?.protected;
     let mut output = String::with_capacity(source.len());
     let mut offset = 0usize;
@@ -559,18 +636,22 @@ fn trailing_content_end(body: &str) -> usize {
 }
 
 #[derive(Debug)]
-struct Event {
+struct Event<'a> {
     pos: usize,
     block: usize,
     start: bool,
-    unit: String,
+    unit: &'a str,
 }
 
-fn indentation_unit(block: &Block, config: &CompiledConfig) -> Result<String, FormatError> {
+fn indentation_unit<'a>(
+    block: &Block,
+    config: &'a CompiledConfig,
+    spaces: &'a str,
+) -> Result<&'a str, FormatError> {
     if block.name == "foreach-body"
         && matches!(block.kind, BlockKind::Group | BlockKind::MandatoryArgument)
     {
-        return Ok(String::new());
+        return Ok("");
     }
     if block.kind == BlockKind::Heading
         && !config
@@ -580,7 +661,7 @@ fn indentation_unit(block: &Block, config: &CompiledConfig) -> Result<String, Fo
             .get(block.name.trim_end_matches('*'))
             .is_some_and(|h| h.indent)
     {
-        return Ok(String::new());
+        return Ok("");
     }
     if block.kind == BlockKind::Environment
         && let Some(pattern) = &config.syntax.environment
@@ -588,12 +669,12 @@ fn indentation_unit(block: &Block, config: &CompiledConfig) -> Result<String, Fo
             .is_match(&block.name)
             .map_err(|e| FormatError::Syntax(e.to_string()))?
     {
-        return Ok(String::new());
+        return Ok("");
     }
     Ok(config
         .config
         .indent
-        .unit(block.kind.category(), &block.name))
+        .unit_with_spaces(block.kind.category(), &block.name, spaces))
 }
 
 pub(crate) fn indent_after_arguments(
@@ -683,9 +764,19 @@ fn indent_with_argument_ranges(
     }
     let blocks = projected_blocks.as_ref().unwrap_or(original_blocks);
     let mut events = Vec::new();
+    // Validated indentation widths are bounded by 256. Events borrow slices
+    // of one buffer or the configured literal instead of allocating per block.
+    let spaces = " ".repeat(256);
     let mut branches = BTreeMap::new();
     let newlines: Vec<usize> = memchr::memchr_iter(b'\n', source.as_bytes()).collect();
     for (i, block) in blocks.iter().enumerate() {
+        if i < original_blocks.len()
+            && configuration_ranges
+                .get(configuration_ranges.partition_point(|range| range.end <= block.begin.start))
+                .is_some_and(|range| range.start <= block.begin.start && block.end.end <= range.end)
+        {
+            continue;
+        }
         let newline = newlines.partition_point(|&pos| pos < block.body.start);
         if block.body.start >= block.body.end
             || block.kind != BlockKind::Loop
@@ -695,7 +786,7 @@ fn indent_with_argument_ranges(
         {
             continue;
         }
-        let unit = indentation_unit(block, config)?;
+        let unit = indentation_unit(block, config, &spaces)?;
         if unit.is_empty() {
             continue;
         }
@@ -709,7 +800,7 @@ fn indent_with_argument_ranges(
             pos: block.body.end,
             block: i,
             start: false,
-            unit: String::new(),
+            unit: "",
         });
         for (_, branch) in &block.branches {
             branches.insert(branch.start, i);
@@ -757,12 +848,23 @@ fn indent_with_argument_ranges(
         while event < events.len() && events[event].pos <= first {
             let e = &events[event];
             if e.start {
-                active.insert(e.block, e.unit.as_str());
+                active.insert(e.block, e.unit);
             } else {
                 active.remove(&e.block);
             }
             event += 1;
             dirty = true;
+        }
+        // Argument expansion owns only its changed groups. Other lines may
+        // already carry mathematical continuation or alignment indentation.
+        if !arguments.is_empty()
+            && arguments
+                .get(arguments.partition_point(|argument| argument.end <= first))
+                .is_none_or(|argument| first < argument.start)
+        {
+            output.push_str(line);
+            offset += line.len();
+            continue;
         }
         let protected_index = protected.partition_point(|r| r.end <= offset);
         let in_protected = protected
@@ -891,6 +993,7 @@ fn indent_with_argument_ranges(
         output.push_str(ending);
         offset += line.len();
     }
+    parsing.reuse_indented_snapshot(source, &output);
     Ok(output)
 }
 
