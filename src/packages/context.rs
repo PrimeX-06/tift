@@ -94,6 +94,9 @@ impl ContextIndex {
     }
 
     fn load(&mut self, name: &str, at: usize, certain: bool) {
+        if name == "tex-live-zh-cn" {
+            self.load("tex-live", at, certain);
+        }
         let events = self.packages.entry(name.into()).or_default();
         let definite = if certain {
             Some(at)
@@ -141,9 +144,30 @@ impl ContextIndex {
                 self.load(&package, start, certain && loaded);
             }
         }
+        if name == "input" {
+            let cursor = crate::trivia::skip(source, end);
+            let input = source[cursor..]
+                .split(|c: char| c.is_whitespace() || c == '%')
+                .next()
+                .unwrap_or("");
+            if matches!(input, "pitex" | "pitex.tex" | "{pitex}" | "{pitex.tex}") {
+                self.load("pitex", cursor + input.len(), certain);
+            }
+            if matches!(
+                input,
+                "pdfToolbox" | "pdfToolbox.tex" | "{pdfToolbox}" | "{pdfToolbox.tex}"
+            ) {
+                self.load("pdfToolbox", cursor + input.len(), certain);
+            }
+        }
         if matches!(
             name,
-            "usepackage" | "RequirePackage" | "RequirePackageWithOptions"
+            "usepackage"
+                | "RequirePackage"
+                | "RequirePackageWithOptions"
+                | "documentclass"
+                | "LoadClass"
+                | "LoadClassWithOptions"
         ) {
             let mut cursor = crate::trivia::skip(source, end);
             if source.as_bytes().get(cursor) == Some(&b'[') {

@@ -211,20 +211,34 @@ pub fn command_at(source: &str, start: usize) -> Option<(&str, usize)> {
     control_after_escape(source, start + 1)
 }
 
+pub(crate) fn expansion_precedes(source: &str, start: usize) -> bool {
+    let prefix = source[..start].trim_end_matches(char::is_whitespace);
+    prefix
+        .rfind('\\')
+        .and_then(|at| command_at(prefix, at))
+        .is_some_and(|(name, end)| {
+            end == prefix.len() && matches!(name, "expandafter" | "exp_after:wN")
+        })
+}
+
 fn control_after_escape(source: &str, name_start: usize) -> Option<(&str, usize)> {
     let bytes = source.as_bytes();
     let next = *bytes.get(name_start)?;
     let control_word = |byte: u8| byte.is_ascii_alphabetic() || matches!(byte, b'@' | b'_' | b':');
     let mut end = name_start + 1;
-    if control_word(next) {
-        while bytes.get(end).is_some_and(|&byte| control_word(byte)) {
-            end += 1;
+    let first = source[name_start..].chars().next()?;
+    if control_word(next) || first.is_alphabetic() {
+        end = name_start + first.len_utf8();
+        while let Some(character) = source[end..].chars().next()
+            && (character.is_alphabetic() || matches!(character, '@' | '_' | ':'))
+        {
+            end += character.len_utf8();
         }
         if bytes.get(end) == Some(&b'*') {
             end += 1;
         }
     } else if !next.is_ascii() {
-        // A non-ASCII control symbol is exactly one Unicode scalar, as before.
+        // Non-letter Unicode control symbols remain one scalar.
         end = name_start + source[name_start..].chars().next()?.len_utf8();
     }
     Some((&source[name_start..end], end))
@@ -290,8 +304,140 @@ fn next_character_test_end(source: &str, name: &str, end: usize) -> Option<usize
 // not start a group. A trailing star belongs to that token, not the primitive.
 pub(crate) fn primitive_data_end(source: &str, name: &str, end: usize) -> Option<usize> {
     let base = name.trim_end_matches('*');
-    if base == "tl_to_str:n" {
+    if matches!(base, "plIncludeInRelease" | "IncludeInRelease") {
+        return arguments::signature_end(source, end, "momm");
+    }
+    if matches!(base, "sseq@checkdef" | "sseq@checkprotecteddef") {
+        let target = tex_token_end(source, end)?;
+        let body = parameter_text_end(source, target)?;
+        return balanced_end(source, body, b'{', b'}');
+    }
+    if let Some(argument) = crate::source_model::expl3_stored_arguments(source, base, end) {
+        return Some(argument.end);
+    }
+    if base == "use:c" {
+        let start = skip_trivia(source, end);
+        if let Some(finish) = balanced_end(source, start, b'{', b'}') {
+            let factory = source[start + 1..finish - 1]
+                .split_whitespace()
+                .collect::<String>();
+            if matches!(
+                factory.as_str(),
+                "#1DocumentEnvironment" | "#1DocumentCommand"
+            ) {
+                return arguments::signature_end(
+                    source,
+                    finish,
+                    if factory.ends_with("Environment") {
+                        "mmmm"
+                    } else {
+                        "mmm"
+                    },
+                );
+            }
+        }
+    }
+    if base == "MakeSetupCommand" {
+        return delayed_data_end(source, base, end);
+    }
+    if base == "begingroup" {
+        // Common expansion idiom: the generated replacement closes the local
+        // group before executing its expanded payload. Keep the unit intact.
+        let mut start = skip_trivia(source, end);
+        while let Some(("catcode", after)) = command_at(source, start) {
+            let Some((character, code, finish)) = literal_catcode_assignment(source, after, true)
+            else {
+                break;
+            };
+            if matches!(character, 37 | 92 | 123 | 125) || matches!(code, 0 | 1 | 2 | 14) {
+                break;
+            }
+            start = skip_trivia(source, finish);
+        }
+        if let Some(("def" | "edef" | "xdef", after)) = command_at(source, start)
+            && let Some((target, after_target)) = command_at(source, skip_trivia(source, after))
+            && let body = skip_trivia(source, after_target)
+            && let Some(finish) = balanced_end(source, body, b'{', b'}')
+            && command_at(source, skip_trivia(source, body + 1))
+                .is_some_and(|(n, _)| n == "endgroup")
+            && let Some((called, finish)) = command_at(source, skip_trivia(source, finish))
+            && target == called
+        {
+            return Some(finish);
+        }
+    }
+    // Expansion suppression and token comparisons read tokens as data. A
+    // literal \verb, conditional or incomplete command in these operands
+    // must not invoke its ordinary reader.
+    if matches!(base, "exp_not:n" | "tl_to_str:n") {
         return balanced_end(source, skip_trivia(source, end), b'{', b'}');
+    }
+    if let Some((family, signature)) = base.split_once(':')
+        && matches!(family, "tl_if_in" | "tl_if_eq")
+        && let Some(prefix) = signature
+            .strip_suffix("TF")
+            .or_else(|| signature.strip_suffix('T'))
+            .or_else(|| signature.strip_suffix('F'))
+        && prefix.len() == 2
+        && let Some(call) =
+            crate::code_layout::expl3::parse_call(source, &format!("{family}:{prefix}"), end)
+    {
+        return Some(call.end);
+    }
+    if base.starts_with("exp_args:N")
+        && let Some(call) = crate::code_layout::expl3::parse_call(source, base, end)
+        && let Some((target, _)) = command_at(source, call.arguments.first()?.range.start)
+        && expl3_definition_variant(target).is_some_and(|variant| variant.contains('p'))
+    {
+        // The expansion wrapper supplies the definition's input. Its target
+        // need not have parameter text or a replacement group in the source.
+        return Some(call.end);
+    }
+    if matches!(base, "halign" | "valign" | "ialign" | "oalign" | "ooalign") {
+        let mut start = skip_trivia(source, end);
+        if source[start..].starts_with("to") || source[start..].starts_with("spread") {
+            while source.as_bytes().get(start) != Some(&b'{') {
+                match source.as_bytes().get(start)? {
+                    b'%' => start = line_end(source, start),
+                    b'\\' => start = command_at(source, start)?.1,
+                    _ => start += source[start..].chars().next()?.len_utf8(),
+                }
+            }
+        }
+        return balanced_end(source, start, b'{', b'}');
+    }
+    if matches!(
+        base,
+        "char" | "mathchar" | "number" | "romannumeral" | "numexpr"
+    ) {
+        return literal_integer(source, end).map(|(_, finish)| finish);
+    }
+    let token_list = match base {
+        "message" | "errmessage" | "special" | "mark" | "unexpanded" | "expanded" => {
+            Some(skip_trivia(source, end))
+        }
+        "write" | "marks" => {
+            literal_integer(source, end).map(|(_, after)| skip_trivia(source, after))
+        }
+        "toks" => literal_integer(source, end).map(|(_, after)| {
+            let next = skip_trivia(source, after);
+            skip_trivia(
+                source,
+                next + usize::from(source.as_bytes().get(next) == Some(&b'=')),
+            )
+        }),
+        "everyjob" | "everypar" | "everymath" | "everydisplay" | "everyhbox" | "everyvbox"
+        | "everycr" | "everyeof" | "output" | "errhelp" => {
+            let start = skip_trivia(source, end);
+            Some(skip_trivia(
+                source,
+                start + usize::from(source.as_bytes().get(start) == Some(&b'=')),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(start) = token_list {
+        return balanced_end(source, start, b'{', b'}');
     }
     if !matches!(
         base,
@@ -332,11 +478,104 @@ fn tex_token_end(source: &str, start: usize) -> Option<usize> {
     }
 }
 
+/// Backtick control-symbol operands are character data, including math delimiters.
+fn character_code_end(source: &str, start: usize) -> Option<usize> {
+    if source.as_bytes().get(start) != Some(&b'`')
+        || source.as_bytes().get(start + 1) != Some(&b'\\')
+    {
+        return None;
+    }
+    let (name, end) = command_at(source, start + 1)?;
+    (name.chars().count() == 1).then_some(end)
+}
+
+fn follows_numeric_operator(source: &str, mut end: usize) -> bool {
+    loop {
+        let prefix = source[..end].trim_end_matches([' ', '\t', '\r', '\n']);
+        let mut cursor = prefix.rfind('\n').map_or(0, |position| position + 1);
+        while cursor < prefix.len() {
+            if prefix.as_bytes()[cursor] == b'%' {
+                break;
+            }
+            cursor = command_at(prefix, cursor).map_or_else(
+                || {
+                    cursor
+                        + prefix[cursor..]
+                            .chars()
+                            .next()
+                            .expect("source character")
+                            .len_utf8()
+                },
+                |(_, finish)| finish,
+            );
+        }
+        if cursor == prefix.len() {
+            return prefix.ends_with(['=', '<', '>', '+', '-']);
+        }
+        end = cursor;
+    }
+}
+
+fn has_single_expandafter_prefix(source: &str, command_end: usize, command: &str) -> bool {
+    let Some(raw_command) = source[..command_end].strip_suffix(command) else {
+        return false;
+    };
+    let Some(prefix) = raw_command.strip_suffix('\\') else {
+        return false;
+    };
+    let prefix = prefix.trim_end_matches([' ', '\t', '\r', '\n']);
+    let Some(before) = prefix.strip_suffix("\\expandafter") else {
+        return false;
+    };
+    // A commented or escaped control sequence cannot expand the operand.
+    let line_start = before.rfind('\n').map_or(0, |position| position + 1);
+    !is_escaped(source, before.len())
+        && !before[line_start..]
+            .match_indices('%')
+            .any(|(offset, _)| !is_escaped(source, line_start + offset))
+        && !before
+            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .ends_with("\\expandafter")
+}
+
 fn primitive_test_end(source: &str, name: &str, end: usize) -> Option<usize> {
     let base = name.trim_end_matches('*');
     let start = if name.ends_with('*') { end - 1 } else { end };
     match base {
-        "ifx" => tex_token_end(source, tex_token_end(source, start)?),
+        "if_true:"
+        | "if_false:"
+        | "if_inner:"
+        | "if_mode_horizontal:"
+        | "if_mode_inner:"
+        | "if_mode_math:"
+        | "if_mode_vertical:" => Some(start),
+        "if_bool:N" | "if_box_empty:N" | "if_eof:w" | "if_hbox:N" | "if_vbox:N"
+        | "if_cs_exist:N" => tex_token_end(source, start),
+        "if:w" | "if_catcode:w" | "if_charcode:w" | "if_meaning:w" => {
+            tex_token_end(source, tex_token_end(source, start)?)
+        }
+        "if_case:w" => literal_integer(source, start).map(|(_, finish)| finish),
+        "if_cs_exist:w" => constructed_csname_body(source, start).map(|(_, finish)| finish),
+        "if_dim:w" => conditions::numeric_test_end(source, "ifdim", start),
+        "if_int_compare:w" => conditions::numeric_test_end(source, "ifnum", start),
+        "if_int_odd:w" => conditions::numeric_test_end(source, "ifodd", start),
+        "if_predicate:w" => conditions::numeric_test_end(source, "ifodd", start),
+        "ifcase" => literal_integer(source, start)
+            .filter(|(_, finish)| source[start..*finish].contains('`'))
+            .map(|(_, finish)| finish),
+        "ifx" => {
+            let operand_start = skip_trivia(source, start);
+            // \expandafter\ifx\csname...\endcsname compares one constructed
+            // control sequence and one unexpanded token.
+            let first_end = if source[operand_start..].starts_with("\\csname")
+                && has_single_expandafter_prefix(source, start, base)
+            {
+                literal_csname(source, operand_start).map(|(_, finish)| finish)
+            } else {
+                None
+            };
+            tex_token_end(source, first_end.or_else(|| tex_token_end(source, start))?)
+        }
         "ifdefined" | "ifprimitive" => tex_token_end(source, start),
         "if" | "ifcat" => {
             // Expanded operands require macro execution to determine. Direct
@@ -367,6 +606,22 @@ pub(crate) fn test_operand_end(source: &str, name: &str, end: usize) -> Option<u
 /// Delayed replacement text and literal arguments do not execute while their
 /// enclosing declaration is read. Reuse the grammar used by protection analysis.
 pub(crate) fn delayed_data_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if matches!(
+        name.trim_end_matches('*'),
+        "newcommand" | "renewcommand" | "providecommand"
+    ) && let Some(finish) = constructed_definition_end(source, end)
+    {
+        return Some(finish);
+    }
+    if name == "MakeSetupCommand" {
+        return arguments::signature_end(source, end, "mmoom");
+    }
+    if matches!(name, "dofor" | "dofornoempty") {
+        let list_end = balanced_end(source, skip_trivia(source, end), b'{', b'}')?;
+        let body = parameter_text_end(source, skip_trivia(source, list_end))?;
+        let body_end = balanced_end(source, body, b'{', b'}')?;
+        return balanced_end(source, skip_trivia(source, body_end), b'{', b'}');
+    }
     if let Some(body) = expl3_definition_body(source, name, end) {
         return Some(body.end);
     }
@@ -384,10 +639,44 @@ pub(crate) fn delayed_data_end(source: &str, name: &str, end: usize) -> Option<u
 }
 
 pub(crate) fn let_declaration_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    let name = conditions::canonical_condition_control(name);
+    if let Some((_, _, finish, _)) = command_copy(source, name, end) {
+        return Some(finish);
+    }
+    if let Some((family, signature)) = name.split_once(':')
+        && matches!(family, "cs_new_eq" | "cs_set_eq" | "cs_gset_eq")
+        && matches!(signature, "NN" | "Nc" | "cN" | "cc")
+    {
+        return arguments::signature_end(source, end, "mm");
+    }
+    if matches!(
+        name,
+        "NewCommandCopy" | "RenewCommandCopy" | "DeclareCommandCopy"
+    ) {
+        // Altered letter catcodes can extend a control sequence beyond the
+        // ordinary name grammar. Its braced operands still have a known extent.
+        let mut cursor = end;
+        for _ in 0..2 {
+            cursor = skip_trivia(source, cursor);
+            cursor = if command_at(source, cursor).is_some_and(|(name, _)| name == "csname") {
+                constructed_operand_end(source, cursor)?
+            } else if source.as_bytes().get(cursor) == Some(&b'{') {
+                balanced_end(source, cursor, b'{', b'}')?
+            } else {
+                tex_token_end(source, cursor)?
+            };
+        }
+        return Some(cursor);
+    }
     if !matches!(name, "let" | "futurelet") {
         return None;
     }
-    let target = tex_token_end(source, end)?;
+    let target_start = skip_trivia(source, end);
+    let target = if command_at(source, target_start).is_some_and(|(name, _)| name == "csname") {
+        constructed_operand_end(source, target_start)?
+    } else {
+        tex_token_end(source, target_start)?
+    };
     let mut operand = skip_trivia(source, target);
     if name == "futurelet" {
         // Its two lookahead tokens return to the input stream for execution.
@@ -400,7 +689,116 @@ pub(crate) fn let_declaration_end(source: &str, name: &str, end: usize) -> Optio
             operand += 1;
         }
     }
-    tex_token_end(source, operand)
+    if command_at(source, operand).is_some_and(|(name, _)| name == "csname") {
+        constructed_operand_end(source, operand)
+    } else {
+        tex_token_end(source, operand)
+    }
+}
+
+fn constructed_definition_end(source: &str, mut cursor: usize) -> Option<usize> {
+    cursor = skip_trivia(source, cursor);
+    if let Some((name, end)) = command_at(source, cursor)
+        && name.trim_end_matches('*') == "expandafter"
+    {
+        cursor = skip_trivia(source, end);
+    }
+    if source.as_bytes().get(cursor) == Some(&b'*') {
+        cursor = skip_trivia(source, cursor + 1);
+    }
+    let ("csname", after) = command_at(source, cursor)? else {
+        return None;
+    };
+    cursor = after;
+    while cursor < source.len() {
+        cursor = skip_trivia(source, cursor);
+        if let Some((name, end)) = command_at(source, cursor) {
+            if name == "IfNoValueTF" {
+                let args = crate::layout::signature_argument_ranges(
+                    source,
+                    end..source.len(),
+                    "mmm".bytes(),
+                );
+                if args.len() != 3 || args.iter().any(|arg| source.as_bytes()[arg.start] != b'{') {
+                    return None;
+                }
+                for branch in &args[1..] {
+                    let start = skip_trivia(source, branch.start + 1);
+                    let ("endcsname", mut end) = command_at(source, start)? else {
+                        return None;
+                    };
+                    end = skip_trivia(source, end);
+                    while source.as_bytes().get(end) == Some(&b'[') {
+                        end = skip_trivia(source, balanced_end(source, end, b'[', b']')?);
+                    }
+                    if end != branch.end - 1 {
+                        return None;
+                    }
+                }
+                let default_branch = args.last()?;
+                return balanced_end(source, skip_trivia(source, default_branch.end), b'{', b'}');
+            }
+            if name == "endcsname" {
+                return None;
+            }
+            cursor = end;
+        } else {
+            if matches!(source.as_bytes()[cursor], b'{' | b'}') {
+                return None;
+            }
+            cursor += source[cursor..].chars().next()?.len_utf8();
+        }
+    }
+    None
+}
+
+/// Read control-sequence copies without interpreting either operand as code.
+/// Constructed names are resolved only when their spelling is literal.
+pub(crate) fn command_copy<'a>(
+    source: &'a str,
+    name: &str,
+    end: usize,
+) -> Option<(&'a str, &'a str, usize, bool)> {
+    let (signature, global) = match name {
+        "NewCommandCopy" | "RenewCommandCopy" | "DeclareCommandCopy" => ("NN", false),
+        _ => {
+            let (family, signature) = name.split_once(':')?;
+            if !matches!(family, "cs_new_eq" | "cs_set_eq" | "cs_gset_eq")
+                || !matches!(signature, "NN" | "Nc" | "cN" | "cc")
+            {
+                return None;
+            }
+            (signature, family == "cs_gset_eq")
+        }
+    };
+    let mut cursor = end;
+    let mut operand = |kind| {
+        cursor = skip_trivia(source, cursor);
+        if source.as_bytes().get(cursor) == Some(&b'{') {
+            let finish = balanced_end(source, cursor, b'{', b'}')?;
+            let text = source[cursor + 1..finish - 1].trim();
+            let value = if kind == b'c' {
+                (!text.is_empty() && !text.contains(['\\', '#', '{', '}', '%'])).then_some(text)?
+            } else {
+                let (value, finish) = command_at(text, 0)?;
+                (finish == text.len()).then_some(value)?
+            };
+            cursor = finish;
+            Some(value)
+        } else if kind == b'N' {
+            let (value, finish) = command_at(source, cursor)?;
+            if value == "csname" {
+                return None;
+            }
+            cursor = finish;
+            Some(value)
+        } else {
+            None
+        }
+    };
+    let target = operand(signature.as_bytes()[0])?;
+    let value = operand(signature.as_bytes()[1])?;
+    Some((target, value, cursor, global))
 }
 
 fn primitive_literal_argument_end(source: &str, name: &str, end: usize) -> Option<usize> {
@@ -411,6 +809,9 @@ fn primitive_literal_argument_end(source: &str, name: &str, end: usize) -> Optio
 }
 
 fn definition_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if let Some(body) = expl3_definition_body(source, name, end) {
+        return Some(body.start);
+    }
     (latex_macro_definition(name) || matches!(name, "def" | "gdef" | "edef" | "xdef"))
         .then(|| macro_body(source, name, end).map(|body| body.start))
         .flatten()
@@ -424,6 +825,31 @@ fn literal_csname(source: &str, start: usize) -> Option<(String, usize)> {
         return None;
     }
     constructed_csname(source, start)
+}
+
+fn constructed_operand_end(source: &str, start: usize) -> Option<usize> {
+    let ("csname", mut cursor) = command_at(source, start)? else {
+        return None;
+    };
+    let mut depth = 1usize;
+    while cursor < source.len() {
+        cursor = skip_trivia(source, cursor);
+        if let Some((name, end)) = command_at(source, cursor) {
+            if name == "csname" {
+                depth += 1;
+            }
+            if name == "endcsname" {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(end);
+                }
+            }
+            cursor = end;
+        } else {
+            cursor += source.get(cursor..)?.chars().next()?.len_utf8();
+        }
+    }
+    None
 }
 
 fn constructed_csname(source: &str, start: usize) -> Option<(String, usize)> {
@@ -440,7 +866,7 @@ fn constructed_csname_body(source: &str, mut pos: usize) -> Option<(String, usiz
         match source.as_bytes()[pos] {
             b'\\' => {
                 let (name, end) = command_at(source, pos)?;
-                return (name == "endcsname").then_some((constructed, end));
+                return matches!(name, "endcsname" | "cs_end:").then_some((constructed, end));
             }
             b'%' => pos = line_end(source, pos),
             _ => {
@@ -453,6 +879,102 @@ fn constructed_csname_body(source: &str, mut pos: usize) -> Option<(String, usiz
         }
     }
     None
+}
+
+/// Return the outer token-list argument consumed by the case conversion
+/// primitives. TeX removes this wrapper before putting the tokens back on the
+/// input stream, so the wrapper delimiters do not create an execution group.
+pub(crate) fn token_list_argument_range(
+    source: &str,
+    name: &str,
+    end: usize,
+) -> Option<Range<usize>> {
+    matches!(
+        name.trim_end_matches('*'),
+        "uppercase" | "lowercase" | "expanded" | "precattl_exec:n"
+    )
+    .then(|| {
+        let start = skip_trivia(source, end);
+        (source.as_bytes().get(start) == Some(&b'{'))
+            .then(|| balanced_end(source, start, b'{', b'}'))
+            .flatten()
+            .map(|finish| start..finish)
+    })
+    .flatten()
+}
+
+/// Messages are token-list readers. Their arguments may contain arbitrary
+/// structural-looking commands, which must remain data while the message is
+/// read.
+pub(crate) fn message_data_arguments(
+    source: &str,
+    name: &str,
+    end: usize,
+) -> Option<Vec<Range<usize>>> {
+    let slots = match name.trim_end_matches('*') {
+        "typeout" | "wlog" => 1,
+        "PackageWarning"
+        | "PackageWarningNoLine"
+        | "PackageInfo"
+        | "ClassWarning"
+        | "ClassWarningNoLine"
+        | "ClassInfo"
+        | "GenericInfo"
+        | "GenericWarning"
+        | "GenericWarningNoLine" => 2,
+        "PackageError" | "ClassError" => 3,
+        "GenericError" => 4,
+        base if base.starts_with("msg_") => {
+            let (family, signature) = base.split_once(':')?;
+            if !matches!(
+                family,
+                "msg_new"
+                    | "msg_set"
+                    | "msg_gset"
+                    | "msg_info"
+                    | "msg_note"
+                    | "msg_warning"
+                    | "msg_error"
+                    | "msg_fatal"
+                    | "msg_critical"
+                    | "msg_expandable_error"
+                    | "msg_term"
+                    | "msg_log"
+                    | "msg_redirect_name"
+                    | "msg_redirect_module"
+                    | "msg_redirect_class"
+            ) || signature.is_empty()
+                || !signature
+                    .bytes()
+                    .all(|slot| matches!(slot, b'n' | b'x' | b'f' | b'o' | b'e' | b'v'))
+            {
+                return None;
+            }
+            signature.len()
+        }
+        _ => return None,
+    };
+    let mut cursor = end;
+    let mut arguments = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        let start = skip_trivia(source, cursor);
+        // A stored message invocation may be partially applied: its caller
+        // supplies the remaining arguments after expanding the wrapper.
+        // An enclosing group's terminator remains structural source.
+        if matches!(source.as_bytes().get(start), None | Some(b'}' | b']'))
+            || command_at(source, start)
+                .is_some_and(|(name, _)| matches!(name, "fi" | "else" | "or"))
+        {
+            break;
+        }
+        cursor = if source.as_bytes().get(start) == Some(&b'{') {
+            balanced_end(source, start, b'{', b'}')?
+        } else {
+            tex_token_end(source, start)?
+        };
+        arguments.push(start..cursor);
+    }
+    (!arguments.is_empty()).then_some(arguments)
 }
 
 // Resolve only zero-argument literal replacements, with ordinary TeX scope and
@@ -554,6 +1076,48 @@ fn line_end(source: &str, pos: usize) -> usize {
     source[pos..]
         .find('\n')
         .map_or(source.len(), |i| pos + i + 1)
+}
+
+fn untranslated_character_sequence(source: &str) -> Option<usize> {
+    let mut cursor = 0;
+    while cursor < source.len() {
+        if source.as_bytes()[cursor] == b'%' {
+            cursor = line_end(source, cursor);
+            continue;
+        }
+        if source[cursor..].starts_with("^^")
+            && !source[cursor..].starts_with("^^I")
+            && !source[cursor..].starts_with("^^09")
+            && source.as_bytes().get(cursor + 2).is_some_and(u8::is_ascii)
+        {
+            return Some(cursor);
+        }
+        if source.as_bytes()[cursor] == b'\\' {
+            if let Some((name, end)) = command_at(source, cursor)
+                && (name.trim_end_matches('*') == "verb"
+                    || crate::code_environments::INLINE_VERBATIM_COMMANDS
+                        .contains(&name.trim_end_matches('*'))
+                    || crate::code_package_syntax::INLINE_CODE_COMMANDS
+                        .contains(&name.trim_end_matches('*')))
+                && let Some(finish) = inline_end(source, name, end)
+            {
+                cursor = finish;
+                continue;
+            }
+            if matches!(source.as_bytes().get(cursor + 1), Some(b'%' | b'\\')) {
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        cursor += source[cursor..]
+            .chars()
+            .next()
+            .expect("source character")
+            .len_utf8();
+    }
+    None
 }
 
 /// Shared physical-line controls for TeX and BibTeX comment scanners.
@@ -672,16 +1236,30 @@ fn inline_end(source: &str, name: &str, mut pos: usize) -> Option<usize> {
         .map(|i| body + i + delimiter.len_utf8())
 }
 
+/// Find the first begin-group token after a TeX parameter text.
+pub(crate) fn parameter_text_end(source: &str, mut pos: usize) -> Option<usize> {
+    loop {
+        match *source.as_bytes().get(pos)? {
+            b'{' => return Some(pos),
+            b'}' => return None,
+            b'%' => pos = line_end(source, pos),
+            b'\\' => pos = command_at(source, pos)?.1,
+            _ => pos += source[pos..].chars().next()?.len_utf8(),
+        }
+    }
+}
+
 fn macro_body(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
     let name = name.trim_end_matches('*');
     let mut pos = skip_trivia(source, end);
-    if matches!(name, "def" | "gdef" | "edef" | "xdef") {
+    if matches!(name, "@namedef" | "csdef" | "csgdef" | "csedef" | "csxdef") {
+        pos = balanced_end(source, pos, b'{', b'}')?;
+        pos = parameter_text_end(source, pos)?;
+    } else if matches!(name, "def" | "gdef" | "edef" | "xdef") {
         if source.as_bytes().get(pos) == Some(&b'\\') {
             pos = command_at(source, pos)?.1;
         }
-        while pos < source.len() && source.as_bytes()[pos] != b'{' {
-            pos += source[pos..].chars().next()?.len_utf8();
-        }
+        pos = parameter_text_end(source, pos)?;
     } else {
         if source.as_bytes().get(pos) == Some(&b'{') {
             pos = balanced_end(source, pos, b'{', b'}')?;
@@ -811,7 +1389,8 @@ fn semiverbatim_environment_end(source: &str, mut cursor: usize, name: &str) -> 
 fn primitive_condition(name: &str) -> bool {
     matches!(
         name,
-        "if" | "ifcat"
+        "if" | "if:w"
+            | "ifcat"
             | "ifnum"
             | "ifdim"
             | "ifodd"
@@ -836,6 +1415,35 @@ fn primitive_condition(name: &str) -> bool {
             | "ifabsdim"
             | "ifpdfabsnum"
             | "ifpdfabsdim"
+            | "if_bool:N"
+            | "if_case:w"
+            | "if_box_empty:N"
+            | "if_catcode:w"
+            | "if_charcode:w"
+            | "if_cs_exist:N"
+            | "if_cs_exist:w"
+            | "if_dim:w"
+            | "if_eof:w"
+            | "if_false:"
+            | "if_hbox:N"
+            | "if_inner:"
+            | "if_int_compare:w"
+            | "if_int_odd:w"
+            | "if_meaning:w"
+            | "if_mode_horizontal:"
+            | "if_mode_inner:"
+            | "if_mode_math:"
+            | "if_mode_vertical:"
+            | "if_predicate:w"
+            | "if_true:"
+            | "if_vbox:N"
+    )
+}
+
+fn case_condition(name: &str) -> bool {
+    matches!(
+        conditions::canonical_condition_control(name),
+        "ifcase" | "if_case:w"
     )
 }
 
@@ -922,7 +1530,7 @@ fn math_delimiter_command(name: &str) -> bool {
 
 // In a formula, a literal interval can follow a control word. An optional
 // argument must close before the enclosing formula's own terminator.
-fn math_optional_argument_end(source: &str, start: usize) -> Option<usize> {
+pub(crate) fn math_optional_argument_end(source: &str, start: usize) -> Option<usize> {
     let mut pos = start + 1;
     let mut brackets = 1usize;
     let mut braces = 0usize;
@@ -1004,14 +1612,21 @@ fn opaque_suffix<'a>(
     protected.last().filter(|range| {
         range.end == source.len()
             && (command_at(source, range.start).is_some_and(|(name, end)| {
-                matches!(name, "catcode" | "obeyspaces" | "obeylines" | "scantokens")
-                    || name == "ExplSyntaxOn" && !source[end..].contains("\\ExplSyntaxOff")
-            }) || env_at(source, range.start).is_some_and(|(name, begin, _)| {
-                begin
-                    && inferred_protected_environments(source, config, protected)
-                        .iter()
-                        .any(|environment| environment == name)
-            }))
+                matches!(
+                    name,
+                    "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+                ) || name == "ExplSyntaxOn" && !source[end..].contains("\\ExplSyntaxOff")
+            }) || (source.as_bytes().get(range.start) == Some(&b'{')
+                || command_at(source, range.start)
+                    .is_some_and(|(name, _)| matches!(name, "begingroup" | "bgroup")))
+                && (source[(*range).clone()].contains("\\catcode")
+                    || source[(*range).clone()].contains("\\endlinechar"))
+                || env_at(source, range.start).is_some_and(|(name, begin, _)| {
+                    begin
+                        && inferred_protected_environments(source, config, protected)
+                            .iter()
+                            .any(|environment| environment == name)
+                }))
     })
 }
 
@@ -1031,6 +1646,9 @@ pub(crate) fn classic_command_definition(name: &str) -> bool {
         "newcommand"
             | "renewcommand"
             | "providecommand"
+            | "newcommandx"
+            | "renewcommandx"
+            | "providecommandx"
             | "DeclareRobustCommand"
             | "newrobustcmd"
             | "renewrobustcmd"
@@ -1053,13 +1671,22 @@ pub(crate) fn fixed_command_factory_signature(name: &str) -> Option<&'static str
 }
 
 fn latex_macro_definition(name: &str) -> bool {
+    if name == "@namedef" {
+        return true;
+    }
     classic_command_definition(name)
         || fixed_command_factory_signature(name).is_some()
         || matches!(
             name.trim_end_matches('*'),
             "DeclareMathOperator"
+                | "csdef"
+                | "csgdef"
+                | "csedef"
+                | "csxdef"
                 | "newenvironment"
                 | "renewenvironment"
+                | "newenvironmentx"
+                | "renewenvironmentx"
                 | "lynewenvironment"
                 | "NewEnviron"
                 | "RenewEnviron"
@@ -1289,7 +1916,7 @@ fn context_macro_declaration_with_config(
     });
     // The balanced body establishes completion even when explicit syntax makes
     // interpreting this declaration's argument specification unnecessary.
-    let specification = if configured_signature {
+    let specification = if configured_signature || command.trim_end_matches('*').ends_with('x') {
         None
     } else if let Some(signature) = fixed_command_factory_signature(command) {
         Some(signature.to_owned())
@@ -1416,10 +2043,23 @@ pub(crate) fn expl3_command_declaration(
     };
     let body = expl3_definition_body(source, command, end)?;
     let count = if variant.contains('p') {
-        let text = source[cursor..body.start].trim();
-        let count = text.bytes().filter(|&byte| byte == b'#').count();
-        (count <= 9 && text == (1..=count).map(|n| format!("#{n}")).collect::<String>())
-            .then_some(count)?
+        let finish = parameter_text_end(source, cursor)?;
+        let mut text = String::new();
+        let mut position = cursor;
+        while position < finish {
+            position = skip_trivia(source, position);
+            if position >= finish {
+                break;
+            }
+            let character = source[position..].chars().next()?;
+            text.push(character);
+            position += character.len_utf8();
+        }
+        let shape = arguments::parameter_signature(&text)?;
+        shape
+            .bytes()
+            .all(|slot| slot == b'm')
+            .then_some(shape.len())?
     } else {
         let suffix = name.rsplit_once(':')?.1;
         (suffix.len() <= 9 && suffix.bytes().all(|byte| b"nNcCoVvxef".contains(&byte)))
@@ -1437,8 +2077,19 @@ pub(crate) fn expl3_command_declaration(
     })
 }
 
-fn expl3_definition_variant(command: &str) -> Option<&str> {
+pub(crate) fn expl3_definition_variant(command: &str) -> Option<&str> {
     let (family, variant) = command.split_once(':')?;
+    if matches!(
+        family,
+        "prg_new_conditional"
+            | "prg_new_protected_conditional"
+            | "prg_set_conditional"
+            | "prg_set_protected_conditional"
+            | "prg_gset_conditional"
+            | "prg_gset_protected_conditional"
+    ) {
+        return matches!(variant, "Npnn" | "Nnn").then_some(variant);
+    }
     if !matches!(
         family,
         "cs_new"
@@ -1460,7 +2111,11 @@ fn expl3_definition_variant(command: &str) -> Option<&str> {
     Some(variant)
 }
 
-fn expl3_definition_body(source: &str, command: &str, end: usize) -> Option<Range<usize>> {
+pub(crate) fn expl3_definition_body(
+    source: &str,
+    command: &str,
+    end: usize,
+) -> Option<Range<usize>> {
     let variant = expl3_definition_variant(command)?;
     let mut cursor = skip_trivia(source, end);
     cursor = if variant.starts_with('N') {
@@ -1470,12 +2125,11 @@ fn expl3_definition_body(source: &str, command: &str, end: usize) -> Option<Rang
     };
     cursor = skip_trivia(source, cursor);
     if variant.contains('p') {
-        while source.as_bytes().get(cursor) != Some(&b'{') {
-            if source.as_bytes().get(cursor) == Some(&b'\\') {
-                return None;
-            }
-            cursor += source.get(cursor..)?.chars().next()?.len_utf8();
-        }
+        cursor = parameter_text_end(source, cursor)?;
+    }
+    if matches!(variant, "Npnn" | "Nnn") {
+        // Both conditional declaration forms take the variant list before the body.
+        cursor = skip_trivia(source, balanced_end(source, cursor, b'{', b'}')?);
     }
     Some(cursor..balanced_end(source, cursor, b'{', b'}')?)
 }
@@ -1911,8 +2565,11 @@ fn declaration_protection_validation_needed(source: &str, config: &Config) -> bo
                         .get(base)
                         .is_some_and(|rule| rule.verbatim)
                     || config.protect.dynamic_catcodes
-                        && matches!(base, "catcode" | "obeyspaces" | "obeylines" | "scantokens")
-                    || config.protect.expl3 && base == "ExplSyntaxOn"
+                        && matches!(
+                            base,
+                            "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+                        )
+                    || config.protect.expl3 && !config.code.expl3 && base == "ExplSyntaxOn"
             })
         })
 }
@@ -2303,33 +2960,9 @@ pub(crate) fn infer_list_environments_with_definitions(
 pub(crate) fn macro_layout_active(source: &str, config: &crate::CompiledConfig) -> bool {
     config.config.protect.macro_bodies
         && config.config.protect.format_macro_bodies
-        && [
-            "\\def",
-            "\\gdef",
-            "\\edef",
-            "\\xdef",
-            "\\newcommand",
-            "\\renewcommand",
-            "\\providecommand",
-            "\\newenvironment",
-            "\\renewenvironment",
-            "\\lynewenvironment",
-            "\\NewDocumentCommand",
-            "\\RenewDocumentCommand",
-            "\\ProvideDocumentCommand",
-            "\\DeclareDocumentCommand",
-            "\\NewDocumentEnvironment",
-            "\\RenewDocumentEnvironment",
-            "\\ProvideDocumentEnvironment",
-            "\\DeclareDocumentEnvironment",
-            "\\DeclareRobustCommand",
-            "\\DeclareMathOperator",
-        ]
-        .iter()
-        .any(|name| {
-            source.match_indices(name).any(|(start, _)| {
-                command_at(source, start)
-                    .is_some_and(|(command, _)| command.trim_end_matches('*') == &name[1..])
+        && source.match_indices('\\').any(|(start, _)| {
+            command_at(source, start).is_some_and(|(name, _)| {
+                latex_macro_definition(name) || matches!(name, "def" | "gdef" | "edef" | "xdef")
             })
         })
 }
@@ -2396,6 +3029,16 @@ fn format_macro_definitions_parsed(
         .map_err(|error| FormatError::Syntax(error.to_string()))?;
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     for definition in definitions {
+        // An inline declaration shares its line's indentation with preceding
+        // executable text. Reindenting its closing line would move the next
+        // declaration's apparent base and cause cascading changes on later
+        // passes. Leave these bodies to the enclosing code printer.
+        if !source[line_start(source, definition.start)..definition.start]
+            .trim_matches([' ', '\t'])
+            .is_empty()
+        {
+            continue;
+        }
         if !definition
             .bodies
             .iter()
@@ -2430,11 +3073,29 @@ fn format_macro_definitions_parsed(
         let Ok((tokens, blocks)) = shared_blocks_with_ranges(&synthetic, &inner, &protected) else {
             continue;
         };
+        let mut opaque_lines = protected.clone();
         let risky = tokens
             .iter()
             .filter(|token| token.kind == TokenKind::Command)
             .any(|token| {
-                command_at(&synthetic, token.span.start).is_some_and(|(name, _)| {
+                command_at(&synthetic, token.span.start).is_some_and(|(name, end)| {
+                    let name = name.trim_end_matches('*');
+                    let delayed = if name == "let" {
+                        let_declaration_end(&synthetic, name, end)
+                    } else if token.span.start != 0 && expl3_definition_variant(name).is_some() {
+                        expl3_definition_body(&synthetic, name, end).map(|body| body.end)
+                    } else if token.span.start != 0
+                        && (latex_macro_definition(name)
+                            || matches!(name, "def" | "gdef" | "edef" | "xdef" | "newcolumntype"))
+                    {
+                        macro_body(&synthetic, name, end).map(|body| body.end)
+                    } else {
+                        None
+                    };
+                    if let Some(finish) = delayed {
+                        opaque_lines.push(token.span.start..finish);
+                        return false;
+                    }
                     matches!(
                         name,
                         "def"
@@ -2449,10 +3110,6 @@ fn format_macro_definitions_parsed(
                             | "csname"
                             | "endcsname"
                             | "newif"
-                            | "bgroup"
-                            | "egroup"
-                            | "begingroup"
-                            | "endgroup"
                             | "newcolumntype"
                     ) || latex_macro_definition(name) && token.span.start != 0
                 })
@@ -2461,7 +3118,12 @@ fn format_macro_definitions_parsed(
                 command_at(&synthetic, range.start).is_some_and(|(name, _)| {
                     matches!(
                         name,
-                        "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "ExplSyntaxOn"
+                        "catcode"
+                            | "obeyspaces"
+                            | "obeylines"
+                            | "scantokens"
+                            | "endlinechar"
+                            | "ExplSyntaxOn"
                     )
                 })
             })
@@ -2476,6 +3138,7 @@ fn format_macro_definitions_parsed(
         if risky {
             continue;
         }
+        let opaque_lines = crate::code_layout::merged(opaque_lines);
         let Ok(formatted) = crate::format(&synthetic, crate::FileKind::Tex, &inner) else {
             continue;
         };
@@ -2519,11 +3182,11 @@ fn format_macro_definitions_parsed(
             let mut offset = synthetic_body.start;
             for (index, (&old, &new)) in old_lines.iter().zip(&new_lines).enumerate() {
                 let inline_start = index == 0 && !original.starts_with('\n');
-                let raw = overlaps(&(offset..offset + old.len()), &protected);
-                if inline_start || raw {
+                let raw = overlaps(&(offset..offset + old.len()), &opaque_lines);
+                let content = new.trim_start_matches([' ', '\t']);
+                if inline_start || raw || old.trim_start_matches([' ', '\t']) != content {
                     text.push_str(old);
                 } else {
-                    let content = new.trim_start_matches([' ', '\t']);
                     if content.trim_matches(['\r', '\n']).is_empty() {
                         if index + 1 == old_lines.len() && !old.ends_with('\n') {
                             text.push_str(base);
@@ -2707,7 +3370,10 @@ fn inferred_environment_protection(
                     };
                     let name = name.trim_end_matches('*');
                     if config.protect.dynamic_catcodes
-                        && matches!(name, "catcode" | "obeyspaces" | "obeylines" | "scantokens")
+                        && matches!(
+                            name,
+                            "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+                        )
                         || config.protect.expl3 && name == "ExplSyntaxOn"
                     {
                         direct = true;
@@ -2922,7 +3588,7 @@ fn set_environment_protection(
 
 /// Source regions whose original bytes must survive all formatting passes.
 pub fn protected_ranges(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_impl(source, config, None, None)
+    protected_ranges_impl(source, config, None, None, false)
 }
 
 #[doc(hidden)]
@@ -2931,7 +3597,7 @@ pub fn protected_ranges_with_syntax(
     config: &Config,
     compiled: &CompiledSyntax,
 ) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_impl(source, config, Some(compiled), None)
+    protected_ranges_impl(source, config, Some(compiled), None, false)
 }
 
 pub(crate) fn protected_ranges_with_diagnostics(
@@ -2940,10 +3606,18 @@ pub(crate) fn protected_ranges_with_diagnostics(
     compiled: Option<&CompiledSyntax>,
 ) -> Result<(Vec<Range<usize>>, Vec<crate::Diagnostic>), FormatError> {
     let mut diagnostics = Vec::new();
-    let ranges = protected_ranges_impl(source, config, compiled, Some(&mut diagnostics))?;
+    let ranges = protected_ranges_impl(source, config, compiled, Some(&mut diagnostics), false)?;
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
     diagnostics.dedup_by(|a, b| a.span == b.span && a.message == b.message);
     Ok((ranges, diagnostics))
+}
+
+pub(crate) fn protected_ranges_for_expl3_outer(
+    source: &str,
+    config: &Config,
+    compiled: &CompiledSyntax,
+) -> Result<Vec<Range<usize>>, FormatError> {
+    protected_ranges_impl(source, config, Some(compiled), None, true)
 }
 
 fn protected_ranges_impl(
@@ -2951,6 +3625,7 @@ fn protected_ranges_impl(
     config: &Config,
     compiled: Option<&CompiledSyntax>,
     mut diagnostics: Option<&mut Vec<crate::Diagnostic>>,
+    protect_expl3_bodies: bool,
 ) -> Result<Vec<Range<usize>>, FormatError> {
     let owned;
     let compiled = if let Some(compiled) = compiled {
@@ -2970,6 +3645,7 @@ fn protected_ranges_impl(
         None,
         compiled,
         diagnostics.as_deref_mut(),
+        protect_expl3_bodies,
     )?;
     if ![
         "environment",
@@ -2996,13 +3672,14 @@ fn protected_ranges_impl(
         None,
         compiled,
         diagnostics,
+        protect_expl3_bodies,
     )?;
     add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
     Ok(ranges)
 }
 
 fn protected_ranges_basic(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_with_inferred_environments(source, config, &[], None, None, None)
+    protected_ranges_with_inferred_environments(source, config, &[], None, None, None, false)
 }
 
 pub(crate) fn visual_header_bindings(
@@ -3019,11 +3696,13 @@ pub(crate) fn visual_header_bindings(
         Some(&mut bindings),
         None,
         None,
+        false,
     )?;
     Ok(bindings)
 }
 
 pub(crate) fn inferred_condition(name: &str, source: &str, end: usize) -> bool {
+    let name = conditions::canonical_condition_control(name);
     primitive_condition(name)
         || name.starts_with("if")
             && ![
@@ -3041,8 +3720,274 @@ pub(crate) fn inferred_condition(name: &str, source: &str, end: usize) -> bool {
                 "ifdimcomp",
             ]
             .contains(&name)
-            && !source[end..].trim_start().starts_with('{')
+            && source.as_bytes().get(skip_trivia(source, end)) != Some(&b'{')
             && crate::packages::command_signature(source, name, end).is_none()
+}
+
+fn short_verbatim_declaration(source: &str, name: &str, end: usize) -> Option<(char, bool, usize)> {
+    let name = name.trim_end_matches('*');
+    if !matches!(
+        name,
+        "MakeShortVerb"
+            | "DeleteShortVerb"
+            | "DefineShortVerb"
+            | "UndefineShortVerb"
+            | "lstMakeShortInline"
+            | "lstDeleteShortInline"
+    ) {
+        return None;
+    }
+    let mut start = skip_trivia(source, end);
+    if source.as_bytes().get(start) == Some(&b'[')
+        && matches!(
+            name,
+            "DefineShortVerb" | "UndefineShortVerb" | "lstMakeShortInline"
+        )
+    {
+        start = skip_trivia(source, balanced_end(source, start, b'[', b']')?);
+    }
+    if matches!(name, "lstMakeShortInline" | "lstDeleteShortInline") {
+        let delimiter = source[start..].chars().next()?;
+        return (!delimiter.is_whitespace() && !"\\{}%".contains(delimiter)).then_some((
+            delimiter,
+            name == "lstMakeShortInline",
+            start + delimiter.len_utf8(),
+        ));
+    }
+    let finish = balanced_end(source, start, b'{', b'}')?;
+    let text = source[start + 1..finish - 1].trim();
+    let text = text.strip_prefix('\\').unwrap_or(text);
+    let mut chars = text.chars();
+    let delimiter = chars.next()?;
+    (chars.next().is_none() && !"\\{}%".contains(delimiter)).then_some((
+        delimiter,
+        matches!(name, "MakeShortVerb" | "DefineShortVerb"),
+        finish,
+    ))
+}
+
+// Some branch-selecting macros return an opening primitive conditional. Keep
+// the complete resulting conditional together; either branch has the same
+// source extent even though its truth value requires macro expansion.
+fn conditional_choice_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    let args = if name == "markdownIfOption" {
+        crate::layout::signature_argument_ranges(source, end..source.len(), "mmm".bytes())
+    } else {
+        let call = crate::code_layout::expl3::parse_call(source, name, end)?;
+        if !call.signature.ends_with("TF") {
+            return None;
+        }
+        call.arguments.into_iter().map(|arg| arg.range).collect()
+    };
+    if args.len() < 2 {
+        return None;
+    }
+    for arg in &args[args.len() - 2..] {
+        let mut text = source[arg.clone()].trim();
+        if text.starts_with('{') && text.ends_with('}') {
+            text = text[1..text.len() - 1].trim();
+        }
+        let (condition, finish) = command_at(text, 0)?;
+        if finish != text.len()
+            || !matches!(condition, "iftrue" | "iffalse" | "if_true:" | "if_false:")
+        {
+            return None;
+        }
+    }
+    let mut cursor = args.last()?.end;
+    let mut depth = 1usize;
+    while cursor < source.len() {
+        if source.as_bytes()[cursor] == b'%' {
+            cursor = line_end(source, cursor);
+            continue;
+        }
+        let Some((command, finish)) = command_at(source, cursor) else {
+            cursor += source[cursor..].chars().next()?.len_utf8();
+            continue;
+        };
+        if let Some(next) = primitive_data_end(source, command, finish)
+            .or_else(|| delayed_data_end(source, command, finish))
+            .or_else(|| let_declaration_end(source, command, finish))
+        {
+            cursor = next;
+            continue;
+        }
+        let command = conditions::canonical_condition_control(command);
+        if primitive_condition(command) {
+            depth += 1;
+        } else if command == "fi" {
+            depth -= 1;
+            if depth == 0 {
+                return Some(finish);
+            }
+        }
+        cursor = test_operand_end(source, command, finish).unwrap_or(finish);
+    }
+    None
+}
+
+fn terminal_branch(source: &str, start: usize, limit: usize) -> bool {
+    let mut cursor = start;
+    let mut terminal = false;
+    while cursor < limit {
+        cursor = skip_trivia(source, cursor);
+        if cursor >= limit {
+            break;
+        }
+        terminal = false;
+        if let Some((name, end)) = command_at(source, cursor) {
+            terminal = matches!(name, "endinput" | "stop" | "@@end" | "bye");
+            cursor = delayed_data_end(source, name, end)
+                .or_else(|| {
+                    message_data_arguments(source, name, end)
+                        .and_then(|args| args.last().map(|arg| arg.end))
+                })
+                .unwrap_or(end);
+        } else {
+            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+    terminal && cursor <= limit
+}
+
+fn terminal_argument_branches(source: &str, name: &str, end: usize) -> Vec<Range<usize>> {
+    let shape = match name {
+        "IfPackageLoadedTF" | "IfClassLoadedTF" | "IfFormatAtLeastTF" => "mmm",
+        "IfPackageAtLeastTF" | "IfClassAtLeastTF" => "mmmm",
+        _ => return Vec::new(),
+    };
+    let args = crate::layout::signature_argument_ranges(source, end..source.len(), shape.bytes());
+    if args.len() != shape.len() {
+        return Vec::new();
+    }
+    args[args.len() - 2..]
+        .iter()
+        .filter_map(|arg| {
+            (source.as_bytes()[arg.start] == b'{'
+                && terminal_branch(source, arg.start + 1, arg.end - 1))
+            .then_some(arg.start + 1..arg.end - 1)
+        })
+        .collect()
+}
+
+fn terminal_else_branch(source: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut depth = 0usize;
+    while cursor < source.len() {
+        cursor = skip_trivia(source, cursor);
+        let Some((name, end)) = command_at(source, cursor) else {
+            cursor += source.get(cursor..)?.chars().next()?.len_utf8();
+            continue;
+        };
+        if let Some(finish) = delayed_data_end(source, name, end) {
+            cursor = finish;
+            continue;
+        }
+        if primitive_condition(name) || inferred_condition(name, source, end) {
+            depth += 1;
+        } else if name == "fi" {
+            if depth == 0 {
+                return terminal_branch(source, start, cursor).then_some(cursor);
+            }
+            depth -= 1;
+        } else if matches!(name, "else" | "or") && depth == 0 {
+            return None;
+        }
+        cursor = test_operand_end(source, name, end).unwrap_or(end);
+    }
+    None
+}
+
+pub(crate) fn opens_final_condition(body: &str) -> bool {
+    let mut cursor = 0;
+    let mut depth = 0usize;
+    let mut final_open = false;
+    let mut constructed_open = false;
+    while cursor < body.len() {
+        cursor = skip_trivia(body, cursor);
+        if cursor == body.len() {
+            break;
+        }
+        let Some((name, end)) = command_at(body, cursor) else {
+            final_open = false;
+            cursor += body[cursor..].chars().next().unwrap().len_utf8();
+            continue;
+        };
+        if let Some(finish) = primitive_data_end(body, name, end)
+            .or_else(|| delayed_data_end(body, name, end))
+            .or_else(|| let_declaration_end(body, name, end))
+        {
+            cursor = finish;
+            final_open = false;
+            continue;
+        }
+        if matches!(name, "newif" | "ltx@newif" | "newife") {
+            let target = skip_trivia(body, end);
+            cursor = if command_at(body, target).is_some_and(|(name, _)| name == "csname") {
+                constructed_operand_end(body, target).unwrap_or(end)
+            } else {
+                tex_token_end(body, target).unwrap_or(end)
+            };
+            final_open = false;
+            continue;
+        }
+        if name == "csname"
+            && let Some((target, finish)) = constructed_csname(body, cursor)
+            && target.starts_with("if")
+            && target.contains('#')
+        {
+            depth += 1;
+            constructed_open = true;
+            cursor = finish;
+            continue;
+        }
+        let base = conditions::canonical_condition_control(name);
+        final_open = primitive_condition(base) || inferred_condition(base, body, end);
+        if final_open {
+            depth += 1;
+        } else if base == "fi" {
+            let Some(next) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = next;
+        } else if matches!(base, "else" | "or") && depth == 0 {
+            return false;
+        }
+        cursor = test_operand_end(body, name, end).unwrap_or(end);
+    }
+    (final_open || constructed_open) && depth == 1
+}
+
+fn case_test_data(source: &str, name: &str, end: usize) -> Option<Vec<Range<usize>>> {
+    let (family, _) = name.split_once(':')?;
+    if !matches!(
+        family,
+        "str_case" | "str_case_e" | "tl_case" | "int_case" | "dim_case"
+    ) {
+        return None;
+    }
+    let call = crate::code_layout::expl3::parse_call(source, name, end)?;
+    let test = call.arguments.first()?.range.clone();
+    let list = call.arguments.get(1)?.range.clone();
+    if source.as_bytes().get(list.start) != Some(&b'{') {
+        return None;
+    }
+    let mut ranges = vec![test];
+    let mut cursor = list.start + 1;
+    while cursor < list.end - 1 {
+        let start = skip_trivia(source, cursor);
+        if start >= list.end - 1 {
+            break;
+        }
+        let finish = balanced_end(source, start, b'{', b'}')?;
+        ranges.push(start..finish);
+        let branch = skip_trivia(source, finish);
+        cursor = balanced_end(source, branch, b'{', b'}')?;
+        if cursor > list.end - 1 {
+            return None;
+        }
+    }
+    Some(ranges)
 }
 
 // A conditional can choose an environment which is closed in a later
@@ -3135,7 +4080,7 @@ fn add_conditional_environment_protection(
                     },
                     |(name, _)| name.as_str(),
                 );
-                let base = name.trim_end_matches('*');
+                let base = conditions::canonical_condition_control(name.trim_end_matches('*'));
                 if new_if {
                     known.insert(base.into());
                     new_if = false;
@@ -3148,7 +4093,7 @@ fn add_conditional_environment_protection(
                     if branch.has_else
                         || base == "or"
                             && primitive_condition(&branch.name)
-                            && branch.name != "ifcase"
+                            && !case_condition(&branch.name)
                     {
                         break;
                     }
@@ -3370,13 +4315,31 @@ fn literal_catcode_assignment(
     {
         (13, finish, true)
     } else {
-        let (value, finish) = literal_integer(source, cursor)?;
+        let (value, finish) = literal_integer(source, cursor).or_else(|| {
+            // A comment immediately after the decimal code is the usual
+            // end-of-line spelling in catcode setup blocks.
+            let start = skip_trivia(source, cursor);
+            let mut finish = start;
+            while source
+                .as_bytes()
+                .get(finish)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                finish += 1;
+            }
+            (finish > start && source.as_bytes().get(finish) == Some(&b'%')).then(|| {
+                source[start..finish]
+                    .parse::<i64>()
+                    .ok()
+                    .map(|value| (value, finish))
+            })?
+        })?;
         (value, finish, false)
     };
     let code = u8::try_from(code).ok().filter(|&c| c <= 15)?;
     if !complete
         && source.as_bytes().get(finish) == Some(&b'\\')
-        && command_at(source, finish)?.0 != "relax"
+        && !matches!(command_at(source, finish)?.0, "relax" | "catcode")
     {
         return None;
     }
@@ -3467,7 +4430,7 @@ fn dynamic_catcode_end(
     let mut nested = Vec::<(String, HashMap<u32, u8>)>::new();
     let mut can_restore_scope = !global;
     let mut pending_global = false;
-    let mut pending_conditions = 0usize;
+    let mut pending_conditions = Vec::new();
     while cursor < source.len() {
         let c = source[cursor..].chars().next().expect("catcode token");
         let code = changed
@@ -3493,14 +4456,23 @@ fn dynamic_catcode_end(
                 continue;
             }
             if command == "catcode" || crate::packages::code::catcode_value(command).is_some() {
-                if pending_conditions != 0 {
+                if !pending_conditions.is_empty() {
                     return source.len();
                 }
-                let Some((character, value, next)) =
-                    catcode_assignment(source, command, finish, kernel_active)
+                let translated;
+                let (assignment_source, assignment_end, base_offset) = if c != '\\' && c.is_ascii()
+                {
+                    translated = source[finish..].replace(&format!("`{c}"), "`\\");
+                    (translated.as_str(), 0, finish)
+                } else {
+                    (source, finish, 0)
+                };
+                let Some((character, value, relative_next)) =
+                    catcode_assignment(assignment_source, command, assignment_end, kernel_active)
                 else {
                     return source.len();
                 };
+                let next = base_offset + relative_next;
                 if pending_global {
                     can_restore_scope = false;
                     for (_, snapshot) in &mut nested {
@@ -3517,8 +4489,8 @@ fn dynamic_catcode_end(
                         && !changed
                             .iter()
                             .any(|(&character, &code)| character != '\\' as u32 && code == 0)
-                        || character == '{' as u32
-                        || character == '}' as u32
+                        || character == '{' as u32 && !changed.values().any(|&code| code == 1)
+                        || character == '}' as u32 && !changed.values().any(|&code| code == 2)
                         || char::from_u32(character).is_some_and(|c| c.is_ascii_alphabetic()))
                 {
                     return source.len();
@@ -3586,8 +4558,21 @@ fn dynamic_catcode_end(
                 cursor = end;
                 continue;
             }
-            if name == "ExplSyntaxOn" && command == "ExplSyntaxOff" {
-                if pending_conditions != 0 {
+            if matches!(
+                command,
+                "obeylines" | "obeyspaces" | "scantokens" | "endlinechar" | "globaldefs"
+            ) {
+                return source.len();
+            }
+            if command == "ExplSyntaxOn" {
+                if name != "ExplSyntaxOn" || !pending_conditions.is_empty() {
+                    return source.len();
+                }
+                cursor = finish;
+                continue;
+            }
+            if command == "ExplSyntaxOff" {
+                if name != "ExplSyntaxOn" || !pending_conditions.is_empty() {
                     return source.len();
                 }
                 if nested.is_empty() {
@@ -3599,20 +4584,22 @@ fn dynamic_catcode_end(
                 cursor = finish;
                 continue;
             }
-            // A closed primitive branch containing no tokenization or scope
-            // changes cannot affect the later restoration boundary. Keep its
-            // contents opaque; reject branch-dependent changes below.
+            // Each possible branch must return to its entry scope. Balanced
+            // argument groups and local groups do not delay catcode recovery.
             if primitive_condition(command) {
-                pending_conditions += 1;
+                pending_conditions.push(nested.len());
                 cursor = primitive_test_end(source, command, finish).unwrap_or(finish);
                 continue;
             }
             if inferred_condition(command, source, finish) {
-                return source.len();
+                pending_conditions.push(nested.len());
+                cursor = primitive_test_end(source, command, finish).unwrap_or(finish);
+                continue;
             }
             if let Some(next) = primitive_data_end(source, command, finish)
                 .or_else(|| let_declaration_end(source, command, finish))
                 .or_else(|| primitive_literal_argument_end(source, command, finish))
+                .or_else(|| expl3_definition_body(source, command, finish).map(|body| body.end))
                 .or_else(|| {
                     inline_end(source, command, finish)
                         .filter(|_| matches!(command, "verb" | "verb*"))
@@ -3629,18 +4616,22 @@ fn dynamic_catcode_end(
                 cursor = next;
                 continue;
             }
-            if command == "fi" && pending_conditions != 0 {
-                pending_conditions -= 1;
+            if matches!(command, "else" | "or" | "fi") {
+                if pending_conditions.last() != Some(&nested.len()) {
+                    return source.len();
+                }
+                if command == "fi" {
+                    pending_conditions.pop();
+                }
                 cursor = finish;
                 continue;
             }
             if let Some((environment, begin, next)) = env_at(source, cursor) {
-                if pending_conditions != 0 {
-                    return source.len();
-                }
                 let terminator = format!("\\end{{{environment}}}");
                 if begin {
                     nested.push((terminator, changed.clone()));
+                } else if pending_conditions.last() == Some(&nested.len()) {
+                    return source.len();
                 } else if nested.last().is_some_and(|(end, _)| end == &terminator) {
                     changed = nested.pop().expect("catcode scope").1;
                 } else if nested.is_empty()
@@ -3648,14 +4639,13 @@ fn dynamic_catcode_end(
                     && scope == Some(terminator.as_str())
                 {
                     return cursor;
+                } else {
+                    return source.len();
                 }
                 cursor = next;
                 continue;
             }
             if matches!(command, "begingroup" | "bgroup" | "group_begin:") {
-                if pending_conditions != 0 {
-                    return source.len();
-                }
                 nested.push((
                     if command == "group_begin:" {
                         "\\group_end:"
@@ -3668,7 +4658,7 @@ fn dynamic_catcode_end(
                     changed.clone(),
                 ));
             } else if matches!(command, "endgroup" | "egroup" | "group_end:") {
-                if pending_conditions != 0 {
+                if pending_conditions.last() == Some(&nested.len()) {
                     return source.len();
                 }
                 let terminator = format!("\\{command}");
@@ -3683,22 +4673,28 @@ fn dynamic_catcode_end(
                         return finish;
                     }
                     return cursor;
+                } else {
+                    return source.len();
                 }
             }
             cursor = finish;
             continue;
         }
-        if pending_conditions != 0 && matches!(code, 1 | 2) {
-            return source.len();
-        }
         if c == '{' && code == 1 {
             nested.push(("}".into(), changed.clone()));
         } else if c == '}' && code == 2 {
+            if pending_conditions.last() == Some(&nested.len()) {
+                return source.len();
+            }
             if nested.last().is_some_and(|(end, _)| end == "}") {
                 changed = nested.pop().expect("catcode scope").1;
             } else if nested.is_empty() && can_restore_scope && scope == Some("}") {
                 return cursor;
+            } else {
+                return source.len();
             }
+        } else if matches!(code, 1 | 2) && !pending_conditions.is_empty() {
+            return source.len();
         }
         cursor += c.len_utf8();
     }
@@ -3746,7 +4742,22 @@ fn protected_ranges_with_inferred_environments(
     mut visual_headers: Option<&mut HashMap<usize, bool>>,
     compiled: Option<&CompiledSyntax>,
     mut diagnostics: Option<&mut Vec<crate::Diagnostic>>,
+    protect_expl3_bodies: bool,
 ) -> Result<Vec<Range<usize>>, FormatError> {
+    if config.protect.dynamic_catcodes
+        && let Some(at) = untranslated_character_sequence(source)
+    {
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.push(crate::Diagnostic {
+                severity: crate::Severity::Warning,
+                message:
+                    "TeX character translation requires a different token stream; source preserved"
+                        .into(),
+                span: at..at + 2,
+            });
+        }
+        return Ok(std::iter::once(0..source.len()).collect());
+    }
     if memchr::memchr2(b'\\', b'%', source.as_bytes()).is_none()
         && !config.syntax.special.iter().any(|r| r.verbatim)
     {
@@ -3777,11 +4788,18 @@ fn protected_ranges_with_inferred_environments(
         })
         .collect();
     let mut macro_ranges = Vec::new();
+    let mut short_verbatim = HashSet::<char>::new();
+    let mut document_short_verbatim = Vec::new();
     let mut delayed_key_ranges = std::collections::BTreeMap::new();
     let mut package_context = crate::packages::ContextIndex::with_config(source, config);
+    if package_context.at(0).has_package("ltxdoc") || package_context.at(0).has_package("l3doc") {
+        short_verbatim.insert('|');
+    }
     let mut pending_branches = std::collections::BTreeMap::new();
     let mut branch_ends = std::collections::BinaryHeap::new();
     let mut xparse_bindings = arguments::SignatureBindings::default();
+    let command_imports = crate::source_model::SourceModel::command_imports(source, config);
+    let mut command_imports = command_imports.iter().peekable();
     use crate::package_environments::VerbatimTerminator;
     let mut package_verbatim = HashMap::new();
     let mut package_commands_redefined = HashSet::new();
@@ -3789,12 +4807,25 @@ fn protected_ranges_with_inferred_environments(
     let mut conditional_bindings = ConditionalBindings::default();
     let mut catcode_scopes: Vec<(String, bool, usize)> = Vec::new();
     let mut inline_tikz_start = None;
+    let mut pitex_verbatim = HashSet::new();
+    let mut kkverb_delimiters = ("|".to_owned(), "|".to_owned());
+    let mut knowledge_variants: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    let mut knowledge_literal_styles = HashSet::<String>::new();
     let mut active_conditions: Vec<ActiveCondition> = Vec::new();
     let mut conditional_loops = Vec::new();
+    let mut case_list_delimiters = HashSet::new();
     let mut foreach_variables = HashMap::<&str, usize>::new();
     let mut foreach_groups = None;
     let mut pending_unless = false;
-    while pos < source.len() {
+    let mut input_end = source.len();
+    while pos < input_end {
+        while command_imports.peek().is_some_and(|event| event.at <= pos) {
+            for (name, command) in &command_imports.next().unwrap().commands {
+                if !config.syntax.commands.contains_key(name) {
+                    xparse_bindings.import(name, command);
+                }
+            }
+        }
         while pending_branches
             .first_key_value()
             .is_some_and(|(&start, _)| start <= pos)
@@ -3825,7 +4856,36 @@ fn protected_ranges_with_inferred_environments(
             pos = range.end;
             continue;
         }
+        if case_list_delimiters.remove(&pos) {
+            pos += 1;
+            continue;
+        }
         let c = source.as_bytes()[pos];
+        let character = source[pos..].chars().next().expect("source character");
+        if c == b'!'
+            && package_context.at(pos).has_package("codedescribe")
+            && let Some(finish) = crate::packages::code::punctuation_code_end(source, pos)
+        {
+            ranges.push(pos..finish);
+            pos = finish;
+            continue;
+        }
+        if short_verbatim.contains(&character) && !directives.is_disabled() && noindent.is_empty() {
+            let body = pos + character.len_utf8();
+            if let Some(relative) = source[body..line_end(source, body)].find(character) {
+                let finish = body + relative + character.len_utf8();
+                ranges.push(pos..finish);
+                pos = finish;
+                continue;
+            }
+        }
+        if let Some(end) =
+            character_code_end(source, pos).filter(|_| follows_numeric_operator(source, pos))
+        {
+            ranges.push(pos..end);
+            pos = end;
+            continue;
+        }
         if pending_unless && c != b'\\' && c != b'%' && !c.is_ascii_whitespace() {
             pending_unless = false;
         }
@@ -3863,8 +4923,152 @@ fn protected_ranges_with_inferred_environments(
             continue;
         }
         if c == b'\\' {
-            let command = command_at(source, pos);
+            let command = command_at(source, pos).map(|(name, end)| {
+                if let Some(suffix) = name.strip_prefix("verb")
+                    && suffix.starts_with(':')
+                    && !xparse_bindings.contains(false, name)
+                    && !config.syntax.commands.contains_key(name)
+                {
+                    ("verb", pos + 5)
+                } else {
+                    (name, end)
+                }
+            });
             if let Some((name, end)) = command {
+                if name == "Ver"
+                    && source[end..].starts_with('>')
+                    && let Some(offset) = source[end + 1..].find("<Rev")
+                {
+                    let finish = end + 1 + offset + 4;
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if name == "ver"
+                    && source[end..].starts_with('>')
+                    && let Some(offset) = source[end + 1..line_end(source, end)].find('>')
+                {
+                    let finish = end + offset + 2;
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if package_context.at(pos).has_package("KKluaverb")
+                    || package_context.at(pos).has_package("kkluaverb")
+                {
+                    if name == "KKvSetDelims" {
+                        let args = crate::layout::signature_argument_ranges(
+                            source,
+                            end..source.len(),
+                            "mm".bytes(),
+                        );
+                        if args.len() == 2
+                            && args.iter().all(|arg| source.as_bytes()[arg.start] == b'{')
+                        {
+                            let opening = &source[args[0].start + 1..args[0].end - 1];
+                            let closing = &source[args[1].start + 1..args[1].end - 1];
+                            if !opening.is_empty()
+                                && !closing.is_empty()
+                                && !opening.contains('\\')
+                                && !closing.contains('\\')
+                            {
+                                kkverb_delimiters = (opening.into(), closing.into());
+                                pos = args[1].end;
+                                ranges.push(end..pos);
+                                continue;
+                            }
+                        }
+                    } else if name == "KKverb" && source[end..].starts_with(&kkverb_delimiters.0) {
+                        let body = end + kkverb_delimiters.0.len();
+                        if let Some(offset) = source[body..].find(&kkverb_delimiters.1) {
+                            let finish = body + offset + kkverb_delimiters.1.len();
+                            ranges.push(pos..finish);
+                            pos = finish;
+                            continue;
+                        }
+                    }
+                }
+                if package_context.at(pos).has_package("pitex") {
+                    if name == "newverbatim"
+                        && let Some((target, after)) = command_at(source, skip_trivia(source, end))
+                        && let Some(finish) = arguments::signature_end(source, after, "omm")
+                    {
+                        pitex_verbatim.insert(target.to_owned());
+                        ranges.push(pos..finish);
+                        pos = finish;
+                        continue;
+                    }
+                    if pitex_verbatim.contains(name) && !package_commands_redefined.contains(name) {
+                        let terminator = format!("\\{name}/");
+                        if let Some(offset) = source[end..].find(&terminator) {
+                            let finish = end + offset + terminator.len();
+                            ranges.push(pos..finish);
+                            pos = finish;
+                            continue;
+                        }
+                    }
+                }
+                if name == "startluacode"
+                    && let Some(offset) = source[end..].find("\\stopluacode")
+                {
+                    let finish = end + offset + "\\stopluacode".len();
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if let Some(finish) =
+                    crate::packages::code::literate_fragment_end(source, name, end)
+                {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if let Some((delimiter, enable, finish)) =
+                    short_verbatim_declaration(source, name, end)
+                {
+                    if enable {
+                        short_verbatim.insert(delimiter);
+                    } else {
+                        short_verbatim.remove(&delimiter);
+                    }
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if name == "AtBeginDocument"
+                    && let Some(finish) = arguments::signature_end(source, end, "m")
+                {
+                    let mut cursor = skip_trivia(source, end) + 1;
+                    while cursor < finish - 1 {
+                        if source.as_bytes()[cursor] == b'%' {
+                            cursor = line_end(source, cursor);
+                        } else if let Some((nested, next)) = command_at(source, cursor) {
+                            if let Some((delimiter, enable, after)) =
+                                short_verbatim_declaration(source, nested, next)
+                            {
+                                document_short_verbatim.push((delimiter, enable));
+                                cursor = after;
+                            } else {
+                                cursor = next;
+                            }
+                        } else {
+                            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+                        }
+                    }
+                }
+                if name == "documentclass" {
+                    let mut start = skip_trivia(source, end);
+                    if source.as_bytes().get(start) == Some(&b'[')
+                        && let Some(finish) = balanced_end(source, start, b'[', b']')
+                    {
+                        start = skip_trivia(source, finish);
+                    }
+                    if let Some(finish) = balanced_end(source, start, b'{', b'}')
+                        && matches!(source[start + 1..finish - 1].trim(), "ltxdoc" | "l3doc")
+                    {
+                        short_verbatim.insert('|');
+                    }
+                }
                 if foreach_variables
                     .get(name)
                     .is_some_and(|&finish| pos < finish)
@@ -3911,10 +5115,28 @@ fn protected_ranges_with_inferred_environments(
                     end,
                     active_conditions.is_empty() && branch_ends.is_empty(),
                 );
+                if name == "documentclass" && package_context.at(source.len()).has_package("letgut")
+                {
+                    short_verbatim.insert('™');
+                }
+                if matches!(name, "usepackage" | "RequirePackage")
+                    && package_context.at(source.len()).has_package("tex-live")
+                {
+                    short_verbatim.insert('|');
+                }
             }
             if let Some((name, begin, finish)) =
                 command.and_then(|(name, end)| env_after_command(source, name, end))
             {
+                if begin && name == "document" {
+                    for (delimiter, enable) in document_short_verbatim.drain(..) {
+                        if enable {
+                            short_verbatim.insert(delimiter);
+                        } else {
+                            short_verbatim.remove(&delimiter);
+                        }
+                    }
+                }
                 if begin
                     && crate::packages::scoped_header_signature(name).is_some()
                     && let Some(headers) = visual_headers.as_deref_mut()
@@ -3960,6 +5182,7 @@ fn protected_ranges_with_inferred_environments(
                         || config.protect.file_contents.iter().any(|n| n == name)
                         || package_verbatim.contains_key(name)
                         || listing_header.is_some()
+                        || crate::packages::code::context_verbatim(name, &package_context.at(pos))
                         || crate::package_environments::is_source_verbatim_environment_outside(
                             &source[..pos],
                             name,
@@ -4132,14 +5355,117 @@ fn protected_ranges_with_inferred_environments(
                 }
             }
             if let Some((name, end)) = command {
-                let base = name.trim_end_matches('*');
+                let base = conditions::canonical_condition_control(name.trim_end_matches('*'));
+                let global_catcode = conditional_bindings.has_global_prefix();
+                if package_context.at(pos).has_package("knowledge")
+                    && matches!(base, "knowledgenewvariant" | "knowledgestyle")
+                    && !package_commands_redefined.contains(base)
+                    && !config.syntax.commands.contains_key(base)
+                {
+                    let args = crate::layout::signature_argument_ranges(
+                        source,
+                        end..source.len(),
+                        "mm".bytes(),
+                    );
+                    if args.len() == 2 && source.as_bytes()[args[1].start] == b'{' {
+                        let text = &source[args[1].start + 1..args[1].end - 1];
+                        if base == "knowledgenewvariant" {
+                            let target = source[args[0].clone()]
+                                .trim()
+                                .trim_start_matches('{')
+                                .trim_end_matches('}')
+                                .trim();
+                            if let Some((target, finish)) = command_at(target, 0)
+                                && finish
+                                    == source[args[0].clone()]
+                                        .trim()
+                                        .trim_start_matches('{')
+                                        .trim_end_matches('}')
+                                        .trim()
+                                        .len()
+                            {
+                                let mut groups = Vec::new();
+                                for entry in crate::packages::keys::definition_entries(text) {
+                                    if let Some((key, value)) = text[entry].split_once('=')
+                                        && matches!(
+                                            key.trim(),
+                                            "default style"
+                                                | "unknown style"
+                                                | "unknown style cont"
+                                        )
+                                    {
+                                        groups.push(
+                                            value
+                                                .trim()
+                                                .trim_start_matches('{')
+                                                .trim_end_matches('}')
+                                                .split(',')
+                                                .map(|value| value.trim().to_owned())
+                                                .collect(),
+                                        );
+                                    }
+                                }
+                                if groups.len() == 3 {
+                                    xparse_bindings.assign(
+                                        false,
+                                        target.to_owned(),
+                                        xparse::Signature::parse("sd()od()m"),
+                                        None,
+                                        global_catcode,
+                                    );
+                                    knowledge_variants.insert(target.to_owned(), groups);
+                                }
+                            }
+                        } else if source.as_bytes()[args[0].start] == b'{' {
+                            let style =
+                                source[args[0].start + 1..args[0].end - 1].trim().to_owned();
+                            let literal = crate::packages::keys::definition_entries(text)
+                                .iter()
+                                .any(|entry| {
+                                    text[entry.clone()].split_once('=').is_some_and(
+                                        |(key, value)| {
+                                            key.trim() == "wrap" && value.trim() == "\\detokenize"
+                                        },
+                                    )
+                                });
+                            if literal {
+                                knowledge_literal_styles.insert(style);
+                            } else {
+                                knowledge_literal_styles.remove(&style);
+                            }
+                        }
+                        for (target, groups) in &knowledge_variants {
+                            xparse_bindings.set_literal(
+                                target,
+                                groups.iter().all(|group| {
+                                    group
+                                        .iter()
+                                        .any(|style| knowledge_literal_styles.contains(style))
+                                }),
+                            );
+                        }
+                        ranges.push(pos..args[1].end);
+                        pos = args[1].end;
+                        continue;
+                    }
+                }
+                if matches!(base, "newcommand" | "renewcommand" | "providecommand")
+                    && let Some(finish) = constructed_definition_end(source, end)
+                {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
                 let uncertain = !branch_ends.is_empty()
                     || active_conditions.iter().any(|condition| {
                         condition.meaning == ConditionalMeaning::Other
                             || condition.meaning == ConditionalMeaning::Case
                                 && condition.selected.is_none()
                     });
-                let global_catcode = conditional_bindings.has_global_prefix();
+                if let Some(argument) = token_list_argument_range(source, name, end) {
+                    case_list_delimiters.insert(argument.start);
+                    case_list_delimiters.insert(argument.end - 1);
+                }
                 if latex_macro_definition(name) {
                     if let Some(declaration) = context_macro_declaration(source, pos, name, end) {
                         let provide = base.starts_with("provide") || base.starts_with("Provide");
@@ -4163,11 +5489,44 @@ fn protected_ranges_with_inferred_environments(
                                 .flatten();
                             xparse_bindings.assign(
                                 declaration.environment,
-                                declaration.name,
+                                declaration.name.clone(),
                                 signature,
                                 math,
                                 global_catcode,
                             );
+                            if !uncertain
+                                && !declaration.environment
+                                && let Some(body) = macro_body(source, name, end)
+                                && let Some(kind) = crate::packages::code::forwarded_inline_kind(
+                                    &source[body.start + 1..body.end - 1],
+                                )
+                            {
+                                xparse_bindings.assign_inline_code(
+                                    declaration.name.clone(),
+                                    kind,
+                                    global_catcode,
+                                );
+                            }
+                            if !uncertain
+                                && !declaration.environment
+                                && let Some(body) = macro_body(source, name, end)
+                            {
+                                let body = &source[body.start + 1..body.end - 1];
+                                if crate::source_model::parameters_are_stored_in_context(
+                                    body,
+                                    &package_context.at(pos),
+                                ) {
+                                    xparse_bindings.mark_literal(&declaration.name);
+                                } else if body.contains('#') {
+                                    xparse_bindings.mark_literal_slots(
+                                        &declaration.name,
+                                        crate::source_model::stored_parameter_mask(
+                                            body,
+                                            &package_context.at(pos),
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                 } else if matches!(
@@ -4227,8 +5586,44 @@ fn protected_ranges_with_inferred_environments(
                         math,
                         global_catcode || matches!(base, "gdef" | "xdef"),
                     );
+                    if !uncertain
+                        && matches!(base, "def" | "gdef" | "edef" | "xdef")
+                        && let Some(body) = macro_body(source, base, end)
+                        && crate::source_model::parameters_are_stored(
+                            &source[body.start + 1..body.end - 1],
+                        )
+                    {
+                        xparse_bindings.mark_literal(target);
+                    }
                 }
                 let configured = config.syntax.commands.get(base);
+                if matches!(base, "url" | "nolinkurl")
+                    && configured.is_none()
+                    && !xparse_bindings.contains(false, base)
+                {
+                    // url's catcode reader consumes percent signs as URL
+                    // characters. A subsequent source definition must only
+                    // shadow this reader after its own declaration/import.
+                    let start = skip_trivia(source, end);
+                    let finish = if source.as_bytes().get(start) == Some(&b'{') {
+                        crate::code_package_syntax::raw_group_end(source, start)
+                    } else {
+                        source[start..]
+                            .chars()
+                            .next()
+                            .filter(|c| !c.is_whitespace())
+                            .and_then(|delimiter| {
+                                source[start + delimiter.len_utf8()..line_end(source, start)]
+                                    .find(delimiter)
+                                    .map(|offset| start + offset + 2 * delimiter.len_utf8())
+                            })
+                    };
+                    if let Some(finish) = finish {
+                        ranges.push(start..finish);
+                        pos = finish;
+                        continue;
+                    }
+                }
                 if configured.is_none()
                     && !config
                         .protect
@@ -4260,7 +5655,7 @@ fn protected_ranges_with_inferred_environments(
                             base,
                             end - usize::from(name.ends_with('*')),
                         )
-                    } else if matches!(base, "hll" | "pyth")
+                    } else if matches!(base, "hll" | "pyth" | "KKverb")
                         && !xparse_bindings.contains(false, base)
                     {
                         crate::packages::listing_wrappers::inline_end(
@@ -4314,6 +5709,31 @@ fn protected_ranges_with_inferred_environments(
                 });
                 if let Some(signature) = signature {
                     let start = end - usize::from(name.ends_with('*'));
+                    if configured.is_none() {
+                        let slots = xparse_bindings.literal_slots(base);
+                        if slots != 0
+                            && let Some(arguments) =
+                                signature.slot_ranges(source, start..source.len())
+                        {
+                            delayed_key_ranges.extend(
+                                arguments
+                                    .into_iter()
+                                    .filter(|argument| {
+                                        argument.slot < 9 && slots & (1 << argument.slot) != 0
+                                    })
+                                    .map(|argument| (argument.range.start, argument.range.end)),
+                            );
+                        }
+                    }
+                    if configured.is_none()
+                        && xparse_bindings.literal(base)
+                        && let Some(arguments) = signature.ranges(source, start..source.len())
+                        && let Some(last) = arguments.last()
+                    {
+                        pos = last.end;
+                        ranges.extend(arguments);
+                        continue;
+                    }
                     let arguments = if let Some(math) = configured
                         .is_none()
                         .then(|| xparse_bindings.math_signature(base))
@@ -4341,7 +5761,59 @@ fn protected_ranges_with_inferred_environments(
                 }
 
                 conditional_bindings.observe_with_uncertainty(source, name, end, config, uncertain);
+                if matches!(base, "endinput" | "bye")
+                    && active_conditions.is_empty()
+                    && catcode_scopes.is_empty()
+                    && !xparse_bindings.contains(false, base)
+                    && !config.syntax.commands.contains_key(base)
+                {
+                    let suffix = if base == "endinput" {
+                        line_end(source, end)
+                    } else {
+                        end
+                    };
+                    if suffix < source.len() {
+                        ranges.push(suffix..source.len());
+                    }
+                    input_end = suffix;
+                    pos = end;
+                    continue;
+                }
+                if let Some(arguments) = message_data_arguments(source, name, end) {
+                    pos = arguments.last().expect("message arguments").end;
+                    for argument in arguments {
+                        let content = if source.as_bytes()[argument.start] == b'{' {
+                            argument.start + 1..argument.end - 1
+                        } else {
+                            argument
+                        };
+                        if !content.is_empty() {
+                            ranges.push(content);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(finish) = primitive_data_end(source, name, end) {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
+                if let Some(data) = case_test_data(source, name, end) {
+                    delayed_key_ranges
+                        .extend(data.into_iter().map(|range| (range.start, range.end)));
+                }
+                delayed_key_ranges.extend(
+                    terminal_argument_branches(source, name, end)
+                        .into_iter()
+                        .map(|range| (range.start, range.end)),
+                );
+                if name == "else"
+                    && !active_conditions.is_empty()
+                    && let Some(finish) = terminal_else_branch(source, end)
+                {
+                    delayed_key_ranges.insert(end, finish);
+                }
+                if let Some(finish) = conditional_choice_end(source, name, end) {
                     ranges.push(pos..finish);
                     pos = finish;
                     continue;
@@ -4394,6 +5866,18 @@ fn protected_ranges_with_inferred_environments(
                     continue;
                 }
                 if !config.syntax.commands.contains_key(base)
+                    && !package_commands_redefined.contains(base)
+                    && let Some(declaration) =
+                        crate::package_environments::verbatim_declaration(source, base, end)
+                {
+                    for name in declaration.names {
+                        package_verbatim.insert(name, declaration.terminator);
+                    }
+                    ranges.push(pos..declaration.end);
+                    pos = declaration.end;
+                    continue;
+                }
+                if !config.syntax.commands.contains_key(base)
                     && if crate::packages::has_scoped_command_data(base) {
                         !visual_overrides.contains(base)
                     } else {
@@ -4441,7 +5925,11 @@ fn protected_ranges_with_inferred_environments(
                                 if config.protect.dynamic_catcodes
                                     && matches!(
                                         command,
-                                        "catcode" | "obeyspaces" | "obeylines" | "scantokens"
+                                        "catcode"
+                                            | "obeyspaces"
+                                            | "obeylines"
+                                            | "scantokens"
+                                            | "endlinechar"
                                     )
                                     || config.protect.expl3 && command == "ExplSyntaxOn"
                                 {
@@ -4626,6 +6114,12 @@ fn protected_ranges_with_inferred_environments(
                     || conditional_bindings.meaning(executed_name, config),
                     |(meaning, _)| meaning,
                 );
+                if meaning == ConditionalMeaning::Ordinary
+                    && !conditional_bindings.assigned(executed_name)
+                    && inferred_condition(executed_name, source, executed_end)
+                {
+                    meaning = ConditionalMeaning::Other;
+                }
                 if meaning == ConditionalMeaning::Unless {
                     pending_unless = true;
                     pos = executed_end;
@@ -4737,6 +6231,15 @@ fn protected_ranges_with_inferred_environments(
                     pos = finish;
                     continue;
                 }
+                if !config.syntax.commands.contains_key(base)
+                    && !xparse_bindings.contains(false, base)
+                    && let Some(finish) =
+                        crate::packages::references::preprocessed_reference_end(source, base, end)
+                {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
                 if config
                     .protect
                     .commands
@@ -4753,26 +6256,70 @@ fn protected_ranges_with_inferred_environments(
                     pos = finish;
                     continue;
                 }
-                if config.protect.expl3 && name == "ExplSyntaxOn"
+                // With the native printer on, keep enclosing branches visible
+                // when an expl3 switch can cross their boundaries.
+                if config.protect.expl3
+                    && executed_name == "ExplSyntaxOn"
+                    && (!config.code.expl3 || active_conditions.is_empty())
                     || config.protect.dynamic_catcodes
-                        && (matches!(name, "catcode" | "obeyspaces" | "obeylines" | "scantokens")
-                            || crate::packages::code::catcode_value(name).is_some())
+                        && (matches!(
+                            executed_name,
+                            "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+                        ) || crate::packages::code::catcode_value(executed_name).is_some())
                 {
                     let mut closed_scope = false;
                     let finish = dynamic_catcode_end(
                         source,
-                        name,
-                        end,
+                        executed_name,
+                        executed_end,
                         catcode_scopes.last().map(|scope| scope.0.as_str()),
                         global_catcode,
                         !xparse_bindings.contains(false, "active"),
                         &mut closed_scope,
                     );
-                    let message = match name {
+                    if executed_name == "ExplSyntaxOn" {
+                        // Literal factories in a preserved expl3 preamble still
+                        // establish readers used by the following document.
+                        let mut cursor = executed_end;
+                        while cursor < finish {
+                            if source.as_bytes()[cursor] == b'%' {
+                                cursor = line_end(source, cursor);
+                            } else if let Some((command, after)) = command_at(source, cursor) {
+                                if !package_commands_redefined.contains(command)
+                                    && let Some(declaration) =
+                                        crate::package_environments::verbatim_declaration(
+                                            source, command, after,
+                                        )
+                                    && declaration.end <= finish
+                                {
+                                    for name in declaration.names {
+                                        package_verbatim.insert(name, declaration.terminator);
+                                    }
+                                    cursor = declaration.end;
+                                } else if let Some((delimiter, enable, next)) =
+                                    short_verbatim_declaration(source, command, after)
+                                {
+                                    if enable {
+                                        short_verbatim.insert(delimiter);
+                                    } else {
+                                        short_verbatim.remove(&delimiter);
+                                    }
+                                    cursor = next;
+                                } else {
+                                    cursor = primitive_data_end(source, command, after)
+                                        .or_else(|| delayed_data_end(source, command, after))
+                                        .unwrap_or(after);
+                                }
+                            } else {
+                                cursor += source[cursor..].chars().next().unwrap().len_utf8();
+                            }
+                        }
+                    }
+                    let message = match executed_name {
                         "ExplSyntaxOn" if !config.code.expl3 => Some("expl3 source preserved"),
                         "ExplSyntaxOn" => None,
                         "obeyspaces" => Some("space-sensitive region preserved"),
-                        "obeylines" => Some("line-sensitive region preserved"),
+                        "obeylines" | "endlinechar" => Some("line-sensitive region preserved"),
                         _ => Some("dynamic catcode region preserved"),
                     };
                     if let Some(message) = message
@@ -4784,7 +6331,18 @@ fn protected_ranges_with_inferred_environments(
                             span: pos..end,
                         });
                     }
-                    let start = if closed_scope {
+                    let start = if finish == source.len()
+                        && !global_catcode
+                        && catcode_scopes.first().is_some_and(|scope| {
+                            if scope.0 == "}" {
+                                balanced_end(source, scope.2, b'{', b'}').is_some()
+                            } else {
+                                source[scope.2..].contains(&scope.0)
+                            }
+                        }) {
+                        // Unknown catcodes can hide closing braces of outer scopes.
+                        catcode_scopes.first().map_or(pos, |scope| scope.2)
+                    } else if closed_scope {
                         conditional_bindings.leave();
                         visual_overrides.leave();
                         xparse_bindings.leave();
@@ -4797,6 +6355,11 @@ fn protected_ranges_with_inferred_environments(
                     continue;
                 }
                 if config.protect.macro_bodies
+                    && (config.protect.expl3 || protect_expl3_bodies)
+                    && let Some(body) = expl3_definition_body(source, name, end)
+                {
+                    macro_ranges.push(body);
+                } else if config.protect.macro_bodies
                     && (latex_macro_definition(base)
                         || matches!(base, "def" | "gdef" | "edef" | "xdef" | "newcolumntype"))
                 {
@@ -4842,12 +6405,27 @@ fn protected_ranges_with_inferred_environments(
             if config.syntax.special.is_empty() {
                 let next = memchr::memchr3(b'\\', b'%', b'{', &source.as_bytes()[pos..])
                     .map_or(source.len(), |i| pos + i);
+                let next = memchr::memchr(b'`', &source.as_bytes()[pos..])
+                    .map_or(next, |i| next.min(pos + i));
                 let next = memchr::memchr(b'}', &source.as_bytes()[pos..])
                     .map_or(next, |i| next.min(pos + i));
+                let next = if package_context.at(pos).has_package("codedescribe") {
+                    memchr::memchr(b'!', &source.as_bytes()[pos..])
+                        .map_or(next, |i| next.min(pos + i))
+                } else {
+                    next
+                };
                 let next = delayed_key_ranges
                     .range(pos..)
                     .next()
                     .map_or(next, |(&start, _)| next.min(start));
+                let next = short_verbatim
+                    .iter()
+                    .filter_map(|&delimiter| {
+                        source[pos..].find(delimiter).map(|offset| pos + offset)
+                    })
+                    .min()
+                    .map_or(next, |offset| next.min(offset));
                 pos = macro_ranges
                     .last()
                     .filter(|r| r.start >= pos)
@@ -5060,6 +6638,15 @@ fn lex_with_constructed_commands(
                     } else {
                         TokenKind::EndEnvironment
                     }
+                } else if model.is_some_and(|model| model.inline_math_shift_at(pos)) {
+                    pos = command_at(source, pos).expect("math shift alias").1;
+                    dollar_mode = if dollar_mode == Some(1) {
+                        None
+                    } else {
+                        Some(1)
+                    };
+                    pending_text_mode = false;
+                    TokenKind::Math
                 } else if let Some((_, begin, end)) = env_at(source, pos) {
                     pos = end;
                     pending_text_mode = false;
@@ -5502,6 +7089,54 @@ pub(crate) fn blocks_from_tokens(
     )
 }
 
+type BoundaryPairs = Vec<(usize, usize)>;
+
+fn scoped_pairs(events: &[(usize, bool, Option<usize>)]) -> (BoundaryPairs, BoundaryPairs) {
+    let mut local_pairs = Vec::new();
+    let mut unmatched_open = Vec::new();
+    let mut unmatched_close = Vec::new();
+    let mut stacks = HashMap::<Option<usize>, Vec<usize>>::new();
+
+    for &(position, is_open, owner) in events {
+        if is_open {
+            stacks.entry(owner).or_default().push(position);
+        } else if let Some(open) = stacks.get_mut(&owner).and_then(Vec::pop) {
+            local_pairs.push((open, position));
+        } else {
+            unmatched_close.push((position, owner));
+        }
+    }
+
+    for (owner, opens) in stacks {
+        unmatched_open.extend(opens.into_iter().map(|position| (position, owner)));
+    }
+    unmatched_open.sort_by_key(|(position, _)| *position);
+    unmatched_close.sort_by_key(|(position, _)| *position);
+
+    let mut cross_pairs = Vec::new();
+    let mut used_closes = HashSet::new();
+    // Only infer fragments inside braced source. Top-level errors must still
+    // be diagnosed, even if a stored argument contains the opposite delimiter.
+    for (open, open_owner) in unmatched_open
+        .into_iter()
+        .filter_map(|(open, owner)| Some((open, owner?)))
+    {
+        if let Some((index, &(close, _close_owner))) =
+            unmatched_close
+                .iter()
+                .enumerate()
+                .find(|(index, (_, owner))| {
+                    owner.is_some_and(|owner| owner != open_owner) && !used_closes.contains(index)
+                })
+        {
+            used_closes.insert(index);
+            cross_pairs.push((open, close));
+        }
+    }
+
+    (local_pairs, cross_pairs)
+}
+
 fn parse_blocks_from_tokens<S: NameStore>(
     source: &str,
     config: &crate::CompiledConfig,
@@ -5517,8 +7152,73 @@ fn parse_blocks_from_tokens<S: NameStore>(
     let mut new_if = false;
     let mut known_conditions: HashSet<String> =
         config.config.syntax.conditions.iter().cloned().collect();
+    let mut case_list_delimiters = HashSet::new();
     let mut conditional_bindings = ConditionalBindings::default();
     let mut condition_meanings = HashMap::new();
+    let mut condition_scopes = HashMap::<usize, Option<usize>>::new();
+    let mut deferred_ranges: Vec<Range<usize>> = analysis
+        .model()
+        .declarations()
+        .iter()
+        .map(|declaration| declaration.body.clone())
+        .collect();
+    let mut literal_ranges = Vec::new();
+    let mut prior_literals = std::collections::BTreeMap::<usize, usize>::new();
+    let mut reverse_if_condition_arguments = HashMap::<usize, Range<usize>>::new();
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == TokenKind::Command)
+    {
+        if prior_literals
+            .range(..=token.span.start)
+            .next_back()
+            .is_some_and(|(_, &end)| token.span.start < end)
+        {
+            continue;
+        }
+        let Some((name, end)) = command_at(source, token.span.start) else {
+            continue;
+        };
+        if !expansion_precedes(source, token.span.start)
+            && let Some(call) = crate::code_layout::expl3::parse_call(source, name, end)
+        {
+            for (slot, argument) in call.arguments.iter().enumerate() {
+                if crate::code_layout::expl3::is_code_argument(
+                    &call,
+                    slot,
+                    call.signature.as_bytes()[slot],
+                ) {
+                    deferred_ranges.push(argument.range.clone());
+                    if call.base == "reverse_if"
+                        && slot == 0
+                        && call.signature.as_bytes()[slot] == b'N'
+                        && let Some((condition, _)) = command_at(source, argument.range.start)
+                        && is_condition_command(condition, &config.config)
+                    {
+                        reverse_if_condition_arguments
+                            .insert(argument.range.start, argument.range.clone());
+                    }
+                } else if !(call.signature.as_bytes()[slot] == b'N'
+                    && argument.range.len() == 1
+                    && matches!(
+                        source.as_bytes().get(argument.range.start),
+                        Some(b'{' | b'}')
+                    ))
+                {
+                    prior_literals.insert(argument.range.start, argument.range.end);
+                    literal_ranges.push(argument.range.clone());
+                }
+            }
+        }
+    }
+    deferred_ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    deferred_ranges.dedup();
+    literal_ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    literal_ranges.dedup();
+    let mut active_deferred = Vec::new();
+    let mut next_deferred = 0;
+    let mut active_literal = Vec::new();
+    let mut next_literal = 0;
     let mut list_environments: HashSet<String> = config
         .config
         .syntax
@@ -5539,17 +7239,164 @@ fn parse_blocks_from_tokens<S: NameStore>(
     let mut loop_conditions: HashMap<usize, usize> = HashMap::new();
     let mut configured_headers: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
     let mut environment_ends = HashMap::new();
-    let mut environments = Vec::new();
+    let mut environment_headers = Vec::<usize>::new();
+    let mut brace_groups = Vec::new();
+    let mut cross_argument_environments = HashSet::new();
+    let mut cross_argument_control_groups = HashSet::new();
+    let mut cross_argument_math = HashSet::new();
+    let mut environment_events = HashMap::<String, Vec<(usize, bool, Option<usize>)>>::new();
+    let mut control_group_events = HashMap::<&str, Vec<(usize, bool, Option<usize>)>>::new();
+    let mut math_events = HashMap::<usize, Vec<(usize, bool, Option<usize>)>>::new();
+    let mut math_next_is_open = HashMap::<usize, bool>::new();
     for token in tokens {
-        if token.kind == TokenKind::BeginEnvironment {
-            environments.push(token.span.start);
-        } else if token.kind == TokenKind::EndEnvironment
-            && let Some(start) = environments.pop()
+        while environment_headers
+            .last()
+            .is_some_and(|&end| token.span.start >= end)
         {
-            environment_ends.insert(start, token.span.start);
+            environment_headers.pop();
+        }
+        let brace_owner = brace_groups.last().copied();
+        match token.kind {
+            TokenKind::BeginEnvironment => {
+                let (name, _, _) = token.environment_at(source).expect("environment token");
+                environment_events
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push((token.span.start, true, brace_owner));
+                let start = skip_trivia(source, token.span.end);
+                if source.as_bytes().get(start) == Some(&b'[')
+                    && let Some(end) = balanced_end(source, start, b'[', b']')
+                    && crate::packages::header_signature(name)
+                        .is_some_and(|shape| shape.starts_with('o'))
+                {
+                    environment_headers.push(end);
+                }
+            }
+            TokenKind::EndEnvironment => {
+                let (name, _, _) = token.environment_at(source).expect("environment token");
+                if !environment_headers.is_empty() {
+                    cross_argument_environments.insert(token.span.start);
+                    continue;
+                }
+                environment_events
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push((token.span.start, false, brace_owner));
+            }
+            TokenKind::OpenBrace => brace_groups.push(token.span.start),
+            TokenKind::CloseBrace => {
+                brace_groups.pop();
+            }
+            TokenKind::Math => {
+                let width = token.span.len();
+                let is_open = *math_next_is_open.entry(width).or_insert(true);
+                math_next_is_open.insert(width, !is_open);
+                math_events.entry(width).or_default().push((
+                    token.span.start,
+                    is_open,
+                    brace_owner,
+                ));
+            }
+            TokenKind::Command => {
+                if let Some((name, _)) = command_at(source, token.span.start) {
+                    match if analysis.model().opens_group_at(token.span.start) {
+                        "begingroup"
+                    } else {
+                        conditions::canonical_condition_control(name.trim_end_matches('*'))
+                    } {
+                        "begingroup" => control_group_events.entry("group").or_default().push((
+                            token.span.start,
+                            true,
+                            brace_owner,
+                        )),
+                        "endgroup" => control_group_events.entry("group").or_default().push((
+                            token.span.start,
+                            false,
+                            brace_owner,
+                        )),
+                        "bgroup" => control_group_events.entry("brace").or_default().push((
+                            token.span.start,
+                            true,
+                            brace_owner,
+                        )),
+                        "egroup" => control_group_events.entry("brace").or_default().push((
+                            token.span.start,
+                            false,
+                            brace_owner,
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for events in environment_events.values() {
+        let (local_pairs, cross_pairs) = scoped_pairs(events);
+        for (start, end) in local_pairs {
+            environment_ends.insert(start, end);
+        }
+        for (start, end) in cross_pairs {
+            cross_argument_environments.insert(start);
+            cross_argument_environments.insert(end);
+        }
+    }
+    for events in control_group_events.values() {
+        let (_, cross_pairs) = scoped_pairs(events);
+        for (start, end) in cross_pairs {
+            cross_argument_control_groups.insert(start);
+            cross_argument_control_groups.insert(end);
+        }
+    }
+    for events in math_events.values() {
+        let (_, cross_pairs) = scoped_pairs(events);
+        for (start, end) in cross_pairs {
+            cross_argument_math.insert(start);
+            cross_argument_math.insert(end);
         }
     }
     for token in tokens {
+        while next_literal < literal_ranges.len()
+            && literal_ranges[next_literal].start <= token.span.start
+        {
+            if literal_ranges[next_literal].end > token.span.start {
+                active_literal.push(next_literal);
+            }
+            next_literal += 1;
+        }
+        active_literal.retain(|&region| literal_ranges[region].end > token.span.start);
+        if !active_literal.is_empty() {
+            pending = None;
+            continue;
+        }
+        while next_deferred < deferred_ranges.len()
+            && deferred_ranges[next_deferred].start <= token.span.start
+        {
+            if deferred_ranges[next_deferred].end > token.span.start {
+                active_deferred.push(next_deferred);
+            }
+            next_deferred += 1;
+        }
+        active_deferred.retain(|&region| deferred_ranges[region].end > token.span.start);
+        let deferred_scope = active_deferred.last().copied();
+        let expired: Vec<usize> = condition_scopes
+            .iter()
+            .filter_map(|(&condition, scope)| {
+                scope
+                    .filter(|&scope| deferred_ranges[scope].end <= token.span.start)
+                    .map(|_| condition)
+            })
+            .collect();
+        for condition in expired {
+            let scope = condition_scopes
+                .remove(&condition)
+                .flatten()
+                .expect("expired deferred condition");
+            let end = deferred_ranges[scope].end;
+            stack.retain(|&open| open != condition);
+            blocks[condition].body.end = end;
+            blocks[condition].end = end..end;
+        }
         let parent = stack.last().copied();
         macro_rules! add {
             ($kind:expr, $name:expr, $parent:expr) => {{
@@ -5569,6 +7416,14 @@ fn parse_blocks_from_tokens<S: NameStore>(
         match token.kind {
             TokenKind::BeginEnvironment => {
                 let (name, _, _) = token.environment_at(source).expect("environment token");
+                if cross_argument_environments.contains(&token.span.start) {
+                    pending = None;
+                    continue;
+                }
+                if dynamic_environment_name(name) {
+                    pending = None;
+                    continue;
+                }
                 let i = add!(BlockKind::Environment, names.make(name), parent);
                 if let Some(rule) = config
                     .config
@@ -5657,6 +7512,14 @@ fn parse_blocks_from_tokens<S: NameStore>(
             }
             TokenKind::EndEnvironment => {
                 let (name, _, _) = token.environment_at(source).expect("environment token");
+                if cross_argument_environments.contains(&token.span.start) {
+                    pending = None;
+                    continue;
+                }
+                if dynamic_environment_name(name) {
+                    pending = None;
+                    continue;
+                }
                 let position = stack
                     .iter()
                     .rposition(|&i| blocks[i].kind != BlockKind::Condition)
@@ -5669,8 +7532,11 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 let i = stack.remove(position);
                 if blocks[i].kind != BlockKind::Environment || blocks[i].name != name {
                     return Err(FormatError::Syntax(format!(
-                        "mismatched \\end{{{name}}} at byte {}",
-                        token.span.start
+                        "mismatched \\end{{{name}}} at byte {}; innermost open {} {:?} starts at byte {}",
+                        token.span.start,
+                        blocks[i].kind.category(),
+                        blocks[i].name,
+                        blocks[i].begin.start
                     )));
                 }
                 blocks[i].body.end = token.span.start;
@@ -5679,6 +7545,9 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 pending = None;
             }
             TokenKind::OpenBrace | TokenKind::OpenBracket => {
+                if case_list_delimiters.remove(&token.span.start) {
+                    continue;
+                }
                 if token.kind == TokenKind::OpenBrace {
                     conditional_bindings.enter();
                 }
@@ -5747,7 +7616,10 @@ fn parse_blocks_from_tokens<S: NameStore>(
                                     })
                             })
                         else {
-                            return true;
+                            // Infer a balanced option for an unknown command
+                            // without consuming tokens beyond its TeX group.
+                            return token.kind == TokenKind::OpenBrace
+                                || math_optional_argument_end(source, token.span.start).is_some();
                         };
                         if token.kind == TokenKind::OpenBracket {
                             rule.optional_arguments
@@ -5833,6 +7705,9 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 pending = None;
             }
             TokenKind::CloseBrace | TokenKind::CloseBracket => {
+                if case_list_delimiters.remove(&token.span.start) {
+                    continue;
+                }
                 let structural_position = stack
                     .iter()
                     .rposition(|&i| blocks[i].kind != BlockKind::Condition);
@@ -5857,9 +7732,13 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         || blocks[i].kind == BlockKind::Group && blocks[i].name == "bgroup"
                 };
                 if !correct {
+                    let opening = source.as_bytes()[blocks[i].begin.start] as char;
                     return Err(FormatError::Syntax(format!(
-                        "mismatched closing delimiter at byte {}",
-                        token.span.start
+                        "mismatched closing delimiter at byte {}; innermost open {} block starts with {:?} at byte {}",
+                        token.span.start,
+                        blocks[i].kind.category(),
+                        opening,
+                        blocks[i].begin.start
                     )));
                 }
                 blocks[i].body.end = token.span.start;
@@ -5892,23 +7771,37 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 let constructed = cached_constructed.or(literal_constructed.as_ref());
                 let (raw_name, raw_end) =
                     command_at(source, token.span.start).expect("command token");
+                if let Some(argument) = token_list_argument_range(source, raw_name, raw_end) {
+                    case_list_delimiters.insert(argument.start);
+                    case_list_delimiters.insert(argument.end - 1);
+                }
                 let name = constructed.map_or(raw_name, |(name, _)| name.as_str());
-                let base = name.trim_end_matches('*');
-                conditional_bindings.observe(
-                    source,
-                    name,
-                    constructed.map_or(raw_end, |(_, finish)| *finish),
-                    &config.config,
-                );
+                let base = if analysis.model().opens_group_at(token.span.start) {
+                    "begingroup"
+                } else {
+                    conditions::canonical_condition_control(name.trim_end_matches('*'))
+                };
+                if cross_argument_control_groups.contains(&token.span.start) {
+                    pending = None;
+                    continue;
+                }
+                if deferred_scope.is_none() {
+                    conditional_bindings.observe(
+                        source,
+                        name,
+                        constructed.map_or(raw_end, |(_, finish)| *finish),
+                        &config.config,
+                    );
+                }
                 let meaning = conditional_bindings.meaning(base, &config.config);
-                if new_if {
+                if new_if && deferred_scope.is_none() {
                     known_conditions.insert(base.into());
                     conditional_bindings.assign(base, ConditionalMeaning::Other, false);
                     new_if = false;
                     pending = None;
                     continue;
                 }
-                if base == "newif" {
+                if base == "newif" && deferred_scope.is_none() {
                     new_if = true;
                     pending = None;
                     continue;
@@ -5980,6 +7873,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         .filter(|&open| {
                             blocks[open].kind == BlockKind::Condition
                                 && blocks[open].begin.start > blocks[i].begin.start
+                                && condition_scopes.get(&open).copied().flatten() == deferred_scope
                         })
                         .collect();
                     let expected = loop_conditions.get(&i).copied().unwrap_or(0) + 1;
@@ -5997,6 +7891,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         )));
                     }
                     let condition = conditions[0];
+                    condition_scopes.remove(&condition);
                     stack.retain(|&open| open != i && open != condition);
                     blocks[condition].body.end = token.span.start;
                     blocks[condition].end = token.span.start..token.span.start;
@@ -6014,18 +7909,24 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         ConditionalMeaning::Or => "or",
                         _ => "fi",
                     };
-                    let position = stack
-                        .iter()
-                        .rposition(|&i| blocks[i].kind == BlockKind::Condition)
-                        .ok_or_else(|| {
-                            FormatError::Syntax(format!(
-                                "unexpected \\{base} at byte {}",
-                                token.span.start
-                            ))
-                        })?;
+                    let position = stack.iter().rposition(|&i| {
+                        blocks[i].kind == BlockKind::Condition
+                            && condition_scopes.get(&i).copied().flatten() == deferred_scope
+                    });
+                    let Some(position) = position else {
+                        if deferred_scope.is_some() {
+                            pending = None;
+                            continue;
+                        }
+                        return Err(FormatError::Syntax(format!(
+                            "unexpected \\{base} at byte {}",
+                            token.span.start
+                        )));
+                    };
                     let i = stack[position];
                     if operation == "fi" {
                         stack.remove(position);
+                        condition_scopes.remove(&i);
                         blocks[i].body.end = token.span.start;
                         blocks[i].end = token.span.clone();
                     } else if operation == "or"
@@ -6070,6 +7971,16 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 {
                     let i = add!(BlockKind::Condition, names.make(name), parent);
                     condition_meanings.insert(i, meaning);
+                    let condition_scope =
+                        match reverse_if_condition_arguments.get(&token.span.start) {
+                            Some(argument) => active_deferred
+                                .iter()
+                                .rev()
+                                .find(|&&scope| deferred_ranges[scope] != *argument)
+                                .copied(),
+                            None => deferred_scope,
+                        };
+                    condition_scopes.insert(i, condition_scope);
                     stack.push(i);
                     pending = None;
                 } else if base == "[" || base == "(" {
@@ -6200,7 +8111,13 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 }
             }
             TokenKind::Math => {
-                let name = if source[token.span.clone()].len() == 2 {
+                if cross_argument_math.contains(&token.span.start) {
+                    pending = None;
+                    continue;
+                }
+                let name = if source[token.span.clone()].len() == 2
+                    && !analysis.model().inline_math_shift_at(token.span.start)
+                {
                     "displayMathTeX"
                 } else {
                     "inlineMath"
@@ -6352,6 +8269,20 @@ fn parse_blocks_from_tokens<S: NameStore>(
             _ => (),
         }
     }
+    let deferred_conditions: Vec<usize> = condition_scopes
+        .iter()
+        .filter_map(|(&condition, scope)| scope.map(|_| condition))
+        .collect();
+    for condition in deferred_conditions {
+        let scope = condition_scopes
+            .remove(&condition)
+            .flatten()
+            .expect("deferred condition scope");
+        let end = deferred_ranges[scope].end;
+        stack.retain(|&open| open != condition);
+        blocks[condition].body.end = end;
+        blocks[condition].end = end..end;
+    }
     if let Some(&i) = stack.last() {
         if let Some(suffix) = opaque_suffix(source, protected, &config.config) {
             // An opaque suffix can contain the closing tokens of the already
@@ -6443,6 +8374,10 @@ fn declaration_reuse_config_supported(config: &Config) -> bool {
             .any(|rule| rule.preserve_body || rule.verbatim)
 }
 
+fn dynamic_environment_name(name: &str) -> bool {
+    name.contains('\\') || name.contains('#')
+}
+
 fn declaration_cross_segment_command(command: &str) -> bool {
     command != "iff" && command.starts_with("if")
         || command.starts_with("@if")
@@ -6459,6 +8394,7 @@ fn declaration_cross_segment_command(command: &str) -> bool {
                 | "catcode"
                 | "obeyspaces"
                 | "obeylines"
+                | "endlinechar"
                 | "scantokens"
                 | "ExplSyntaxOn"
                 | "ExplSyntaxOff"
@@ -6594,7 +8530,7 @@ fn declaration_reuse_boundary_with_ranges(
         let Some((name, end)) = command_at(source, cursor) else {
             return Pending;
         };
-        let base = name.trim_end_matches('*');
+        let base = conditions::canonical_condition_control(name.trim_end_matches('*'));
         if base == "newif" {
             if config.syntax.commands.contains_key(base) {
                 return PolicyRefused;
@@ -6778,7 +8714,7 @@ pub fn declaration_neutral_segment_with_syntax(
         let Some((name, end)) = command_at(source, start) else {
             return false;
         };
-        let base = name.trim_end_matches('*');
+        let base = conditions::canonical_condition_control(name.trim_end_matches('*'));
         let conditional =
             inferred_condition(base, source, end) || matches!(base, "fi" | "else" | "or");
         if context_declaration_command(base)
@@ -6841,7 +8777,7 @@ pub fn declaration_neutral_segment_with_syntax(
                 let Some((name, end)) = command_at(source, token.span.start) else {
                     return false;
                 };
-                let base = name.trim_end_matches('*');
+                let base = conditions::canonical_condition_control(name.trim_end_matches('*'));
                 // The project declaration graph expands loaders only outside
                 // groups, conditions and ordinary environments. Scoped loaders
                 // remain literal source in that graph; they need not invalidate
@@ -6866,7 +8802,7 @@ pub fn declaration_neutral_segment_with_syntax(
                 }
                 if inferred_condition(base, source, end) {
                     conditions.push(NeutralCondition {
-                        case: base == "ifcase",
+                        case: case_condition(base),
                         had_else: false,
                         groups,
                         brackets,

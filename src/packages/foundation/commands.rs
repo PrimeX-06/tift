@@ -236,6 +236,16 @@ fn separated_star(source: &str, name: &str, end: usize) -> bool {
 
 /// Ordered citation notes and delayed macro-patching arguments.
 pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    if name == "setbeamertemplate" {
+        let after_name = syntax::arguments::signature_end(source, end, "m")?;
+        return Some(
+            if source.as_bytes().get(trivia(source, after_name)) == Some(&b'[') {
+                "mo"
+            } else {
+                "mm"
+            },
+        );
+    }
     if let Some(shape) = stored_kernel_signature(name) {
         return Some(shape);
     }
@@ -248,15 +258,18 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
                 "oom"
             }
         }
-        "patchcmd" => "ommmmm",
-        "apptocmd" | "pretocmd" => "ommmm",
+        "patchcmd" | "xpatchcmd" => "ommmmm",
+        "@ifundefined" | "@ifpackageloaded" | "@ifclassloaded" => "mmm",
+        "@ifpackagewith" | "@ifclasswith" => "mmmm",
+        "apptocmd" | "pretocmd" | "xapptocmd" | "xpretocmd" => "ommmm",
         "appto" | "preto" => "mm",
         "ifpatchable" if separated => "mmmm",
         "ifpatchable" if name.ends_with('*') => "mmm",
         "ifpatchable" => "mmmm",
         // etoolbox.sty:130ff: one tested token/name, then two branch arguments.
-        "ifundef" | "ifcsundef" | "ifdef" | "ifcsdef" | "ifdefvoid" | "ifcsvoid" | "ifdefempty"
-        | "ifcsempty" | "ifblank" | "ifstrempty" | "iftoggle" | "ifbool" => "mmm",
+        "notbool" | "nottoggle" | "ifundef" | "ifcsundef" | "ifdef" | "ifcsdef" | "ifdefvoid"
+        | "ifcsvoid" | "ifdefempty" | "ifcsempty" | "ifblank" | "ifstrempty" | "iftoggle"
+        | "ifbool" => "mmm",
         "ifstrequal" | "ifdefequal" | "ifcsequal" | "ifdefstring" | "ifcsstring" => "mmmm",
         "ifnumcomp" | "ifdimcomp" => "mmmmm",
         // KOMA-Script TOC hooks; titling.sty title/author/date hooks.
@@ -278,6 +291,15 @@ pub(crate) fn is_metadata_command(name: &str) -> bool {
         || matches!(
             name.trim_end_matches('*'),
             "patchcmd"
+                | "@ifundefined"
+                | "@ifpackageloaded"
+                | "@ifclassloaded"
+                | "@ifpackagewith"
+                | "@ifclasswith"
+                | "xpatchcmd"
+                | "xapptocmd"
+                | "xpretocmd"
+                | "setbeamertemplate"
                 | "apptocmd"
                 | "pretocmd"
                 | "appto"
@@ -305,18 +327,37 @@ pub(crate) fn is_metadata_command(name: &str) -> bool {
 /// Deferred hooks and patches have a different effect even though their stored
 /// arguments are opaque while the registration command itself is parsed.
 pub(crate) fn is_recording_command(name: &str) -> bool {
-    matches!(name, "lily" | "lilypond")
+    matches!(
+        name,
+        "lily"
+            | "lilypond"
+            | "fakeverb"
+            | "DescribeMacro"
+            | "DescribeEnv"
+            | "index"
+            | "sindex"
+            | "indexentry"
+    )
 }
 
 /// Search/replacement tokens and appended code retain their source bytes.
 /// Immediate success/failure branches remain available for nested formatting.
 pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if name == "setbeamertemplate" {
+        return syntax::arguments::signature_end(
+            source,
+            end,
+            command_signature(source, name, end)?,
+        );
+    }
     if let Some(shape) = stored_kernel_signature(name) {
         return crate::syntax::arguments::signature_end(source, end, shape);
     }
     let shape = match name.trim_end_matches('*') {
-        "patchcmd" => "ommm",
-        "apptocmd" | "pretocmd" => "omm",
+        "patchcmd" | "xpatchcmd" => "ommm",
+        "@ifundefined" | "@ifpackageloaded" | "@ifclassloaded" => "m",
+        "@ifpackagewith" | "@ifclasswith" => "mm",
+        "apptocmd" | "pretocmd" | "xapptocmd" | "xpretocmd" => "omm",
         "appto" | "preto" => "mm",
         "ifpatchable" if separated_star(source, name, end) => "mm",
         "ifpatchable" if name.ends_with('*') => "m",
@@ -335,9 +376,75 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
 }
 
 fn stored_kernel_signature(name: &str) -> Option<&'static str> {
-    match name {
+    match name.trim_end_matches('*') {
         // The kernel stores this control-sequence name in its preamble list.
         "@onlypreamble" => Some("m"),
+        "xintdefinfix" => Some("mmmmm"),
+        // beamerbasetemplates.sty:51--63 stores the template body after
+        // its element/name, argument count and optional default value.
+        "defbeamertemplate" => Some("mmoom"),
+        "markdownSetup" => Some("m"),
+        "DeclareOptionX" => Some("mom"),
+        // Hook registrations store their replacement text for a later run.
+        "AddToHook" | "AddToHookNext" | "AddToHookWithArguments" => Some("mom"),
+        "AtBeginDocument"
+        | "AtEndDocument"
+        | "AtEndOfPackage"
+        | "AtEndOfClass"
+        | "AfterEndPreamble"
+        | "AtEndPreamble"
+        | "BeforeBeginEnvironment"
+        | "AfterEndEnvironment" => Some(if name.ends_with("Environment") {
+            "mm"
+        } else {
+            "m"
+        }),
+        "hook_gput_code:nnn" | "hook_gput_next_code:nn" => Some(if name == "hook_gput_code:nnn" {
+            "mmm"
+        } else {
+            "mm"
+        }),
+        "titlecontents" => Some("mommmmo"),
+        // biblatex's declaration languages contain replacement tokens and
+        // regular expressions whose dollar signs are ordinary source data.
+        "DeclareSourcemap" | "DeclareStyleSourcemap" => Some("m"),
+        "defbibheading" => Some("mom"),
+        "defbibenvironment" => Some("mmmm"),
+        "defbibfilter" | "defbibcheck" | "defbibnote" => Some("mm"),
+        "KOMA@key" => Some("mom"),
+        "FamilyKey" => Some("ommm"),
+        "TOCEntryStyleStartInitCode" | "TOCEntryStyleInitCode" | "TOCEntryStyleEndInitCode" => {
+            Some("mm")
+        }
+        "owneroftoc" => Some("om"),
+        "DeclareNewLayer" | "DeclareLayer" | "RedeclareLayer" => Some("om"),
+        "AtBeginSection" | "AtBeginSubsection" | "AtBeginSubsubsection" => Some("om"),
+        "ekvdefinekeys" => Some("mm"),
+        "changemenuelement" => Some("mmm"),
+        "DeclareSubstanceProperty" => Some("moo"),
+        "algblockdefx" => Some("ommoomoom"),
+        "algcblockdefx" => Some("ommmoomoom"),
+        "algcdefx" => Some("ommmoom"),
+        "pdfstringdefDisableCommands" => Some("m"),
+        "fakeverb" => Some("m"),
+        "tsobj" => Some("om"),
+        "tsmacro" => Some("omm"),
+        "NoDescribeMacro" | "DescribeMacro" | "DescribeEnv" => Some("m"),
+        "DeclarePairedDelimiter" => Some("mmm"),
+        "DeclarePairedDelimiterX" => Some("mommm"),
+        "DeclarePairedDelimiterXPP" => Some("mommmmm"),
+        "reDeclarePairedDelimiterInnerWrapper" => Some("mmm"),
+        "displaycmd" => Some("mm"),
+        "NewPitonEnvironment" | "RenewPitonEnvironment" => Some("mmmm"),
+        "DeclareTextCommandDefault" | "ProvideTextCommandDefault" => Some("moom"),
+        "DeclareTextCommand" | "ProvideTextCommand" => Some("mmoom"),
+        "plIncludeInRelease" | "IncludeInRelease" => Some("mmm"),
+        "DeclareTemplateInterface" => Some("mmmm"),
+        "DeclareTemplateCode" => Some("mmmmm"),
+        "SetForm" => Some("mmm"),
+        "makeoddfoot" | "makeevenfoot" | "makeoddhead" | "makeevenhead" => Some("mmmm"),
+        // xpatch's named-format append/prepend operations store their patch.
+        "xapptonameformat" | "xpretonameformat" | "xapptobibmacro" | "xpretobibmacro" => Some("mm"),
         _ => None,
     }
 }

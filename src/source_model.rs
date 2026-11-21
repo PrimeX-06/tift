@@ -82,6 +82,9 @@ pub struct Conditional {
 #[derive(Debug, Clone)]
 enum Replacement {
     Boundary(EnvironmentAlias),
+    GroupBegin,
+    InlineMathShift,
+    ConstructedWrapper(String),
     Forward(String),
     /// Literal boundaries balance, provided the supplied arguments do too.
     NeutralWrapper,
@@ -95,13 +98,62 @@ struct Binding {
     signature: Option<EnvironmentArguments>,
     condition: Option<String>,
     literal_arguments: bool,
+    literal_slots: u16,
     math_signature: Option<(&'static str, &'static str)>,
+    global: bool,
+}
+
+type ConditionalProofs = HashMap<
+    usize,
+    HashMap<String, BTreeMap<usize, (Option<EnvironmentArguments>, u16, bool, bool)>>,
+>;
+
+fn join_conditional_data(
+    source: &str,
+    at: usize,
+    branches: &[Range<usize>],
+    proofs: &mut ConditionalProofs,
+    bindings: &mut HashMap<String, Binding>,
+) {
+    let Some(names) = proofs.remove(&at) else {
+        return;
+    };
+    if !branches.last().is_some_and(|range| {
+        syntax::command_at(source, range.end).is_some_and(|(name, _)| name == "else")
+    }) {
+        return;
+    }
+    for (name, variants) in names {
+        if variants.len() != branches.len() + 1 {
+            continue;
+        }
+        let Some(Some(signature)) = variants
+            .first_key_value()
+            .map(|(_, value)| value.0.as_ref())
+        else {
+            continue;
+        };
+        if variants
+            .values()
+            .any(|(other, _, _, candidate)| *candidate || other.as_ref() != Some(signature))
+        {
+            continue;
+        }
+        if let Some(binding) = bindings.get_mut(&name) {
+            binding.signature = Some(signature.clone());
+            binding.literal_arguments = variants.values().all(|(_, _, literal, _)| *literal);
+            binding.literal_slots = variants
+                .values()
+                .fold(u16::MAX, |mask, (_, slots, _, _)| mask & slots);
+        }
+    }
 }
 
 struct SourceImportEvent {
     at: usize,
     aliases: BTreeMap<String, Option<EnvironmentAlias>>,
     arguments: BTreeMap<String, Option<EnvironmentArguments>>,
+    commands: BTreeMap<String, crate::config::ImportedCommand>,
 }
 
 /// Owned, immutable text with a complete lexical partition and semantic index.
@@ -119,9 +171,12 @@ pub struct SourceModel {
     conditionals: Vec<Conditional>,
     rules: Vec<SyntaxRule>,
     boundaries: HashMap<usize, EnvironmentAlias>,
+    group_openers: HashSet<usize>,
+    inline_math_shifts: HashSet<usize>,
     exported: BTreeMap<String, EnvironmentAlias>,
     exported_unknown: HashSet<String>,
     exported_environments: BTreeMap<String, Option<EnvironmentArguments>>,
+    exported_commands: BTreeMap<String, crate::config::ImportedCommand>,
     registry: HashMap<String, SyntaxRule>,
     invocations: HashMap<usize, SyntaxRule>,
     invocation_arguments: HashMap<usize, Vec<syntax::xparse::ArgumentSlot>>,
@@ -186,35 +241,16 @@ impl SourceModel {
                     };
                     match structure {
                         Ok(structure) => {
-                            let mut open = Vec::new();
-                            for token in &structure.0 {
-                                match token.kind {
-                                    syntax::TokenKind::OpenBrace => open.push(token.span.clone()),
-                                    syntax::TokenKind::CloseBrace => {
-                                        open.pop();
-                                    }
-                                    syntax::TokenKind::Command => {
-                                        if let Some((name, _)) =
-                                            syntax::command_at(source, token.span.start)
-                                        {
-                                            if matches!(name, "bgroup" | "begingroup") {
-                                                open.push(token.span.clone());
-                                            } else if matches!(name, "egroup" | "endgroup") {
-                                                open.pop();
-                                            }
-                                        }
-                                    }
-                                    _ => (),
+                            // Use the structural groups: literal operands and
+                            // groups paired across arguments are already resolved.
+                            for block in &structure.1 {
+                                if block.kind == syntax::BlockKind::Group && block.end.is_empty() {
+                                    model.diagnostics.push(Diagnostic {
+                                        severity: Severity::Error,
+                                        message: "Unclosed group before an opaque region; source retained".into(),
+                                        span: block.begin.clone(),
+                                    });
                                 }
-                            }
-                            for span in open {
-                                model.diagnostics.push(Diagnostic {
-                                    severity: Severity::Error,
-                                    message:
-                                        "Unclosed group before an opaque region; source retained"
-                                            .into(),
-                                    span,
-                                });
                             }
                             model.structure = Some(structure);
                         }
@@ -304,6 +340,7 @@ impl SourceModel {
     fn import_events(&self, config: &Config) -> Vec<SourceImportEvent> {
         if config.syntax.environment_alias_events.is_empty()
             && config.syntax.environment_argument_events.is_empty()
+            && config.syntax.command_import_events.is_empty()
         {
             return Vec::new();
         }
@@ -337,6 +374,7 @@ impl SourceModel {
                     at,
                     aliases: event.aliases.clone(),
                     arguments: BTreeMap::new(),
+                    commands: BTreeMap::new(),
                 });
             }
         }
@@ -346,11 +384,66 @@ impl SourceModel {
                     at,
                     aliases: BTreeMap::new(),
                     arguments: event.arguments.clone(),
+                    commands: BTreeMap::new(),
+                });
+            }
+        }
+        for event in &config.syntax.command_import_events {
+            if let Some(at) = offset(event.at, &event.loader) {
+                result.push(SourceImportEvent {
+                    at,
+                    aliases: BTreeMap::new(),
+                    arguments: BTreeMap::new(),
+                    commands: event.commands.clone(),
                 });
             }
         }
         result.sort_by_key(|event| event.at);
-        result
+        let mut merged: Vec<SourceImportEvent> = Vec::new();
+        for event in result {
+            if let Some(previous) = merged.last_mut().filter(|previous| previous.at == event.at) {
+                previous.aliases.extend(event.aliases);
+                previous.arguments.extend(event.arguments);
+                previous.commands.extend(event.commands);
+            } else {
+                merged.push(event);
+            }
+        }
+        merged
+    }
+
+    pub(crate) fn command_imports(
+        source: &str,
+        config: &Config,
+    ) -> Vec<crate::config::CommandImportEvent> {
+        let loaders: HashMap<_, _> = Self::loader_occurrences(source)
+            .into_iter()
+            .map(|(at, key)| (key, at))
+            .collect();
+        config
+            .syntax
+            .command_import_events
+            .iter()
+            .filter_map(|event| {
+                let mut event = event.clone();
+                if let Some(loader) = &event.loader {
+                    let start = *loaders.get(loader)?;
+                    let (_, end) = syntax::command_at(source, start)?;
+                    let mut cursor = skip(source, end);
+                    if source.as_bytes().get(cursor) == Some(&b'[') {
+                        cursor = skip(source, syntax::balanced_end(source, cursor, b'[', b']')?);
+                    }
+                    event.at = if source.as_bytes().get(cursor) == Some(&b'{') {
+                        syntax::balanced_end(source, cursor, b'{', b'}')?
+                    } else {
+                        source[cursor..]
+                            .find(|c: char| c.is_whitespace() || "%{}".contains(c))
+                            .map_or(source.len(), |n| cursor + n)
+                    };
+                }
+                Some(event)
+            })
+            .collect()
     }
 
     pub(crate) fn with_ranges(source: &str, config: &Config, ranges: &[Range<usize>]) -> Self {
@@ -368,9 +461,12 @@ impl SourceModel {
             conditionals: Vec::new(),
             rules: Vec::new(),
             boundaries: HashMap::new(),
+            group_openers: HashSet::new(),
+            inline_math_shifts: HashSet::new(),
             exported: BTreeMap::new(),
             exported_unknown: HashSet::new(),
             exported_environments: BTreeMap::new(),
+            exported_commands: BTreeMap::new(),
             registry: HashMap::new(),
             invocations: HashMap::new(),
             invocation_arguments: HashMap::new(),
@@ -463,6 +559,12 @@ impl SourceModel {
     pub fn boundary_at(&self, at: usize) -> Option<&EnvironmentAlias> {
         self.boundaries.get(&at)
     }
+    pub(crate) fn opens_group_at(&self, at: usize) -> bool {
+        self.group_openers.contains(&at)
+    }
+    pub(crate) fn inline_math_shift_at(&self, at: usize) -> bool {
+        self.inline_math_shifts.contains(&at)
+    }
     pub fn command_arguments(&self, name: &str) -> Option<&EnvironmentArguments> {
         match &self.registry.get(name)?.meaning {
             RuleMeaning::Arguments(arguments) => Some(arguments),
@@ -516,6 +618,10 @@ impl SourceModel {
     pub fn exported_packages(&self) -> BTreeMap<String, bool> {
         self.context.export_packages()
     }
+    #[doc(hidden)]
+    pub fn exported_commands(&self) -> &BTreeMap<String, crate::config::ImportedCommand> {
+        &self.exported_commands
+    }
     pub fn opaque_ranges(&self) -> &[Range<usize>] {
         &self.opaque
     }
@@ -524,6 +630,14 @@ impl SourceModel {
     }
 
     fn index(&mut self, config: &Config) {
+        let transparent: HashSet<_> = self
+            .tokens
+            .iter()
+            .filter(|token| token.kind == SourceTokenKind::Control)
+            .filter_map(|token| syntax::command_at(&self.source, token.span.start))
+            .filter_map(|(name, end)| syntax::token_list_argument_range(&self.source, name, end))
+            .flat_map(|range| [range.start, range.end - 1])
+            .collect();
         let mut pairs = HashMap::new();
         let mut groups = Vec::new();
         for (index, token) in self.tokens.iter().enumerate() {
@@ -550,7 +664,9 @@ impl SourceModel {
                         signature: Some(signature.clone()),
                         condition: None,
                         literal_arguments: false,
+                        literal_slots: 0,
                         math_signature: None,
+                        global: false,
                     },
                 );
             }
@@ -581,7 +697,9 @@ impl SourceModel {
                         signature: None,
                         condition: None,
                         literal_arguments: false,
+                        literal_slots: 0,
                         math_signature: None,
+                        global: false,
                     },
                 );
             }
@@ -595,7 +713,9 @@ impl SourceModel {
                     signature: None,
                     condition: None,
                     literal_arguments: false,
+                    literal_slots: 0,
                     math_signature: None,
+                    global: false,
                 },
             );
             self.rules.push(SyntaxRule {
@@ -624,6 +744,7 @@ impl SourceModel {
         let mut seen_builtins = HashSet::new();
         let mut foreach_variables = HashMap::<String, usize>::new();
         let mut global_prefix = false;
+        let mut conditional_proofs = ConditionalProofs::new();
         let imports = self.import_events(config);
         let mut import_index = 0;
         let mut pos = 0;
@@ -647,6 +768,7 @@ impl SourceModel {
             {
                 for (name, alias) in &imports[import_index].aliases {
                     if !config.syntax.environment_aliases.contains_key(name) {
+                        let command = imports[import_index].commands.get(name);
                         let replacement = alias.as_ref().map_or(Replacement::Unknown, |alias| {
                             Replacement::Boundary(alias.clone())
                         });
@@ -657,12 +779,15 @@ impl SourceModel {
                             Binding {
                                 replacement,
                                 candidate: true,
-                                signature: None,
+                                signature: command.and_then(|command| command.arguments.clone()),
                                 condition: None,
-                                literal_arguments: false,
+                                literal_arguments: command
+                                    .is_some_and(|command| command.literal_arguments),
+                                literal_slots: 0,
                                 math_signature: None,
+                                global: false,
                             },
-                            false,
+                            command.is_some_and(|command| command.global),
                         );
                     }
                 }
@@ -677,19 +802,51 @@ impl SourceModel {
                             signature: signature.clone(),
                             condition: None,
                             literal_arguments: false,
+                            literal_slots: 0,
                             math_signature: None,
+                            global: false,
                         },
                         false,
                     );
                 }
+                for (name, command) in &imports[import_index].commands {
+                    if !config.syntax.commands.contains_key(name)
+                        && !imports[import_index].aliases.contains_key(name)
+                    {
+                        assign(
+                            &mut bindings,
+                            &mut scopes,
+                            name,
+                            Binding {
+                                replacement: Replacement::Unknown,
+                                candidate: false,
+                                signature: command.arguments.clone(),
+                                condition: None,
+                                literal_arguments: command.literal_arguments,
+                                literal_slots: 0,
+                                math_signature: None,
+                                global: false,
+                            },
+                            command.global,
+                        );
+                    }
+                }
                 import_index += 1;
             }
             if token.kind == SourceTokenKind::OpenGroup {
+                if transparent.contains(&token.span.start) {
+                    pos += 1;
+                    continue;
+                }
                 scopes.push(HashMap::new());
                 pos += 1;
                 continue;
             }
             if token.kind == SourceTokenKind::CloseGroup {
+                if transparent.contains(&token.span.start) {
+                    pos += 1;
+                    continue;
+                }
                 if scopes.len() > 1 {
                     for (name, previous) in scopes.pop().unwrap() {
                         if let Some(previous) = previous {
@@ -769,6 +926,21 @@ impl SourceModel {
             }
             self.context
                 .observe(&self.source, control, start, end, certain);
+            if !bindings.contains_key(name)
+                && !config.syntax.commands.contains_key(name)
+                && let Some((alias, finish)) =
+                    crate::packages::documents::branch_environment_boundary(&self.source, name, end)
+            {
+                self.context
+                    .observe_environment(&alias.environment, true, finish);
+                self.boundaries.insert(start, alias);
+                self.protected.push(end..finish);
+                scopes.push(HashMap::new());
+                pos = self
+                    .tokens
+                    .partition_point(|token| token.span.start < finish);
+                continue;
+            }
             if name == "documentclass" && self.document_class.is_none() {
                 let arguments = crate::layout::signature_argument_ranges(
                     &self.source,
@@ -1017,7 +1189,9 @@ impl SourceModel {
                             signature,
                             condition: None,
                             literal_arguments: false,
+                            literal_slots: 0,
                             math_signature: None,
+                            global: false,
                         },
                         global_prefix,
                     );
@@ -1054,7 +1228,7 @@ impl SourceModel {
             if !bindings.contains_key(name)
                 && let Some(definition) = definition(&self.source, &self.tokens, &pairs, pos)
             {
-                let (declaration, finish, global, provide) = definition;
+                let (mut declaration, finish, global, provide) = definition;
                 // Expl3 definitions share the delayed-body semantics of
                 // classic declarations. The code printer can expose their
                 // body separately; ordinary structural/math passes must not
@@ -1068,22 +1242,100 @@ impl SourceModel {
                         && !s.optional_arguments
                         && s.signature.as_deref().is_none_or(str::is_empty)
                 });
+                let mut forwarded_data = false;
+                if zero {
+                    let start = skip(body, 0);
+                    if let Some((target, after)) = syntax::command_at(body, start)
+                        && let Some(signature) = bindings
+                            .get(target)
+                            .filter(|binding| binding.literal_arguments)
+                            .and_then(|binding| binding.signature.as_ref())
+                            .and_then(|s| s.signature.as_deref())
+                            .or_else(|| {
+                                (!bindings.contains_key(target)
+                                    && crate::packages::commands::is_metadata_command(target))
+                                .then(|| crate::packages::command_signature(body, target, after))
+                                .flatten()
+                            })
+                        && signature.bytes().all(|slot| slot == b'm')
+                    {
+                        let mut cursor = skip(body, after);
+                        let mut supplied = 0usize;
+                        while cursor < body.len() && body.as_bytes()[cursor] == b'{' {
+                            let Some(end) = syntax::balanced_end(body, cursor, b'{', b'}') else {
+                                break;
+                            };
+                            supplied += 1;
+                            cursor = skip(body, end);
+                        }
+                        if cursor == body.len() && supplied < signature.len() {
+                            let remaining = signature.len() - supplied;
+                            declaration.signature = Some(EnvironmentArguments {
+                                arguments: remaining,
+                                signature: Some("m".repeat(remaining)),
+                                ..Default::default()
+                            });
+                            forwarded_data = true;
+                        }
+                    }
+                }
                 let previous_candidate =
                     bindings.get(&declaration.name).is_some_and(|b| b.candidate);
                 // Declaration bodies may be opaque in the document partition.
                 // Read their lexical children with the same scanner before
                 // interpreting complete command names.
                 let contains_boundary = body_has_environment_effect(body, config, false, false);
+                let neutral_composition = !contains_boundary
+                    && zero
+                    && SourceTokens::new(body, &[]).all(|token| {
+                        if token.kind != SourceTokenKind::Control {
+                            return true;
+                        }
+                        let Some((name, end)) = syntax::command_at(body, token.span.start) else {
+                            return false;
+                        };
+                        bindings.get(name).is_none_or(|binding| {
+                            !binding.candidate
+                                || matches!(binding.replacement, Replacement::NeutralWrapper)
+                                    && binding.signature.as_ref().is_some_and(|signature| {
+                                        neutral_wrapper_arguments(
+                                            body, end, signature, config, &bindings,
+                                        )
+                                    })
+                        })
+                    });
                 let parameterized_wrapper = contains_boundary
                     && body.contains('#')
-                    && !body_has_environment_effect(body, config, true, false);
-                let candidate = previous_candidate
+                    && !body_has_environment_effect(body, config, true, false)
+                    || !contains_boundary
+                        && body.contains('#')
+                        && references_environment_candidate(body, &bindings)
+                        && SourceTokens::new(body, &[]).all(|token| {
+                            if token.kind != SourceTokenKind::Control {
+                                return true;
+                            }
+                            syntax::command_at(body, token.span.start).is_none_or(|(name, _)| {
+                                !matches!(
+                                    name,
+                                    "csname" | "endcsname" | "expandafter" | "scantokens"
+                                ) && bindings.get(name).is_none_or(|binding| {
+                                    !binding.candidate
+                                        || matches!(
+                                            binding.replacement,
+                                            Replacement::NeutralWrapper
+                                        )
+                                })
+                            })
+                        });
+                // A definite redefinition replaces the old grammar. Only
+                // uncertain assignments retain the previous boundary candidate.
+                let candidate = !certain && previous_candidate
                     || contains_boundary
-                    || syntax::command_at(body, skip(body, 0))
-                        .is_some_and(|(n, _)| bindings.get(n).is_some_and(|b| b.candidate));
+                    || !neutral_composition && references_environment_candidate(body, &bindings);
                 let literal_arguments = certain
                     && !candidate
-                    && (parameters_only_in_data(body, &bindings)
+                    && (forwarded_data
+                        || parameters_only_in_data(body, &bindings, Some(&self.context.at(start)))
                         || name.starts_with("cs_") && !body.contains('#'));
                 let mut replacement = if certain && parameterized_wrapper {
                     Replacement::NeutralWrapper
@@ -1097,6 +1349,37 @@ impl SourceModel {
                 {
                     replacement = resolve(target, &bindings)
                         .map_or(Replacement::Unknown, Replacement::Boundary);
+                }
+                if certain
+                    && candidate
+                    && matches!(replacement, Replacement::Unknown)
+                    && body.contains("\\csname")
+                {
+                    replacement = Replacement::ConstructedWrapper(body.to_owned());
+                }
+                let literal_slots =
+                    stored_parameter_mask_with_bindings(body, &self.context.at(start), &bindings);
+                if active_conditions.is_empty()
+                    && let Some((at, branches, _)) = conditions.last()
+                {
+                    conditional_proofs
+                        .entry(*at)
+                        .or_default()
+                        .entry(declaration.name.clone())
+                        .or_default()
+                        .insert(
+                            branches.len(),
+                            (
+                                declaration.signature.clone(),
+                                if forwarded_data {
+                                    u16::MAX
+                                } else {
+                                    literal_slots
+                                },
+                                forwarded_data || literal_arguments,
+                                candidate,
+                            ),
+                        );
                 }
                 if !(config
                     .syntax
@@ -1116,12 +1399,14 @@ impl SourceModel {
                             } else {
                                 None
                             },
-                            condition: None,
+                            condition: syntax::opens_final_condition(body).then(|| "iftrue".into()),
                             literal_arguments,
+                            literal_slots,
                             math_signature: certain
                                 .then(|| crate::packages::scientific::factory_math_signature(name))
                                 .flatten()
                                 .map(|signature| (signature.shape, signature.domains)),
+                            global: false,
                         },
                         global || global_prefix,
                     );
@@ -1139,6 +1424,40 @@ impl SourceModel {
                 self.declarations.push(declaration);
                 global_prefix = false;
                 pos = finish;
+                continue;
+            }
+            if let Some((target, value, finish, global)) =
+                syntax::command_copy(&self.source, name, end)
+            {
+                let mut binding = bindings.get(value).cloned().unwrap_or(Binding {
+                    replacement: Replacement::Forward(value.to_owned()),
+                    candidate: resolve(value, &bindings).is_some(),
+                    signature: None,
+                    condition: (syntax::is_condition_command(value, config)
+                        || matches!(value, "fi" | "else" | "or"))
+                    .then(|| value.to_owned()),
+                    literal_arguments: false,
+                    literal_slots: 0,
+                    math_signature: None,
+                    global: false,
+                });
+                if !certain {
+                    binding.replacement = Replacement::Unknown;
+                    binding.signature = None;
+                    binding.literal_arguments = false;
+                    binding.math_signature = None;
+                }
+                assign(
+                    &mut bindings,
+                    &mut scopes,
+                    target,
+                    binding,
+                    global || global_prefix,
+                );
+                global_prefix = false;
+                pos = self
+                    .tokens
+                    .partition_point(|token| token.span.start < finish);
                 continue;
             }
             if matches!(name, "let" | "futurelet") {
@@ -1163,10 +1482,13 @@ impl SourceModel {
                             replacement: Replacement::Unknown,
                             candidate: false,
                             signature: None,
-                            condition: syntax::is_condition_command(rhs_name, config)
-                                .then(|| rhs_name.to_owned()),
+                            condition: (syntax::is_condition_command(rhs_name, config)
+                                || matches!(rhs_name, "fi" | "else" | "or"))
+                            .then(|| rhs_name.to_owned()),
                             literal_arguments: false,
+                            literal_slots: 0,
                             math_signature: None,
+                            global: false,
                         });
                         if !certain || name == "futurelet" {
                             binding.replacement = Replacement::Unknown;
@@ -1185,7 +1507,7 @@ impl SourceModel {
                     }
                 }
             }
-            if name == "newif" {
+            if matches!(name, "newif" | "ltx@newif" | "newife") {
                 let target = next(&self.tokens, pos + 1);
                 if let Some(token) = self.tokens.get(target)
                     && let Some((name, _)) = syntax::command_at(&self.source, token.span.start)
@@ -1200,7 +1522,9 @@ impl SourceModel {
                             signature: None,
                             condition: Some("iftrue".into()),
                             literal_arguments: false,
+                            literal_slots: 0,
                             math_signature: None,
+                            global: false,
                         },
                         false,
                     );
@@ -1213,6 +1537,61 @@ impl SourceModel {
                 .conditions
                 .iter()
                 .any(|condition| condition == name);
+            if let Some(reader) = bindings
+                .get(name)
+                .and_then(|binding| binding.condition.as_deref())
+            {
+                if matches!(reader, "else" | "or") {
+                    if let Some((_, branches, branch_start)) = conditions.last_mut() {
+                        branches.push(*branch_start..start);
+                        *branch_start = end;
+                    }
+                    pos += 1;
+                    continue;
+                }
+                if reader == "fi" {
+                    if let Some((at, mut branches, branch_start)) = conditions.pop() {
+                        join_conditional_data(
+                            &self.source,
+                            at,
+                            &branches,
+                            &mut conditional_proofs,
+                            &mut bindings,
+                        );
+                        branches.push(branch_start..start);
+                        self.conditionals.push(Conditional {
+                            span: at..end,
+                            branches,
+                        });
+                    }
+                    pos += 1;
+                    continue;
+                }
+            }
+            if let Some(binding) = bindings
+                .get(name)
+                .filter(|binding| !binding.literal_arguments && binding.literal_slots & 1 != 0)
+                && let Some(signature) = &binding.signature
+                && let Some(arguments) = invocation_arguments(&self.source, end, signature)
+            {
+                let prefix: Vec<_> = arguments
+                    .into_iter()
+                    .enumerate()
+                    .take_while(|(index, _)| {
+                        *index < 9 && binding.literal_slots & (1 << index) != 0
+                    })
+                    .map(|(_, argument)| argument)
+                    .collect();
+                if let Some(last) = prefix.last() {
+                    let finish = last.end;
+                    self.stored_arguments.extend(prefix.iter().cloned());
+                    self.protected.extend(prefix);
+                    pos = self
+                        .tokens
+                        .partition_point(|token| token.span.start < finish);
+                    continue;
+                }
+            }
             if let Some(binding) = bindings
                 .get(name)
                 .filter(|binding| binding.literal_arguments)
@@ -1270,6 +1649,13 @@ impl SourceModel {
             }
             if name == "fi" {
                 if let Some((at, mut branches, branch_start)) = conditions.pop() {
+                    join_conditional_data(
+                        &self.source,
+                        at,
+                        &branches,
+                        &mut conditional_proofs,
+                        &mut bindings,
+                    );
                     branches.push(branch_start..start);
                     self.conditionals.push(Conditional {
                         span: at..end,
@@ -1279,7 +1665,12 @@ impl SourceModel {
                 pos += 1;
                 continue;
             }
-            if let Some(alias) = resolve(name, &bindings) {
+            if bindings.get(name).is_some_and(|binding| matches!(binding.replacement, Replacement::GroupBegin)) {
+                self.group_openers.insert(start);
+                scopes.push(HashMap::new());
+            } else if bindings.get(name).is_some_and(|binding| matches!(binding.replacement, Replacement::InlineMathShift)) {
+                self.inline_math_shifts.insert(start);
+            } else if let Some(alias) = resolve(name, &bindings) {
                 self.context
                     .observe_environment(&alias.environment, alias.begin, end);
                 if alias.begin {
@@ -1305,7 +1696,8 @@ impl SourceModel {
                                 config,
                                 &bindings,
                             )
-                        }))
+                        }) || matches!(&binding.replacement, Replacement::ConstructedWrapper(body)
+                            if neutral_constructed_wrapper(body, &self.source, end, binding.signature.as_ref(), config, &bindings)))
             }) {
                 self.diagnostics.push(Diagnostic { severity: Severity::Warning, message: format!("Cannot safely resolve environment alias \\{name}; the following source is preserved"), span: start..end });
                 if self.opaque.is_empty() {
@@ -1337,6 +1729,14 @@ impl SourceModel {
                     .insert(environment.to_owned(), bindings[name].signature.clone());
                 continue;
             }
+            self.exported_commands.insert(
+                name.clone(),
+                crate::config::ImportedCommand {
+                    arguments: bindings[name].signature.clone(),
+                    literal_arguments: bindings[name].literal_arguments,
+                    global: bindings[name].global,
+                },
+            );
             if let Replacement::Boundary(alias) = &bindings[name].replacement {
                 self.exported.insert(name.clone(), alias.clone());
             } else if bindings[name].candidate || resolve(name, &bindings).is_some() {
@@ -1414,7 +1814,55 @@ fn invocation_arguments(
 /// A source wrapper can forward opaque data without making it executable.
 /// Prove every parameter occurrence belongs to an established data argument;
 /// one use outside such a prefix leaves the invocation available to TeX parsing.
-fn parameters_only_in_data(body: &str, bindings: &HashMap<String, Binding>) -> bool {
+pub(crate) fn parameters_are_stored(body: &str) -> bool {
+    parameters_only_in_data(body, &HashMap::new(), None)
+}
+
+pub(crate) fn parameters_are_stored_in_context(
+    body: &str,
+    context: &crate::packages::context::InvocationContext<'_>,
+) -> bool {
+    parameters_only_in_data(body, &HashMap::new(), Some(context))
+}
+
+pub(crate) fn stored_parameter_mask(
+    body: &str,
+    context: &crate::packages::context::InvocationContext<'_>,
+) -> u16 {
+    stored_parameter_mask_with_bindings(body, context, &HashMap::new())
+}
+
+fn stored_parameter_mask_with_bindings(
+    body: &str,
+    context: &crate::packages::context::InvocationContext<'_>,
+    bindings: &HashMap<String, Binding>,
+) -> u16 {
+    if !body.contains('#') {
+        return 0;
+    }
+    let mut mask = 0;
+    for parameter in 1..=9 {
+        if !body.contains(&format!("#{parameter}")) {
+            continue;
+        }
+        let mut isolated = body.to_owned();
+        for other in 1..=9 {
+            if other != parameter {
+                isolated = isolated.replace(&format!("#{other}"), "\\tiftparameter ");
+            }
+        }
+        if parameters_only_in_data(&isolated, bindings, Some(context)) {
+            mask |= 1 << (parameter - 1);
+        }
+    }
+    mask
+}
+
+fn parameters_only_in_data(
+    body: &str,
+    bindings: &HashMap<String, Binding>,
+    context: Option<&crate::packages::context::InvocationContext<'_>>,
+) -> bool {
     if !body.contains('#') {
         return false;
     }
@@ -1428,8 +1876,36 @@ fn parameters_only_in_data(body: &str, bindings: &HashMap<String, Binding>) -> b
             && let Some((name, end)) = syntax::command_at(body, token.span.start)
         {
             let finish = syntax::delayed_data_end(body, name, end)
+                .or_else(|| syntax::primitive_data_end(body, name, end))
+                .or_else(|| syntax::test_operand_end(body, name, end))
+                .or_else(|| syntax::let_declaration_end(body, name, end))
+                .or_else(|| {
+                    context
+                        .and_then(|context| {
+                            crate::packages::command_data_ranges_in_context(
+                                body, name, end, context,
+                            )
+                        })
+                        .and_then(|ranges| ranges.last().map(|range| range.end))
+                })
+                .or_else(|| {
+                    syntax::message_data_arguments(body, name, end)
+                        .and_then(|arguments| arguments.last().map(|argument| argument.end))
+                })
                 .or_else(|| {
                     if let Some(binding) = bindings.get(name) {
+                        if !binding.literal_arguments && binding.literal_slots & 1 != 0 {
+                            let arguments =
+                                invocation_arguments(body, end, binding.signature.as_ref()?)?;
+                            return arguments
+                                .iter()
+                                .enumerate()
+                                .take_while(|(index, _)| {
+                                    *index < 9 && binding.literal_slots & (1 << index) != 0
+                                })
+                                .last()
+                                .map(|(_, argument)| argument.end);
+                        }
                         binding
                             .literal_arguments
                             .then_some(binding.signature.as_ref())
@@ -1447,7 +1923,7 @@ fn parameters_only_in_data(body: &str, bindings: &HashMap<String, Binding>) -> b
                 saw_parameter |= body[end..finish].contains('#');
                 cursor = finish;
             }
-        } else if body[token.span].contains('#') {
+        } else if body[token.span.clone()].contains('#') {
             return false;
         }
     }
@@ -1457,7 +1933,7 @@ fn parameters_only_in_data(body: &str, bindings: &HashMap<String, Binding>) -> b
 /// These kernel operations store their token-list operand. Their declaration
 /// spellings describe the preceding variable/name operand; other expl3 `n`
 /// arguments remain executable unless a source definition proves otherwise.
-fn expl3_stored_data_end(source: &str, name: &str, end: usize) -> Option<usize> {
+pub(crate) fn expl3_stored_arguments(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
     let (family, variant) = name.split_once(':')?;
     if !matches!(
         family,
@@ -1472,11 +1948,20 @@ fn expl3_stored_data_end(source: &str, name: &str, end: usize) -> Option<usize> 
             | "seq_put_right"
             | "seq_gput_left"
             | "seq_gput_right"
+            | "regex_const"
+            | "regex_set"
+            | "regex_gset"
     ) || !matches!(variant, "Nn" | "cn")
     {
         return None;
     }
-    syntax::arguments::signature_end(source, end, "mm")
+    let arguments =
+        crate::layout::signature_argument_ranges(source, end..source.len(), b"mm".iter().copied());
+    (arguments.len() == 2).then(|| arguments[1].clone())
+}
+
+fn expl3_stored_data_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    expl3_stored_arguments(source, name, end).map(|argument| argument.end)
 }
 
 fn register(registry: &mut HashMap<String, SyntaxRule>, rule: SyntaxRule) {
@@ -1496,9 +1981,14 @@ fn register(registry: &mut HashMap<String, SyntaxRule>, rule: SyntaxRule) {
 fn located_error(source: &str, error: crate::FormatError) -> Diagnostic {
     let message = error.to_string();
     let mut at = message
-        .rsplit(" at byte ")
-        .next()
-        .and_then(|s| s.split_whitespace().next())
+        .split(" at byte ")
+        .nth(1)
+        .map(|s| {
+            s.trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or("")
+        })
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0)
         .min(source.len());
@@ -1535,9 +2025,10 @@ fn assign(
     bindings: &mut HashMap<String, Binding>,
     scopes: &mut [HashMap<String, Option<Binding>>],
     name: &str,
-    binding: Binding,
+    mut binding: Binding,
     global: bool,
 ) {
+    binding.global = global;
     if global {
         for scope in scopes.iter_mut().skip(1) {
             scope.remove(name);
@@ -1559,7 +2050,11 @@ fn resolve(name: &str, bindings: &HashMap<String, Binding>) -> Option<Environmen
         slow = match &bindings.get(slow)?.replacement {
             Replacement::Boundary(alias) => return Some(alias.clone()),
             Replacement::Forward(target) => target,
-            Replacement::Unknown | Replacement::NeutralWrapper => return None,
+            Replacement::Unknown
+            | Replacement::NeutralWrapper
+            | Replacement::GroupBegin
+            | Replacement::InlineMathShift
+            | Replacement::ConstructedWrapper(_) => return None,
         };
         // Two cursors detect a cycle in work proportional to the chain length,
         // including short cycles in a file with many unrelated declarations.
@@ -1567,7 +2062,11 @@ fn resolve(name: &str, bindings: &HashMap<String, Binding>) -> Option<Environmen
             fast = match &bindings.get(fast)?.replacement {
                 Replacement::Boundary(alias) => return Some(alias.clone()),
                 Replacement::Forward(target) => target,
-                Replacement::Unknown | Replacement::NeutralWrapper => return None,
+                Replacement::Unknown
+                | Replacement::NeutralWrapper
+                | Replacement::GroupBegin
+                | Replacement::InlineMathShift
+                | Replacement::ConstructedWrapper(_) => return None,
             };
         }
         if slow == fast {
@@ -1576,15 +2075,96 @@ fn resolve(name: &str, bindings: &HashMap<String, Binding>) -> Option<Environmen
     }
 }
 
+fn references_environment_candidate(body: &str, bindings: &HashMap<String, Binding>) -> bool {
+    let mut tokens = SourceTokens::new(body, &[]);
+    while let Some(token) = tokens.next() {
+        if token.kind != SourceTokenKind::Control {
+            continue;
+        }
+        let Some((name, end)) = syntax::command_at(body, token.span.start) else {
+            continue;
+        };
+        if let Some(finish) = syntax::primitive_data_end(body, name, end)
+            .or_else(|| syntax::delayed_data_end(body, name, end))
+            .or_else(|| syntax::let_declaration_end(body, name, end))
+            .or_else(|| crate::packages::command_data_end(body, name, end))
+        {
+            tokens.position = finish;
+        } else if bindings.get(name).is_some_and(|binding| binding.candidate) {
+            return true;
+        }
+    }
+    false
+}
+
 fn replacement(body: &str) -> Replacement {
-    let body = body[skip(body, 0)..].trim_end();
+    let mut body = body[skip(body, 0)..].trim_end();
+    if let Some(("noexpand", end)) = syntax::command_at(body, 0) {
+        body = &body[skip(body, end)..];
+    }
+    let mut cursor = 0;
+    let mut shifts = 0;
+    let mut safe_math = true;
+    while cursor < body.len() {
+        cursor = skip(body, cursor);
+        if cursor >= body.len() {
+            break;
+        }
+        if let Some((name, end)) = syntax::command_at(body, cursor) {
+            safe_math &= matches!(name, "hfill" | "relax" | "%" | "space" | "quad" | "qquad");
+            cursor = end;
+        } else {
+            safe_math &= body.as_bytes()[cursor] == b'$';
+            shifts += usize::from(body.as_bytes()[cursor] == b'$');
+            cursor += body[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+    if safe_math && shifts == 1 {
+        return Replacement::InlineMathShift;
+    }
     let Some((name, end)) = syntax::command_at(body, 0) else {
         return Replacement::Unknown;
     };
+    if matches!(name, "begingroup" | "group_begin:") {
+        let mut cursor = end;
+        let mut groups = 1usize;
+        let mut safe = true;
+        while cursor < body.len() {
+            cursor = skip(body, cursor);
+            if cursor == body.len() {
+                break;
+            }
+            if let Some((name, end)) = syntax::command_at(body, cursor) {
+                if let Some(finish) = syntax::primitive_data_end(body, name, end)
+                    .or_else(|| syntax::delayed_data_end(body, name, end))
+                    .or_else(|| syntax::let_declaration_end(body, name, end))
+                {
+                    cursor = finish;
+                    continue;
+                }
+                if matches!(name, "begingroup" | "group_begin:") {
+                    groups += 1;
+                } else if matches!(name, "endgroup" | "group_end:") {
+                    groups = groups.saturating_sub(1);
+                } else if !matches!(name, "escapechar" | "relax" | "cC" | "cA" | "~") {
+                    safe = false;
+                }
+                cursor = end;
+            } else {
+                cursor += body[cursor..].chars().next().unwrap().len_utf8();
+            }
+        }
+        if safe && groups == 1 {
+            return Replacement::GroupBegin;
+        }
+    }
     if matches!(name, "begin" | "end") {
         let start = skip(body, end);
         if let Some(finish) = syntax::balanced_end(body, start, b'{', b'}')
-            && skip(body, finish) == body.len()
+            && (skip(body, finish) == body.len()
+                || name == "begin"
+                    && syntax::balanced_end(body, skip(body, finish), b'[', b']')
+                        .is_some_and(|end| skip(body, end) == body.len()))
         {
             let environment = body[start + 1..finish - 1].trim();
             if !environment.is_empty() && !environment.contains(['\\', '#', '{', '}', '%']) {
@@ -1610,6 +2190,61 @@ fn body_has_environment_effect(
     neutral_parameters: bool,
     complete: bool,
 ) -> bool {
+    let mut normalized = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    while cursor < body.len() {
+        if body.as_bytes()[cursor] == b'%' {
+            cursor = skip(body, cursor);
+            continue;
+        }
+        if let Some((name, end)) = syntax::command_at(body, cursor) {
+            if matches!(name, "IfBooleanTF" | "IfNoValueTF" | "IfValueTF") {
+                let args =
+                    crate::layout::signature_argument_ranges(body, end..body.len(), "mmm".bytes());
+                if args.len() == 3 && args.iter().all(|arg| body.as_bytes()[arg.start] == b'{') {
+                    let boundaries = |range: &Range<usize>| {
+                        let mut events = Vec::new();
+                        let text = &body[range.start + 1..range.end - 1];
+                        for token in SourceTokens::new(text, &[]) {
+                            if token.kind == SourceTokenKind::Control
+                                && let Some((name, end)) =
+                                    syntax::command_at(text, token.span.start)
+                                && matches!(name, "begin" | "end")
+                            {
+                                let start = skip(text, end);
+                                let finish = syntax::balanced_end(text, start, b'{', b'}')?;
+                                let environment = &text[start + 1..finish - 1];
+                                if environment.contains(['#', '\\']) {
+                                    return None;
+                                }
+                                events.push((name.to_owned(), environment.to_owned()));
+                            }
+                        }
+                        Some(events)
+                    };
+                    if let (Some(first), Some(second)) =
+                        (boundaries(&args[1]), boundaries(&args[2]))
+                        && !first.is_empty()
+                        && first == second
+                    {
+                        normalized.push_str(&body[copied..cursor]);
+                        normalized.push_str(&body[args[1].start + 1..args[1].end - 1]);
+                        copied = args[2].end;
+                        cursor = copied;
+                        continue;
+                    }
+                }
+            }
+            cursor = end;
+        } else {
+            cursor += body[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+    if copied > 0 {
+        normalized.push_str(&body[copied..]);
+        return body_has_environment_effect(&normalized, config, neutral_parameters, complete);
+    }
     if !complete && !body.contains("\\begin") && !body.contains("\\end") {
         return false;
     }
@@ -1635,6 +2270,7 @@ fn body_has_environment_effect(
         if let Some(finish) = syntax::primitive_data_end(body, name, end)
             .or_else(|| syntax::delayed_data_end(body, name, end))
             .or_else(|| syntax::let_declaration_end(body, name, end))
+            .or_else(|| crate::packages::command_data_end(body, name, end))
         {
             tokens.position = finish;
             continue;
@@ -1645,11 +2281,16 @@ fn body_has_environment_effect(
             }
             uncertain = true;
         } else if matches!(name, "begin" | "end") {
-            seen_boundary = true;
             let start = skip(body, end);
             let Some(finish) = syntax::balanced_end(body, start, b'{', b'}') else {
-                return true;
+                // A bare \end is also used as a delimited macro sentinel.
+                // Only complete-argument proofs need to reject that ambiguity.
+                if complete {
+                    return true;
+                }
+                continue;
             };
+            seen_boundary = true;
             let environment = body[start + 1..finish - 1].trim();
             if environment.is_empty() || environment.contains(['\\', '#', '{', '}', '%']) {
                 return true;
@@ -1675,16 +2316,90 @@ fn body_has_environment_effect(
             invalid_condition |= conditions.last().copied() != Some(environments.len());
         } else if name == "fi" {
             invalid_condition |= conditions.pop() != Some(environments.len());
-        } else if name == "newif" {
+        } else if matches!(name, "newif" | "ltx@newif" | "newife") {
             tokens.position = syntax::command_at(body, skip(body, end)).map_or(end, |(_, end)| end);
         } else if let Some(finish) = syntax::test_operand_end(body, name, end) {
             tokens.position = finish;
         }
     }
-    seen_boundary && uncertain
-        || invalid_condition
+    (complete || seen_boundary) && (uncertain || invalid_condition || !conditions.is_empty())
         || !environments.is_empty()
-        || !conditions.is_empty()
+}
+
+fn neutral_constructed_wrapper(
+    body: &str,
+    source: &str,
+    end: usize,
+    signature: Option<&EnvironmentArguments>,
+    config: &Config,
+    bindings: &HashMap<String, Binding>,
+) -> bool {
+    // Environment names must already be literal before substituting values.
+    for token in SourceTokens::new(body, &[]) {
+        if token.kind == SourceTokenKind::Control
+            && let Some((name, end)) = syntax::command_at(body, token.span.start)
+            && matches!(name, "begin" | "end")
+        {
+            let start = skip(body, end);
+            let Some(end) = syntax::balanced_end(body, start, b'{', b'}') else {
+                return false;
+            };
+            if body[start + 1..end - 1].contains(['#', '\\']) {
+                return false;
+            }
+        }
+    }
+    let Some(arguments) =
+        signature.and_then(|signature| invocation_arguments(source, end, signature))
+    else {
+        return false;
+    };
+    if arguments.is_empty() || arguments.len() > 9 {
+        return false;
+    }
+    let mut expanded = body.to_owned();
+    for (index, argument) in arguments.iter().enumerate() {
+        if source.as_bytes().get(argument.start) != Some(&b'{') {
+            return false;
+        }
+        let value = &source[argument.start + 1..argument.end - 1];
+        if !value
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return false;
+        }
+        expanded = expanded.replace(&format!("#{}", index + 1), value);
+    }
+    if expanded.contains('#') {
+        return false;
+    }
+    let mut normalized = String::new();
+    let mut cursor = 0;
+    while cursor < expanded.len() {
+        if let Some(("csname", after)) = syntax::command_at(&expanded, cursor) {
+            let Some(offset) = expanded[after..].find("\\endcsname") else {
+                return false;
+            };
+            let name: String = expanded[after..after + offset]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if !bindings
+                .get(&name)
+                .is_some_and(|binding| !binding.candidate)
+            {
+                return false;
+            }
+            normalized.push_str("\\relax ");
+            cursor = after + offset + "\\endcsname".len();
+        } else {
+            let c = expanded[cursor..].chars().next().unwrap();
+            normalized.push(c);
+            cursor += c.len_utf8();
+        }
+    }
+    !body_has_environment_effect(&normalized, config, false, true)
 }
 
 fn neutral_wrapper_arguments(
@@ -1700,11 +2415,46 @@ fn neutral_wrapper_arguments(
     if arguments.len() < signature.arguments {
         return false;
     }
+    let boolean_ranges: HashSet<_> = signature
+        .signature
+        .as_ref()
+        .and_then(|shape| syntax::xparse::Signature::parse(shape))
+        .and_then(|parsed| {
+            let mask = parsed.boolean_slots();
+            parsed
+                .slot_ranges(
+                    source,
+                    syntax::arguments::invocation_cursor(
+                        source,
+                        end,
+                        signature.signature.as_ref().unwrap(),
+                    )..source.len(),
+                )
+                .map(|arguments| {
+                    arguments
+                        .into_iter()
+                        .filter(|arg| arg.slot < 9 && mask & (1 << arg.slot) != 0)
+                        .map(|arg| (arg.range.start, arg.range.end))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
     arguments.iter().all(|argument| {
+        if boolean_ranges.contains(&(argument.start, argument.end)) {
+            return true;
+        }
+        if source.get(argument.clone()) == Some("*")
+            && signature
+                .signature
+                .as_ref()
+                .is_some_and(|shape| shape.contains('s'))
+        {
+            return true;
+        }
         // An unbraced operand can be a single math shift or a grouping token.
         // Require an explicit operand boundary before proving a replacement
         // independently of the wrapper's surrounding text.
-        if source.as_bytes().get(argument.start) != Some(&b'{') {
+        if !matches!(source.as_bytes().get(argument.start), Some(b'{' | b'[')) {
             return false;
         }
         let body = &source[argument.clone()];

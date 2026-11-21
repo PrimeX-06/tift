@@ -114,6 +114,51 @@ fn format_document_inner(
     mut trace: Option<&mut Vec<StageTrace>>,
     mut details: Option<&mut Vec<crate::trace::DetailTrace>>,
 ) -> Result<FormatOutput, FormatError> {
+    if kind == FileKind::Tex
+        && !config.config.replacement_only
+        && source.contains("\\documentclass")
+    {
+        for (at, marker) in source.match_indices("\\end{document}") {
+            let end = at + marker.len();
+            if source[end..].trim().is_empty() {
+                continue;
+            }
+            let prefix = crate::source_model::SourceModel::analyze(&source[..end], config);
+            let closes_document = prefix.structure.as_ref().is_some_and(|(_, blocks)| {
+                blocks.iter().any(|block| {
+                    block.kind == BlockKind::Environment
+                        && block.name == "document"
+                        && block.parent.is_none()
+                        && block.end.end == end
+                })
+            });
+            if prefix.document_class().is_none() || prefix.has_errors() || !closes_document {
+                continue;
+            }
+            let tail = if source[end..].starts_with("\r\n") {
+                end + 2
+            } else if source[end..].starts_with('\n') {
+                end + 1
+            } else {
+                end
+            };
+            let mut output = format_document_inner(&source[..tail], kind, config, trace, details)?;
+            if output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error)
+            {
+                return Ok(output);
+            }
+            output.text.push_str(&source[tail..]);
+            output.diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                message: "Nonexecuted source after \\end{document} retained unchanged".into(),
+                span: tail..source.len(),
+            });
+            return Ok(output);
+        }
+    }
     match format_document_stages(
         source,
         kind,
@@ -266,7 +311,7 @@ fn format_document_stages(
                 || indent(&text, kind, config, &mut parsing),
             )?;
             let macro_active = syntax::macro_layout_active(&text, config);
-            optional_stage(
+            let macro_changed = optional_stage(
                 "macro-bodies",
                 &mut text,
                 &mut trace,
@@ -289,13 +334,14 @@ fn format_document_stages(
                     crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
                 },
             )?;
+            let arguments_active = crate::argument_layout::is_active(&text, config);
             needs_cleanup |= optional_stage(
                 "arguments",
                 &mut text,
                 &mut trace,
                 &mut details,
                 config,
-                crate::argument_layout::is_active(config),
+                arguments_active,
                 |text| {
                     crate::argument_layout::format_arguments_with_context(
                         text,
@@ -387,6 +433,24 @@ fn format_document_stages(
                 |text| {
                     crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
                 },
+            )?;
+            optional_stage(
+                "macro-bodies-final",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                code_changed || needs_cleanup,
+                |text| syntax::format_macro_definitions_with_context(text, config, &mut parsing),
+            )?;
+            optional_stage(
+                "whitespace-final",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                code_active || macro_changed,
+                |text| clean_whitespace(text, config, &mut parsing),
             )?;
             optional_stage(
                 "column-specs",
@@ -1876,6 +1940,9 @@ fn apply_breaks(
         && !source.contains("\\begin")
         && !source.contains("\\foreach")
         && !source.contains("\\tikz")
+        && config.config.syntax.environment_aliases.is_empty()
+        && config.config.syntax.inferred_environment_aliases.is_empty()
+        && config.config.syntax.environment_alias_events.is_empty()
     {
         return Ok(source.into());
     }

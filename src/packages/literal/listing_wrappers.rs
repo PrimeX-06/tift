@@ -25,6 +25,15 @@ pub(crate) fn context_header_signature(
     context: &InvocationContext<'_>,
 ) -> Option<&'static str> {
     match name {
+        "example" | "sidebyside" | "sourcecode" | "bash"
+            if context.has_package("cnltx-example") =>
+        {
+            Some("o")
+        }
+        "externalDocument" if context.has_package("hvextern") => Some("om"),
+        "exdispExample" if context.has_package("tcolorbox.doc.s_main") => Some("om"),
+        "exdispExample*" if context.has_package("tcolorbox.doc.s_main") => Some("mm"),
+        "ltxexample" | "ltxcode" if context.has_package("ltxdockit") => Some("o"),
         // clrscode3e.sty:223 also defines codebox, as ordinary TeX.
         "codebox" | "codebox*" if context.has_package("codebox") => Some("om"),
         // The second listings parameter consumes a line-end token in the
@@ -47,6 +56,20 @@ pub(crate) fn inline_end(
     context: &InvocationContext<'_>,
 ) -> Option<usize> {
     let mut cursor = crate::trivia::skip(source, cursor);
+    if name == "inlinecode" && context.has_package("pdfToolbox") {
+        let delimiter = source.get(cursor..)?.chars().next()?;
+        cursor += delimiter.len_utf8();
+        return source[cursor..]
+            .find(delimiter)
+            .map(|offset| cursor + offset + delimiter.len_utf8());
+    }
+    if name == "KKverb" && (context.has_package("kkluaverb") || context.has_package("KKluaverb")) {
+        if source.as_bytes().get(cursor) != Some(&b'|') {
+            return None;
+        }
+        cursor += 1;
+        return source[cursor..].find('|').map(|offset| cursor + offset + 1);
+    }
     match name {
         // highlightlatex.sty:209 forwards options; pythonhighlight.sty:158
         // already supplies a fixed style option to listings.

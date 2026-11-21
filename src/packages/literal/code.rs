@@ -5,6 +5,97 @@ use std::collections::BTreeMap;
 use crate::config::CommandRule;
 use crate::package_environments::{VerbatimDeclaration, VerbatimTerminator};
 
+pub(crate) fn punctuation_code_end(source: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    if !source[cursor..].starts_with('!') {
+        return None;
+    }
+    cursor += 1;
+    if source[cursor..].starts_with('!') {
+        cursor += 1;
+    }
+    if source[cursor..].starts_with('?') {
+        cursor += 1;
+    }
+    while source[cursor..].starts_with(':') {
+        cursor += 1;
+    }
+    if source.as_bytes().get(cursor) == Some(&b'[') {
+        cursor = crate::syntax::balanced_end(source, cursor, b'[', b']')?;
+    }
+    crate::syntax::balanced_end(source, cursor, b'{', b'}')
+}
+
+/// tex4ht's literate sources store named fragments between \><<< and >>>.
+/// Individual fragments can contain partial TeX definitions and delimiters.
+pub(crate) fn literate_fragment_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if name != "<" {
+        return None;
+    }
+    let line_end = source[end..].find('\n').map_or(source.len(), |n| end + n);
+    let marker = source[end..line_end].find("\\><<<")? + end;
+    let body = marker + "\\><<<".len();
+    source[body..]
+        .match_indices("\n>>>")
+        .next()
+        .map(|(at, _)| body + at + 4)
+}
+
+pub(crate) fn context_verbatim(name: &str, context: &super::InvocationContext<'_>) -> bool {
+    // skdoc.cls records fragments independently: their TeX groups can span
+    // several displayed MacroCode environments.
+    name == "MacroCode" && context.has_package("skdoc")
+        || matches!(name, "sverbatim" | "fverbatim") && context.has_package("tex-live")
+        || matches!(name, "example" | "sidebyside" | "sourcecode" | "bash")
+            && context.has_package("cnltx-example")
+        || name == "externalDocument" && context.has_package("hvextern")
+        || matches!(name, "exdispExample" | "exdispExample*")
+            && context.has_package("tcolorbox.doc.s_main")
+}
+
+pub(crate) fn context_command_data_ranges(
+    source: &str,
+    name: &str,
+    end: usize,
+    context: &super::InvocationContext<'_>,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if matches!(
+        name,
+        "macro"
+            | "macroname"
+            | "anchormacro"
+            | "gotomacro"
+            | "macroexp"
+            | "getmacrousage"
+            | "getmacrousageB"
+    ) && context.has_package("pdfToolbox")
+    {
+        let start = crate::trivia::skip(source, end);
+        let finish = crate::syntax::arguments::signature_end(source, start, "m")?;
+        return Some(std::iter::once(start..finish).collect());
+    }
+    if name == "cmd"
+        && ["ltxdoc", "l3doc", "ltxdockit"]
+            .iter()
+            .any(|package| context.has_package(package))
+        || name == "com" && context.has_package("pitex")
+    {
+        let start = crate::trivia::skip(source, end);
+        let finish = if source.as_bytes().get(start) == Some(&b'{') {
+            crate::syntax::balanced_end(source, start, b'{', b'}')?
+        } else {
+            crate::syntax::command_at(source, start)?.1
+        };
+        return Some(std::iter::once(start..finish).collect());
+    }
+    if matches!(name, "filename" | "dirname") && context.has_package("tex-live") {
+        let start = crate::trivia::skip(source, end);
+        let finish = crate::code_package_syntax::raw_group_end(source, start)?;
+        return Some(std::iter::once(start..finish).collect());
+    }
+    None
+}
+
 // fancyvrb.sty:1143--1207 and fvextra.sty:1638--1703.
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
     "BVerbatim*",
@@ -58,6 +149,7 @@ pub(crate) const INLINE_CODE_COMMANDS: &[&str] = &[
     "Collectverb",
     "verbdef",
     "Verbdef",
+    "verbcode",
 ];
 
 /// Fixed catcode setters in expl3-code.tex:9200--9230. Their N operand is a
@@ -348,6 +440,27 @@ pub(crate) enum GeneratedInlineKind {
     FancyVerb,
     Minted,
     PythonTex,
+    Listings,
+}
+
+pub(crate) fn forwarded_inline_kind(body: &str) -> Option<GeneratedInlineKind> {
+    let start = crate::trivia::skip(body, 0);
+    let (reader, mut end) = crate::syntax::command_at(body, start)?;
+    let kind = match reader {
+        "lstinline" => GeneratedInlineKind::Listings,
+        "Verb" => GeneratedInlineKind::FancyVerb,
+        "verb" => GeneratedInlineKind::Delimited,
+        _ => return None,
+    };
+    end = crate::trivia::skip(body, end);
+    if matches!(
+        kind,
+        GeneratedInlineKind::Listings | GeneratedInlineKind::FancyVerb
+    ) && body.as_bytes().get(end) == Some(&b'[')
+    {
+        end = crate::syntax::balanced_end(body, end, b'[', b']')?;
+    }
+    (crate::trivia::skip(body, end) == body.len()).then_some(kind)
 }
 
 impl GeneratedInlineKind {
@@ -534,6 +647,11 @@ pub(crate) fn generated_inline_end(
         return inline_code_end(source, "Verb", position);
     }
     if kind == GeneratedInlineKind::Minted {
+        let mut cursor = position;
+        optional_argument(source, &mut cursor);
+        return braced_or_delimited_code_end(source, skip_space(source, cursor));
+    }
+    if kind == GeneratedInlineKind::Listings {
         let mut cursor = position;
         optional_argument(source, &mut cursor);
         return braced_or_delimited_code_end(source, skip_space(source, cursor));

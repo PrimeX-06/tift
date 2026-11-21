@@ -622,6 +622,19 @@ impl BreakConfig {
                     } else {
                         &ENVIRONMENT
                     })
+                } else if category == "item" {
+                    static ITEM: BoundaryRules = BoundaryRules {
+                        begin: BreakMode::Line,
+                        body: BreakMode::Preserve,
+                        end: BreakMode::Preserve,
+                        after: BreakMode::Preserve,
+                        row: BreakMode::Preserve,
+                        else_begin: BreakMode::Preserve,
+                        else_after: BreakMode::Preserve,
+                        or_begin: BreakMode::Preserve,
+                        or_after: BreakMode::Preserve,
+                    };
+                    Some(&ITEM)
                 } else {
                     None
                 }
@@ -657,6 +670,8 @@ pub struct SyntaxConfig {
     pub environment_argument_events: Vec<EnvironmentArgumentEvent>,
     #[serde(skip)]
     pub package_load_events: Vec<PackageLoadEvent>,
+    #[serde(skip)]
+    pub command_import_events: Vec<CommandImportEvent>,
     pub special: Vec<SpecialRule>,
     pub command_pattern: Option<String>,
     pub environment_pattern: Option<String>,
@@ -715,6 +730,7 @@ impl Default for SyntaxConfig {
             inferred_environment_arguments: BTreeMap::new(),
             environment_argument_events: Vec::new(),
             package_load_events: Vec::new(),
+            command_import_events: Vec::new(),
             special: Vec::new(),
             command_pattern: None,
             environment_pattern: None,
@@ -784,6 +800,20 @@ pub struct PackageLoadEvent {
     pub at: usize,
     pub loader: Option<(String, usize)>,
     pub packages: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ImportedCommand {
+    pub arguments: Option<EnvironmentArguments>,
+    pub literal_arguments: bool,
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct CommandImportEvent {
+    pub at: usize,
+    pub loader: Option<(String, usize)>,
+    pub commands: BTreeMap<String, ImportedCommand>,
 }
 
 impl EnvironmentArguments {

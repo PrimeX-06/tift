@@ -90,6 +90,7 @@ impl PersistentCache {
         source: &str,
         kind: FileKind,
         config: &Arc<CompiledConfig>,
+        input_graph: Option<blake3::Hash>,
     ) -> Option<Request> {
         if !config.config.cache.enabled {
             return None;
@@ -164,10 +165,14 @@ impl PersistentCache {
             FileKind::Tikz => 6,
         };
         let mut hash = blake3::Hasher::new();
-        hash.update(b"tift-result-cache-v2");
+        hash.update(b"tift-result-cache-v3");
         hash.update(engine.as_bytes());
         hash.update(options.fingerprint.as_bytes());
         hash.update(&[kind]);
+        field(
+            &mut hash,
+            input_graph.as_ref().map_or(&[], |graph| graph.as_bytes()),
+        );
         field(&mut hash, source.as_bytes());
         let key = hash.finalize().to_hex().to_string();
         let mut slot = blake3::Hasher::new();

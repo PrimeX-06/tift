@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
+pub(crate) mod expl3;
 mod printer;
 mod scanner;
 
@@ -30,8 +31,18 @@ pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
     config.config.code.algorithm2e
         && source.contains("\\begin")
         && (source.contains("algorithm") || source.contains("algocf"))
-        || config.config.code.expl3
-            && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
+        || config.config.code.expl3 && has_expl3_marker(source)
+}
+
+pub(crate) fn has_expl3_marker(source: &str) -> bool {
+    scanner::commands(source, &[])
+        .into_iter()
+        .any(|(_, name, _)| {
+            matches!(
+                name,
+                "ExplSyntaxOn" | "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile"
+            )
+        })
 }
 
 fn overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
@@ -163,7 +174,7 @@ fn math_environment(name: &str) -> bool {
 pub(crate) struct Opaque {
     source: String,
     marker_prefix: String,
-    entries: Vec<(String, String, bool)>,
+    entries: Vec<(String, String, bool, bool)>,
 }
 
 impl Opaque {
@@ -188,16 +199,26 @@ impl Opaque {
                     break;
                 }
             }
-            let marker = format!("{marker_prefix}{suffix}{{}}");
-            output.push_str(&marker);
             let original = &source[range.clone()];
-            if original.ends_with("\r\n") {
+            let display = if original.starts_with(r"\[") || original.starts_with("$$") {
+                "DISPLAY"
+            } else {
+                ""
+            };
+            let marker = format!("{marker_prefix}{display}{suffix}{{}}");
+            output.push_str(&marker);
+            let line_tail = original.trim_end_matches([' ', '\t']);
+            if line_tail.ends_with("\r\n") {
                 output.push_str("\r\n");
-            } else if original.ends_with('\n') {
+            } else if line_tail.ends_with('\n') {
                 output.push('\n');
             }
-            let starts_line = range.start == 0 || source[..range.start].ends_with('\n');
-            entries.push((marker, original.to_owned(), starts_line));
+            let external_indent = syntax::command_at(original, 0)
+                .is_some_and(|(name, _)| mathematical_command(name) || name == "directlua");
+            let starts_line =
+                !external_indent && (range.start == 0 || source[..range.start].ends_with('\n'));
+            let newline_before = source[..range.start].ends_with('\n');
+            entries.push((marker, original.to_owned(), starts_line, newline_before));
             cursor = range.end;
         }
         output.push_str(&source[cursor..]);
@@ -220,7 +241,7 @@ impl Opaque {
             .entries
             .iter()
             .enumerate()
-            .map(|(index, (marker, _, _))| (marker.as_str(), index))
+            .map(|(index, (marker, _, _, _))| (marker.as_str(), index))
             .collect::<HashMap<_, _>>();
         let mut seen = vec![false; self.entries.len()];
         let mut positions = Vec::with_capacity(self.entries.len());
@@ -233,11 +254,31 @@ impl Opaque {
             {
                 end += 1;
             }
-            if !formatted[end..].starts_with("{}") {
+            let word_end = end;
+            while formatted
+                .as_bytes()
+                .get(end)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                end += 1;
+            }
+            if formatted.as_bytes().get(end) != Some(&b'{') {
                 continue;
             }
-            end += 2;
-            let Some(&index) = markers.get(&formatted[position..end]) else {
+            end += 1;
+            while formatted
+                .as_bytes()
+                .get(end)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                end += 1;
+            }
+            if formatted.as_bytes().get(end) != Some(&b'}') {
+                continue;
+            }
+            end += 1;
+            let key = format!("{}{{}}", &formatted[position..word_end]);
+            let Some(&index) = markers.get(key.as_str()) else {
                 continue;
             };
             if std::mem::replace(&mut seen[index], true) {
@@ -252,13 +293,17 @@ impl Opaque {
         // restoration order for a reordered result, whose inserted line ends
         // can affect another marker's indentation boundary.
         if positions.windows(2).any(|pair| pair[0].2 >= pair[1].2) {
-            return self.restore_reordered(formatted);
+            let mut normalized = formatted.to_owned();
+            for &(start, end, index) in positions.iter().rev() {
+                normalized.replace_range(start..end, &self.entries[index].0);
+            }
+            return self.restore_reordered(&normalized);
         }
         let mut output = String::with_capacity(formatted.len());
         let mut cursor = 0;
         let mut line_start = 0;
         for (position, mut end, index) in positions {
-            let (_, original, starts_line) = &self.entries[index];
+            let (_, original, starts_line, newline_before) = &self.entries[index];
             append_tracking_line(&mut output, &formatted[cursor..position], &mut line_start);
             if *starts_line
                 && output[line_start..]
@@ -267,13 +312,42 @@ impl Opaque {
             {
                 output.truncate(line_start);
             }
-            if original.ends_with('\n') {
+            if original.trim_end_matches([' ', '\t']).ends_with('\n') {
                 if formatted[end..].starts_with("\r\n") {
                     end += 2;
                 } else if formatted[end..].starts_with('\n') {
                     end += 1;
                 }
+                if !original.ends_with('\n') {
+                    while matches!(formatted.as_bytes().get(end), Some(b' ' | b'\t')) {
+                        end += 1;
+                    }
+                }
             }
+            // A marker that starts after a printer newline can represent a
+            // range whose original bytes start with that same newline. Keep
+            // one boundary so repeated formatting does not grow blank lines.
+            let original = if original.starts_with("\r\n")
+                && !newline_before
+                && line_start > 0
+                && output[line_start..]
+                    .bytes()
+                    .all(|byte| byte == b' ' || byte == b'\t')
+            {
+                output.truncate(line_start);
+                &original[2..]
+            } else if original.starts_with('\n')
+                && !newline_before
+                && line_start > 0
+                && output[line_start..]
+                    .bytes()
+                    .all(|byte| byte == b' ' || byte == b'\t')
+            {
+                output.truncate(line_start);
+                &original[1..]
+            } else {
+                original
+            };
             append_tracking_line(&mut output, original, &mut line_start);
             cursor = end;
         }
@@ -283,7 +357,7 @@ impl Opaque {
 
     fn restore_reordered(&self, formatted: &str) -> Option<String> {
         let mut output = formatted.to_owned();
-        for (marker, original, starts_line) in &self.entries {
+        for (marker, original, starts_line, _) in &self.entries {
             let position = output.find(marker)?;
             let mut start = position;
             if *starts_line {
@@ -298,11 +372,16 @@ impl Opaque {
                 }
             }
             let mut end = position + marker.len();
-            if original.ends_with('\n') {
+            if original.trim_end_matches([' ', '\t']).ends_with('\n') {
                 if output[end..].starts_with("\r\n") {
                     end += 2;
                 } else if output[end..].starts_with('\n') {
                     end += 1;
+                }
+                if !original.ends_with('\n') {
+                    while matches!(output.as_bytes().get(end), Some(b' ' | b'\t')) {
+                        end += 1;
+                    }
                 }
             }
             output.replace_range(start..end, original);
@@ -326,15 +405,74 @@ pub(crate) fn protected_ranges(
     let mut protection = config.config.clone();
     if allow_expl3 {
         protection.protect.expl3 = false;
+        if protection.protect.macro_bodies {
+            let mut bodies = Vec::new();
+            let mut cursor = 0;
+            while cursor < source.len() {
+                if source.as_bytes()[cursor] == b'%' {
+                    cursor += source[cursor..]
+                        .find('\n')
+                        .map_or(source.len() - cursor, |offset| offset + 1);
+                } else if let Some((name, end)) = syntax::command_at(source, cursor) {
+                    if let Some((environment, true, after)) =
+                        syntax::env_after_command(source, name, end)
+                        && (config
+                            .config
+                            .protect
+                            .environments
+                            .iter()
+                            .any(|name| name == environment)
+                            || config
+                                .config
+                                .protect
+                                .file_contents
+                                .iter()
+                                .any(|name| name == environment))
+                    {
+                        let terminator = format!("\\end{{{environment}}}");
+                        cursor = source[after..]
+                            .find(&terminator)
+                            .map_or(source.len(), |offset| after + offset + terminator.len());
+                    } else if let Some(body) = syntax::expl3_definition_body(source, name, end) {
+                        cursor = body.end;
+                        bodies.push(body);
+                    } else {
+                        cursor = syntax::primitive_data_end(source, name, end)
+                            .or_else(|| syntax::delayed_data_end(source, name, end))
+                            .unwrap_or(end);
+                    }
+                } else {
+                    cursor += source[cursor..].chars().next().unwrap().len_utf8();
+                }
+            }
+            if !bodies.is_empty() {
+                let mut ranges =
+                    syntax::protected_ranges_for_expl3_outer(source, &protection, &config.syntax)?;
+                ranges.retain(|range| !bodies.contains(range));
+                for body in bodies {
+                    let interior = body.start + 1..body.end - 1;
+                    match protected_ranges(&source[interior.clone()], config, true) {
+                        Ok(local) => {
+                            ranges.extend(local.into_iter().map(|range| {
+                                interior.start + range.start..interior.start + range.end
+                            }))
+                        }
+                        Err(_) => ranges.push(body),
+                    }
+                }
+                return Ok(merged(ranges));
+            }
+        }
     }
     syntax::protected_ranges_with_syntax(source, &protection, &config.syntax)
 }
 
 fn matching_ending(formatted: &str, original: &str) -> String {
     let mut formatted = formatted.trim_end_matches(['\r', '\n']).to_owned();
-    if original.ends_with("\r\n") {
+    let tail = original.trim_end_matches([' ', '\t']);
+    if tail.ends_with("\r\n") {
         formatted.push_str("\r\n");
-    } else if original.ends_with('\n') {
+    } else if tail.ends_with('\n') {
         formatted.push('\n');
     }
     formatted
@@ -382,8 +520,7 @@ pub(crate) fn format_code_with_context(
             math_recheck: false,
         });
     }
-    let expl3_active = config.config.code.expl3
-        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"));
+    let expl3_active = config.config.code.expl3 && has_expl3_marker(source);
     let expl3_ranges = if expl3_active && config.config.protect.expl3 {
         Some(parsing.expl3_protected_ranges(source)?)
     } else {
@@ -421,7 +558,7 @@ pub(crate) fn format_code_with_context(
         if config.config.protect.macro_bodies && !config.config.protect.format_macro_bodies {
             stored.extend(model.declarations().iter().filter_map(|declaration| {
                 syntax::command_at(source, declaration.span.start)
-                    .filter(|(name, _)| name.starts_with("cs_"))
+                    .filter(|(name, _)| syntax::expl3_definition_variant(name).is_some())
                     .map(|_| declaration.span.clone())
             }));
         }
@@ -541,6 +678,44 @@ pub(crate) fn format_code_with_context(
             math_recheck: false,
         });
     }
+    if expl3_active {
+        let mut nested_data = Vec::new();
+        for (fragment, expl3) in &fragments {
+            if !expl3 {
+                continue;
+            }
+            let mut end_of_data = fragment.start;
+            // Commands in a replacement body do not enter the top-level
+            // declaration model. Keep their literal arguments opaque here
+            // so enclosing indentation cannot alter the stored bytes either.
+            let data = &source[fragment.clone()];
+            let excluded = overlapping_ranges(&protected, fragment)
+                .iter()
+                .map(|range| {
+                    range.start.saturating_sub(fragment.start)
+                        ..range.end.min(fragment.end) - fragment.start
+                })
+                .collect::<Vec<_>>();
+            for (start, name, end) in scanner::commands(data, &excluded) {
+                if fragment.start + start < end_of_data {
+                    continue;
+                }
+                if let Some(argument) = crate::source_model::expl3_stored_arguments(data, name, end)
+                {
+                    end_of_data = fragment.start + argument.end;
+                    if data.as_bytes().get(argument.start) == Some(&b'{')
+                        && argument.end > argument.start + 2
+                    {
+                        nested_data.push(
+                            fragment.start + argument.start + 1..fragment.start + argument.end - 1,
+                        );
+                    }
+                }
+            }
+        }
+        protected.extend(nested_data);
+        protected = merged(protected);
+    }
     let mathematics = math_ranges(source, &protected);
     let recheck_ranges = if config.config.math.enabled {
         mathematics
@@ -598,7 +773,7 @@ pub(crate) fn format_code_with_context(
         // A conditional or catcode region is kept together with all of its bytes.
         opaque.retain(|range| !range.is_empty());
         let opaque = Opaque::new(original, opaque);
-        let formatted = printer::format(opaque.source(), expl3, config.config.indent.width);
+        let formatted = printer::format(&opaque, expl3, config.config.indent.width);
         let line_start = source[..fragment.start]
             .rfind('\n')
             .map_or(0, |position| position + 1);

@@ -117,7 +117,7 @@ pub(crate) fn format_math_with_context(
         && config.config.code.expl3
         && config.config.protect.format_macro_bodies
         && matches!(kind, FileKind::Tex | FileKind::Style | FileKind::Class)
-        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
+        && crate::code_layout::has_expl3_marker(source)
     {
         let protected = parsing.expl3_protected_ranges(source)?;
         let parsed = parsing.snapshot(source, false, false)?;
@@ -171,7 +171,7 @@ fn format_math_snapshot(
         return Ok(source.into());
     }
     if kind == FileKind::Dtx {
-        return format_documented_math(source, config, parsing);
+        return format_documented_math(source, config);
     }
     let mut protected = math_protection(source, config, parsing)?;
     if kind == FileKind::Ins {
@@ -186,11 +186,14 @@ fn format_math_snapshot(
         protected: &protected,
         edits: Vec::new(),
         visited: HashSet::new(),
+        opaque: BTreeMap::new(),
+        depth: 0,
+        limit_hit: false,
     };
     if config.config.math.spacing {
         for region in &modes.regions {
             if valid_sized_delimiters(source, &region.body, &modes) {
-                editor.sequence(region.body.clone(), false, region.text_cases);
+                editor.format_region(region.body.clone(), region.text_cases);
             }
         }
     }
@@ -257,38 +260,34 @@ impl PositionMap {
     }
 }
 
-fn format_documented_math(
-    source: &str,
-    config: &CompiledConfig,
-    parsing: &mut crate::parse_context::ParseContext<'_>,
-) -> Result<String, FormatError> {
+fn format_documented_math(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
     // Executable code and documentation carry independent TeX state. A code
     // catcode assignment or open group cannot hide documentation environments.
-    let code = format_math_with_context(source, FileKind::Style, config, parsing)?;
-    let parsed = parsing.snapshot(&code, false, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        &code,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let documentation_config =
-        crate::docstrip::documentation_config(analysis.model().document_class(), config)?;
+    // Executable fragments were handled with their own scopes by docstrip.
+    let documentation_config = crate::docstrip::documentation_config(
+        crate::source_model::SourceModel::from_declaration_source(source, &config.config)
+            .document_class(),
+        config,
+    )?;
     let documentation_config = documentation_config.as_ref().unwrap_or(config);
     if !documentation_config.config.math.spacing {
-        return Ok(code);
+        return Ok(source.into());
     }
-    let (documentation, margins) = documentation_source(&code);
+    let (documentation, margins) = documentation_source(source);
     let model = crate::source_model::SourceModel::analyze(&documentation, documentation_config);
     let mut protected = model.protected_ranges().to_vec();
     let mut documentation_parsing =
         crate::parse_context::ParseContext::with_model(documentation_config, Some(model));
-    let modes = MathModes::build(
+    let modes = match MathModes::build(
         &documentation,
         documentation_config,
         &protected,
         &mut documentation_parsing,
-    )?;
+    ) {
+        Ok(modes) => modes,
+        Err(FormatError::Syntax(_)) => return Ok(source.into()),
+        Err(error) => return Err(error),
+    };
     protected.extend(margins);
     protected = code_layout::merged(protected);
     let mut editor = Editor {
@@ -298,13 +297,16 @@ fn format_documented_math(
         protected: &protected,
         edits: Vec::new(),
         visited: HashSet::new(),
+        opaque: BTreeMap::new(),
+        depth: 0,
+        limit_hit: false,
     };
     for region in &modes.regions {
         if valid_sized_delimiters(&documentation, &region.body, &modes) {
-            editor.sequence(region.body.clone(), false, region.text_cases);
+            editor.format_region(region.body.clone(), region.text_cases);
         }
     }
-    Ok(editor.finish(&code))
+    Ok(editor.finish(source))
 }
 
 fn math_protection(
@@ -312,12 +314,114 @@ fn math_protection(
     config: &CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<Vec<Range<usize>>, FormatError> {
-    if config.config.code.expl3
-        && (source.contains("\\ExplSyntaxOn") || source.contains("\\ProvidesExpl"))
+    let mut protected = if config.config.code.expl3 && crate::code_layout::has_expl3_marker(source)
     {
         parsing.expl3_protected_ranges(source)
     } else {
         Ok(parsing.snapshot(source, false, false)?.protected.clone())
+    }?;
+    if config.config.protect.macro_bodies && config.config.code.expl3 {
+        // Definition bodies are formatted independently above. Keep their
+        // stored environments and conditional fragments out of the outer
+        // mathematical execution stream, even when no arity can be inferred.
+        let mut cursor = 0;
+        let mut existing = protected.clone();
+        existing.sort_by_key(|range| range.start);
+        while cursor < source.len() {
+            let index = existing.partition_point(|range| range.end <= cursor);
+            if let Some(range) = existing.get(index).filter(|range| range.start <= cursor) {
+                cursor = range.end;
+                continue;
+            }
+            if source.as_bytes()[cursor] == b'%' {
+                cursor += source[cursor..]
+                    .find('\n')
+                    .map_or(source.len() - cursor, |offset| offset + 1);
+            } else if let Some((name, end)) = syntax::command_at(source, cursor) {
+                if let Some(body) = syntax::expl3_definition_body(source, name, end) {
+                    cursor = body.end;
+                    protected.push(body);
+                } else {
+                    cursor = end;
+                }
+            } else {
+                cursor += source[cursor..].chars().next().unwrap().len_utf8();
+            }
+        }
+    }
+    protect_delimited_file_metadata(source, &mut protected);
+    Ok(code_layout::merged(protected))
+}
+
+/// `expl3`'s file metadata reader consumes `$...$` as a delimited argument.
+/// Those dollars are data even though they use the same delimiters as inline
+/// mathematics, so keep the whole argument out of the math scanner.
+fn protect_delimited_file_metadata(source: &str, protected: &mut Vec<Range<usize>>) {
+    let existing_protection = protected.clone();
+    let mut cursor = 0;
+    let mut protection_index = 0;
+    while cursor < source.len() {
+        while existing_protection
+            .get(protection_index)
+            .is_some_and(|range| range.end <= cursor)
+        {
+            protection_index += 1;
+        }
+        if let Some(range) = existing_protection
+            .get(protection_index)
+            .filter(|range| range.start <= cursor)
+        {
+            cursor = range.end;
+            continue;
+        }
+        if source.as_bytes()[cursor] == b'%' {
+            cursor = source[cursor..]
+                .find('\n')
+                .map_or(source.len(), |end| cursor + end + 1);
+            continue;
+        }
+        if let Some((name, end)) = command_at(source, cursor) {
+            if matches!(
+                name,
+                "ProvidesPackageSVN" | "ProvidesClassSVN" | "ProvidesFileSVN"
+            ) {
+                // svn-prov reads the mandatory argument as an RCS keyword,
+                // with an optional filename before it. Its dollars, dates
+                // and hyphens must survive byte for byte.
+                let mut start = crate::trivia::skip(source, end);
+                if source.as_bytes().get(start) == Some(&b'[')
+                    && let Some(close) = syntax::balanced_end(source, start, b'[', b']')
+                {
+                    start = crate::trivia::skip(source, close);
+                }
+                if let Some(close) = syntax::balanced_end(source, start, b'{', b'}') {
+                    protected.push(start..close);
+                    cursor = close;
+                    continue;
+                }
+            }
+            if name == "GetIdInfo" {
+                let delimiter = skip_space(source, end, source.len());
+                if source.as_bytes().get(delimiter) == Some(&b'$') {
+                    let mut finish = delimiter + 1;
+                    while finish < source.len() {
+                        if source.as_bytes()[finish] == b'$' && !syntax::is_escaped(source, finish)
+                        {
+                            protected.push(delimiter..finish + 1);
+                            cursor = finish + 1;
+                            break;
+                        }
+                        finish += source[finish..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    if cursor > end {
+                        continue;
+                    }
+                }
+            }
+            cursor = end;
+        } else {
+            cursor += source[cursor..].chars().next().map_or(1, char::len_utf8);
+        }
     }
 }
 
@@ -373,6 +477,32 @@ fn skip_space(source: &str, mut cursor: usize, end: usize) -> usize {
     cursor
 }
 
+// Preserve adjacent groups when the command has no trusted math signature.
+fn opaque_arguments(
+    source: &str,
+    mut cursor: usize,
+    end: usize,
+) -> impl Iterator<Item = Range<usize>> {
+    std::iter::from_fn(move || {
+        loop {
+            cursor = skip_space(source, cursor, end);
+            if cursor >= end || source.as_bytes()[cursor] != b'%' {
+                break;
+            }
+            cursor += source[cursor..end].find('\n')? + 1;
+        }
+        let start = cursor;
+        let prefix = &source[..end];
+        let finish = match prefix.as_bytes().get(start)? {
+            b'[' => syntax::math_optional_argument_end(prefix, start),
+            b'{' => syntax::balanced_end(prefix, start, b'{', b'}'),
+            _ => None,
+        }?;
+        cursor = finish;
+        Some(start..finish)
+    })
+}
+
 /// Replace documentation margins in a same-length scan buffer, then keep their
 /// original byte ranges protected when projecting whitespace edits.
 fn documentation_source(source: &str) -> (String, Vec<Range<usize>>) {
@@ -392,11 +522,8 @@ fn documentation_source(source: &str) -> (String, Vec<Range<usize>>) {
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim_start_matches([' ', '\t']);
         let documentation = trimmed.strip_prefix('%');
-        let content = documentation.map(str::trim_start);
-        if content.is_some_and(|text| text.starts_with("\\end{macrocode}")) {
-            macrocode = false
-        } else if content.is_some_and(|text| text.starts_with("\\begin{macrocode}")) {
-            macrocode = true
+        if let Some(open) = crate::docstrip::macrocode_boundary(line) {
+            macrocode = open;
         } else if !macrocode
             && documentation.is_some_and(|text| {
                 !text.starts_with(['%', '<'])
@@ -440,7 +567,11 @@ fn valid_sized_delimiters(source: &str, range: &Range<usize>, modes: &MathModes)
                 .find('\n')
                 .map_or(range.end, |offset| cursor + offset + 1);
         } else if let Some((name, end)) = command_at(source, cursor) {
-            if let Some(signature) = modes.signature_at(name, cursor) {
+            let overridden = modes.is_overridden(name.trim_end_matches('*'), cursor);
+            if let Some(signature) = (!overridden)
+                .then(|| modes.signature_at(name, cursor))
+                .flatten()
+            {
                 for argument in modes
                     .arguments_at(source, cursor, end, range.end, signature)
                     .iter()
@@ -449,17 +580,11 @@ fn valid_sized_delimiters(source: &str, range: &Range<usize>, modes: &MathModes)
                         literal.insert(argument.range.start, argument.range.end);
                     }
                 }
-            } else if !symbols::known_command(name) && !matches!(name, "left" | "right" | "middle")
+            } else if (overridden || !symbols::known_command(name.trim_end_matches('*')))
+                && !matches!(name, "left" | "right" | "middle")
             {
-                let mut next = skip_space(source, end, range.end);
-                while source.as_bytes().get(next) == Some(&b'{') {
-                    let Some(closing) = syntax::balanced_end(source, next, b'{', b'}')
-                        .filter(|closing| *closing <= range.end)
-                    else {
-                        break;
-                    };
-                    literal.insert(next, closing);
-                    next = skip_space(source, closing, range.end);
+                for argument in opaque_arguments(source, end, range.end) {
+                    literal.insert(argument.start, argument.end);
                 }
             }
             match name {
@@ -493,9 +618,28 @@ struct Editor<'a> {
     protected: &'a [Range<usize>],
     edits: Vec<(Range<usize>, Cow<'static, str>)>,
     visited: HashSet<(usize, usize)>,
+    opaque: BTreeMap<usize, usize>,
+    depth: usize,
+    limit_hit: bool,
 }
 
 impl Editor<'_> {
+    fn inside_opaque(&self, at: usize) -> bool {
+        self.opaque
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(_, &end)| at < end)
+    }
+
+    fn format_region(&mut self, range: Range<usize>, text_cases: bool) {
+        let checkpoint = self.edits.len();
+        self.sequence(range, false, text_cases);
+        if self.limit_hit {
+            self.edits.truncate(checkpoint);
+            self.limit_hit = false;
+        }
+    }
+
     fn blocked(&self, range: &Range<usize>) -> bool {
         let index = self
             .protected
@@ -586,6 +730,25 @@ impl Editor<'_> {
     }
 
     fn atom(&mut self, cursor: usize, end: usize, script: bool) -> Atom {
+        // Both nested groups and chains of unbraced scripts recurse here.
+        if self.depth >= 64 {
+            self.limit_hit = true;
+            return Atom {
+                range: cursor..end,
+                class: MathClass::Ord,
+                delimiter: None,
+                command: false,
+                unary: false,
+                barrier: true,
+            };
+        }
+        self.depth += 1;
+        let atom = self.atom_inner(cursor, end, script);
+        self.depth -= 1;
+        atom
+    }
+
+    fn atom_inner(&mut self, cursor: usize, end: usize, script: bool) -> Atom {
         let character = self.source[cursor..].chars().next().unwrap();
         let mut range = cursor..cursor + character.len_utf8();
         let mut info = symbols::character_info(character);
@@ -631,9 +794,10 @@ impl Editor<'_> {
                 range.end =
                     crate::layout::row_terminator_end(self.source, command_end, end, name == "\\");
             }
-            if name == "begin"
-                && let Some(region) = self.modes.environment_at(cursor, end).cloned()
-            {
+            if let Some(finish) = self.modes.literal_environment_end(cursor, end) {
+                range.end = finish;
+                barrier = true;
+            } else if let Some(region) = self.modes.environment_at(cursor, end).cloned() {
                 self.sequence(region.body.clone(), script, region.text_cases);
                 range.end = region.environment.unwrap().end;
                 info.class = MathClass::Inner;
@@ -642,6 +806,14 @@ impl Editor<'_> {
                 "left"
                     | "right"
                     | "middle"
+                    | "big"
+                    | "Big"
+                    | "bigg"
+                    | "Bigg"
+                    | "bigm"
+                    | "Bigm"
+                    | "biggm"
+                    | "Biggm"
                     | "bigl"
                     | "bigr"
                     | "Bigl"
@@ -680,6 +852,21 @@ impl Editor<'_> {
                         MathClass::Open
                     } else if name.ends_with('r') || name == "right" {
                         MathClass::Close
+                    } else if matches!(name, "big" | "Big" | "bigg" | "Bigg") {
+                        let token = &self.source[delimiter_start..delimiter_end];
+                        if matches!(
+                            token,
+                            "(" | "[" | "\\{" | "\\langle" | "\\lvert" | "\\lVert"
+                        ) {
+                            MathClass::Open
+                        } else if matches!(
+                            token,
+                            ")" | "]" | "\\}" | "\\rangle" | "\\rvert" | "\\rVert"
+                        ) {
+                            MathClass::Close
+                        } else {
+                            MathClass::Ord
+                        }
                     } else {
                         MathClass::Ord
                     };
@@ -709,6 +896,10 @@ impl Editor<'_> {
                             } else {
                                 self.sequence(argument.body.clone(), script, false)
                             }
+                        } else if argument.domain == b'U'
+                            && !self.inside_opaque(argument.range.start)
+                        {
+                            self.opaque.insert(argument.range.start, argument.range.end);
                         }
                         range.end = argument.range.end;
                     }
@@ -716,17 +907,11 @@ impl Editor<'_> {
                         info = Default::default()
                     }
                 } else if overridden || !symbols::known_command(name) {
-                    // Unknown brace arguments are token data; bare brackets keep
-                    // their ordinary mathematical delimiter meaning.
-                    let mut next = skip_space(self.source, range.end, end);
-                    while self.source.as_bytes().get(next) == Some(&b'{') {
-                        let Some(closing) = syntax::balanced_end(self.source, next, b'{', b'}')
-                            .filter(|closing| *closing <= end)
-                        else {
-                            break;
-                        };
-                        range.end = closing;
-                        next = skip_space(self.source, range.end, end);
+                    for argument in opaque_arguments(self.source, command_end, end) {
+                        range.end = argument.end;
+                        if !self.inside_opaque(argument.start) {
+                            self.opaque.insert(argument.start, argument.end);
+                        }
                     }
                 }
             }
@@ -934,7 +1119,7 @@ impl Editor<'_> {
     }
 
     fn sequence(&mut self, range: Range<usize>, script: bool, text_cases: bool) {
-        if !self.visited.insert((range.start, range.end)) {
+        if self.inside_opaque(range.start) || !self.visited.insert((range.start, range.end)) {
             return;
         }
         let atoms = self.atoms(range.clone(), script, text_cases);
@@ -969,7 +1154,12 @@ impl Editor<'_> {
                 if !authored.contains(['\r', '\n']) {
                     self.edit(
                         gap,
-                        if control_word_seam(left_text, right_text) {
+                        if control_word_seam(left_text, right_text)
+                            || left.delimiter == Some(DelimiterRole::Open)
+                                && sized_delimiter(left_text)
+                            || right.delimiter == Some(DelimiterRole::Close)
+                                && sized_delimiter(right_text)
+                        {
                             " "
                         } else {
                             ""
@@ -1091,6 +1281,9 @@ fn layout_displays(
         protected,
         edits: Vec::new(),
         visited: HashSet::new(),
+        opaque: BTreeMap::new(),
+        depth: 0,
+        limit_hit: false,
     };
     let mut replacements = Vec::new();
     let ending = if source.contains("\r\n") {
@@ -1102,6 +1295,9 @@ fn layout_displays(
         let Some((start, name)) = &region.display else {
             continue;
         };
+        if editor.inside_opaque(*start) {
+            continue;
+        }
         let body = &source[region.body.clone()];
         if body.contains('%') || body.contains("\\\\") || overlaps(protected, &region.body) {
             continue;
@@ -1142,6 +1338,9 @@ fn layout_displays(
                 continue;
             }
             let atoms = editor.atoms(region.body.clone(), false, false);
+            if std::mem::take(&mut editor.limit_hit) {
+                continue;
+            }
             if let Some((first, last)) = atoms.first().zip(atoms.last())
                 && let Some(flat) = flat_piece(source, &atoms, &(first.range.start..last.range.end))
             {
@@ -1185,6 +1384,9 @@ fn layout_displays(
             continue;
         }
         let atoms = editor.atoms(region.body.clone(), false, false);
+        if std::mem::take(&mut editor.limit_hit) {
+            continue;
+        }
         let candidates = break_candidates(source, &atoms, layout.priority);
         if let Some(replacement) = greedy_breaks(source, &atoms, &candidates, &layout)
             && replacement != body
@@ -1451,4 +1653,8 @@ fn flat_piece(source: &str, atoms: &[Atom], range: &Range<usize>) -> Option<Stri
         output.push_str(tail)
     }
     Some(output)
+}
+
+fn sized_delimiter(text: &str) -> bool {
+    command_at(text, 0).is_some_and(|(name, _)| matches!(name, "big" | "Big" | "bigg" | "Bigg"))
 }

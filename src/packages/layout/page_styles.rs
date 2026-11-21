@@ -46,6 +46,9 @@ macro_rules! commands {
 }
 
 commands! {
+    "ihead" | "chead" | "ohead" | "ifoot" | "cfoot" | "ofoot"
+        | "lehead" | "cehead" | "rehead" | "lohead" | "cohead" | "rohead"
+        | "lefoot" | "cefoot" | "refoot" | "lofoot" | "cofoot" | "rofoot" => "om",
     // fancyhdr.sty:144--149,193--198,378,410--429,687--691,698--711,769.
     "fancyhead" | "fancyfoot" | "fancyhf" | "fancyheadoffset" | "fancyfootoffset"
         | "fancyhfoffset" => "om",

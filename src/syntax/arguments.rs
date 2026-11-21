@@ -65,6 +65,8 @@ struct ScopedSignature {
 struct BoundSignature {
     syntax: xparse::Signature,
     math: Option<crate::packages::math::Signature>,
+    literal: bool,
+    literal_slots: u16,
 }
 
 impl Default for SignatureBindings {
@@ -113,6 +115,77 @@ impl SignatureBindings {
         self.values[0].get(name)?.last()?.binding.as_ref()?.math
     }
 
+    pub(super) fn literal(&self, name: &str) -> bool {
+        self.values[0]
+            .get(name)
+            .and_then(|values| values.last())
+            .and_then(|value| value.binding.as_ref())
+            .is_some_and(|binding| binding.literal)
+    }
+
+    pub(super) fn mark_literal(&mut self, name: &str) {
+        if let Some(binding) = self.values[0]
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+            .and_then(|value| value.binding.as_mut())
+        {
+            binding.literal = true;
+        }
+    }
+
+    pub(super) fn set_literal(&mut self, name: &str, literal: bool) {
+        if let Some(binding) = self.values[0]
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+            .and_then(|value| value.binding.as_mut())
+        {
+            binding.literal = literal;
+        }
+    }
+
+    pub(super) fn mark_literal_slots(&mut self, name: &str, slots: u16) {
+        if let Some(binding) = self.values[0]
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+            .and_then(|value| value.binding.as_mut())
+        {
+            binding.literal_slots = slots;
+        }
+    }
+
+    pub(super) fn literal_slots(&self, name: &str) -> u16 {
+        self.values[0]
+            .get(name)
+            .and_then(|values| values.last())
+            .and_then(|value| value.binding.as_ref())
+            .map_or(0, |binding| binding.literal_slots)
+    }
+
+    pub(super) fn import(&mut self, name: &str, command: &crate::config::ImportedCommand) {
+        let signature = command.arguments.as_ref().and_then(|arguments| {
+            let signature = arguments.signature.clone().unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    if arguments.optional_arguments {
+                        "o"
+                    } else {
+                        ""
+                    },
+                    "m".repeat(arguments.arguments)
+                )
+            });
+            xparse::Signature::parse(&signature)
+        });
+        self.assign(false, name.to_owned(), signature, None, command.global);
+        if let Some(binding) = self.values[0]
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+            .and_then(|value| value.binding.as_mut())
+        {
+            binding.literal = command.literal_arguments;
+        }
+    }
+
     pub(super) fn contains(&self, environment: bool, name: &str) -> bool {
         self.values[usize::from(environment)].contains_key(name)
     }
@@ -149,7 +222,12 @@ impl SignatureBindings {
         let index = usize::from(environment);
         let depth = if global { 0 } else { self.scopes.len() - 1 };
         let values = self.values[index].entry(name.clone()).or_default();
-        let binding = signature.map(|syntax| BoundSignature { syntax, math });
+        let binding = signature.map(|syntax| BoundSignature {
+            syntax,
+            math,
+            literal: false,
+            literal_slots: 0,
+        });
         if global {
             values.clear();
         }
@@ -188,6 +266,29 @@ pub(crate) fn undelimited_signature(parameter_text: &str) -> Option<String> {
 /// declared token sequence. Catcode-dependent and whitespace delimiters stay
 /// unknown so the reader cannot change their meaning.
 pub(crate) fn parameter_signature(parameter_text: &str) -> Option<String> {
+    let uncommented;
+    let parameter_text = if parameter_text.contains('%') {
+        let mut output = String::new();
+        let mut cursor = 0;
+        while cursor < parameter_text.len() {
+            if parameter_text.as_bytes()[cursor] == b'%' {
+                cursor += parameter_text[cursor..]
+                    .find('\n')
+                    .map_or(parameter_text.len() - cursor, |at| at + 1);
+            } else if let Some((_, end)) = command_at(parameter_text, cursor) {
+                output.push_str(&parameter_text[cursor..end]);
+                cursor = end;
+            } else {
+                let character = parameter_text[cursor..].chars().next()?;
+                output.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+        uncommented = output;
+        &uncommented
+    } else {
+        parameter_text
+    };
     if let Some(signature) = undelimited_signature(parameter_text) {
         return Some(signature);
     }

@@ -822,6 +822,15 @@ pub(crate) fn verbatim_declaration(
     let mut names = Vec::new();
     let mut terminator = VerbatimTerminator::AnyPosition;
     match command {
+        "NewPitonEnvironment"
+        | "RenewPitonEnvironment"
+        | "DeclarePitonEnvironment"
+        | "ProvidePitonEnvironment" => {
+            names.push(literal_name(&source[mandatory(source, &mut cursor)?])?);
+            mandatory(source, &mut cursor)?;
+            mandatory(source, &mut cursor)?;
+            mandatory(source, &mut cursor)?;
+        }
         // minted.sty:1895--1910; the starred environment takes extra options.
         "newminted" => {
             let explicit = option(source, &mut cursor);

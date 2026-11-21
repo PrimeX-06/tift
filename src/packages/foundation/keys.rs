@@ -17,7 +17,8 @@ pub(crate) fn command_signature(name: &str) -> Option<&'static str> {
         "DeclareComplementaryOption" | "DeclareVoidOption" => "mm",
         "define@key" => "mmom",
         "setkeys" => "mm",
-        "ifthenelse" => "mmm",
+        "ifthenelse" | "ifboolexpr" => "mmm",
+        "ifboolKV" => "ommm",
         "newtest" => "mom",
         "RequirePDFTeX" | "RequireXeTeX" | "RequireLuaTeX" | "RequirepTeX" | "RequireupTeX"
         | "RequirepTeXng" | "RequireVTeX" | "RequireAleph" | "RequireLuaHBTeX" | "RequireHINT"
@@ -46,6 +47,8 @@ pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
         "define@key",
         "setkeys",
         "ifthenelse",
+        "ifboolexpr",
+        "ifboolKV",
         "newtest",
         "RequirePDFTeX",
         "RequireXeTeX",
@@ -88,7 +91,12 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
     let base = name.trim_end_matches('*');
     let ranges = arguments(source, end, command_signature(name)?)?;
     match base {
-        "keys_define:nn" | "ifthenelse" => ranges.first().map(|range| range.end),
+        "keys_define:nn" | "ifthenelse" | "ifboolexpr" => ranges.first().map(|range| range.end),
+        "ifboolKV" => ranges
+            .get(usize::from(
+                source.as_bytes()[ranges.first()?.start] == b'[',
+            ))
+            .map(|range| range.end),
         "setkeys" => None,
         "keys_set_known:nnN" => ranges.get(1).map(|range| range.end),
         "ProcessKeyvalOptions" if name.ends_with('*') => None,
@@ -139,6 +147,51 @@ pub(crate) fn definition_entries(source: &str) -> Vec<Range<usize>> {
 /// Literal property values are delayed definition data. Their braces are
 /// included so arbitrary TeX bodies cannot alter the surrounding parser scope.
 pub(crate) fn delayed_ranges(source: &str, name: &str, end: usize) -> Vec<Range<usize>> {
+    if matches!(
+        name,
+        "tikzset" | "pgfkeys" | "pgfqkeys" | "tcbset" | "forestset" | "gtrset"
+    ) {
+        let shape = if name == "pgfqkeys" { "mm" } else { "m" };
+        let Some(args) = arguments(source, end, shape) else {
+            return Vec::new();
+        };
+        let Some(body) = args
+            .last()
+            .filter(|range| source.as_bytes()[range.start] == b'{')
+        else {
+            return Vec::new();
+        };
+        let body = body.start + 1..body.end - 1;
+        let mut ranges = Vec::new();
+        for entry in definition_entries(&source[body.clone()]) {
+            let text = &source[body.start + entry.start..body.start + entry.end];
+            let Some(equal) = text.find('=') else {
+                continue;
+            };
+            let key = text[..equal].trim();
+            if key.contains("/.style")
+                || key.contains("/.code")
+                || key.contains("/.append code")
+                || key.contains("/.prepend code")
+            {
+                let start = trivia::skip(source, body.start + entry.start + equal + 1);
+                let finish = body.start + entry.end;
+                // Read every group in handlers such as .style args={#1}{...}.
+                let mut cursor = start;
+                while source.as_bytes().get(cursor) == Some(&b'{') {
+                    let Some(end) = syntax::balanced_end(source, cursor, b'{', b'}') else {
+                        break;
+                    };
+                    if end > finish {
+                        break;
+                    }
+                    ranges.push(cursor..end);
+                    cursor = trivia::skip(source, end);
+                }
+            }
+        }
+        return ranges;
+    }
     if name != "keys_define:nn" {
         return Vec::new();
     }

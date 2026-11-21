@@ -22,6 +22,7 @@ pub(crate) struct MathModes {
     signatures: HashMap<usize, math::Signature>,
     arguments: HashMap<usize, Vec<MathArgument>>,
     environments: HashMap<usize, usize>,
+    literal_environments: HashMap<usize, Range<usize>>,
 }
 
 impl MathModes {
@@ -39,6 +40,14 @@ impl MathModes {
             .environments
             .drain()
             .map(|(at, index)| Some((positions.position(at, true)?, index)))
+            .collect::<Option<_>>()?;
+        self.literal_environments = self
+            .literal_environments
+            .drain()
+            .map(|(at, mut range)| {
+                positions.remap_range(&mut range)?;
+                Some((positions.position(at, true)?, range))
+            })
             .collect::<Option<_>>()?;
         self.source_overrides = self
             .source_overrides
@@ -71,6 +80,13 @@ impl MathModes {
             .as_ref()
             .filter(|range| range.end <= limit)
             .map(|_| region)
+    }
+
+    pub(super) fn literal_environment_end(&self, at: usize, limit: usize) -> Option<usize> {
+        self.literal_environments
+            .get(&at)
+            .filter(|range| range.end <= limit)
+            .map(|range| range.end)
     }
 
     pub(crate) fn signature_at(&self, name: &str, at: usize) -> Option<math::Signature> {
@@ -113,7 +129,8 @@ impl MathModes {
         protected: &[Range<usize>],
         parsing: &mut crate::parse_context::ParseContext<'_>,
     ) -> Result<Self, FormatError> {
-        let parsed = parsing.snapshot(source, true, true)?;
+        let same_protection = parsing.snapshot(source, false, false)?.protected == protected;
+        let parsed = parsing.snapshot(source, same_protection, same_protection)?;
         let exposed_model = (parsed.protected != protected).then(|| {
             parsed
                 .metadata
@@ -152,7 +169,14 @@ impl MathModes {
         let mut signatures = HashMap::new();
         let mut arguments = HashMap::new();
         let mut source_overrides = HashSet::new();
+        let mut literal_environments = HashMap::new();
         for block in blocks {
+            if block.kind == BlockKind::Environment
+                && (block.name == "tikzcd" || crate::tikz_scan::environment(&block.name))
+            {
+                literal_environments.insert(block.begin.start, block.begin.start..block.end.end);
+                continue;
+            }
             let special = block.kind == BlockKind::Special
                 && matches!(
                     block.name.as_str(),
@@ -164,19 +188,20 @@ impl MathModes {
                     .syntax
                     .environment_arguments
                     .contains_key(block.name.as_str())
-                && is_math_environment(&block.name);
+                && is_math_environment(&block.name)
+                && block.name != "tikzcd";
             if special || environment {
                 let mut body = block.body.clone();
                 if environment {
-                    let signature = math::header_signature(&block.name).or_else(|| {
-                        match block.name.trim_end_matches('*') {
+                    let signature = crate::additional_package_syntax::header_signature(&block.name)
+                        .or_else(|| math::header_signature(&block.name))
+                        .or_else(|| match block.name.trim_end_matches('*') {
                             "array" | "subarray" => Some("om"),
                             "alignedat" => Some("om"),
                             "alignat" => Some("m"),
                             "aligned" | "gathered" => Some("o"),
                             _ => None,
-                        }
-                    });
+                        });
                     if let Some(signature) = signature {
                         let arguments = crate::layout::signature_argument_ranges(
                             source,
@@ -292,12 +317,14 @@ impl MathModes {
             arguments,
             source_overrides,
             environments,
+            literal_environments,
         })
     }
 }
 
 pub(crate) fn is_math_environment(name: &str) -> bool {
     math::is_math_environment(name)
+        || matches!(name, "empheq" | "numcases" | "subnumcases")
         || crate::config::matrix_environment(name)
         || matches!(
             name.trim_end_matches('*'),

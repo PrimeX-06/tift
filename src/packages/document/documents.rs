@@ -22,6 +22,52 @@ pub(crate) const LIST_ENVIRONMENTS: &[&str] = &[
 
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &["frame*"];
 
+/// scrguide.cls chooses one of these two document variants. A common
+/// literal environment opening has the same stack effect in either edition.
+pub(crate) fn branch_environment_boundary(
+    source: &str,
+    name: &str,
+    end: usize,
+) -> Option<(crate::config::EnvironmentAlias, usize)> {
+    if name != "iffree" {
+        return None;
+    }
+    let arguments =
+        crate::layout::signature_argument_ranges(source, end..source.len(), "mm".bytes());
+    if arguments.len() != 2 {
+        return None;
+    }
+    let mut common = None;
+    for argument in &arguments {
+        if source.as_bytes()[argument.start] != b'{' {
+            return None;
+        }
+        let text = &source[argument.start + 1..argument.end - 1];
+        let start = crate::trivia::skip(text, 0);
+        let (command, end) = crate::syntax::command_at(text, start)?;
+        let (environment, true, mut finish) = crate::syntax::env_after_command(text, command, end)?
+        else {
+            return None;
+        };
+        finish = crate::trivia::skip(text, finish);
+        if text.as_bytes().get(finish) == Some(&b'[') {
+            finish =
+                crate::trivia::skip(text, crate::syntax::balanced_end(text, finish, b'[', b']')?);
+        }
+        if finish != text.len() || common.as_ref().is_some_and(|value| value != environment) {
+            return None;
+        }
+        common = Some(environment.to_owned());
+    }
+    Some((
+        crate::config::EnvironmentAlias {
+            environment: common?,
+            begin: true,
+        },
+        arguments[1].end,
+    ))
+}
+
 pub(crate) fn documentation_short_verbatim(class: Option<&str>) -> Option<&'static str> {
     // ltxdoc.cls:72 activates the doc package's short verbatim bar for its
     // documentation. The delimiter is scoped to that documentation view.
@@ -31,6 +77,8 @@ pub(crate) fn documentation_short_verbatim(class: Option<&str>) -> Option<&'stat
 /// Overlay <...> is `d`; square-bracket options are `o`; required groups are `m`.
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
+        // l3doc: a variant/options list followed by control-sequence names.
+        "function" | "variable" | "codedescribe" => "om",
         // exam-zh-{question,choices,chinese-english}.sty, installed 2026 release.
         "question" | "problem" | "solution" | "choices" | "select" | "lineto" | "material"
         | "poem" | "writingbox" => "o",

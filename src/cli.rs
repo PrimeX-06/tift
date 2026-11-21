@@ -20,6 +20,9 @@ mod project_context;
 #[path = "persistent_cache.rs"]
 mod persistent_cache;
 
+#[path = "source_encoding.rs"]
+mod source_encoding;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "tift",
@@ -239,8 +242,10 @@ impl Args {
 struct Job {
     path: PathBuf,
     source: Arc<String>,
+    input: Arc<source_encoding::SourceFile>,
     kind: FileKind,
     config: Arc<CompiledConfig>,
+    input_graph: Option<blake3::Hash>,
     config_sources: Vec<PathBuf>,
     matched_overrides: usize,
     cache: Option<persistent_cache::Request>,
@@ -254,10 +259,19 @@ struct InputPath {
 struct Work {
     original: Arc<String>,
     formatted: FormatOutput,
+    encoded: Option<Vec<u8>>,
     differs: bool,
     trace: Vec<StageTrace>,
     details: Vec<tift::trace::DetailTrace>,
     cache_status: persistent_cache::Status,
+}
+
+impl Work {
+    fn output_bytes(&self) -> &[u8] {
+        self.encoded
+            .as_deref()
+            .unwrap_or(self.formatted.text.as_bytes())
+    }
 }
 
 pub fn run() -> i32 {
@@ -269,13 +283,43 @@ pub fn run() -> i32 {
             return code;
         }
     };
-    match execute(&args) {
+    match recover_panic(|| execute(&args)).and_then(|result| result) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             2
         }
     }
+}
+
+thread_local! {
+    static RECOVERING_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn recover_panic<T>(run: impl FnOnce() -> T) -> Result<T, String> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !RECOVERING_PANIC
+                .try_with(|flag| flag.get())
+                .unwrap_or(false)
+            {
+                previous(info);
+            }
+        }));
+    });
+    let previous = RECOVERING_PANIC.with(|flag| flag.replace(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    RECOVERING_PANIC.with(|flag| flag.set(previous));
+    result.map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown cause");
+        format!("internal formatter error: {detail}")
+    })
 }
 
 fn execute(args: &Args) -> Result<i32, String> {
@@ -382,16 +426,25 @@ fn execute(args: &Args) -> Result<i32, String> {
         if effective.excluded {
             continue;
         }
-        let source = match context.read_source_with_identity(&path, input.identity) {
-            Ok(source) => source,
+        let input = match context.read_file_with_identity(&path, input.identity) {
+            Ok(input) => input,
             Err(error) => {
                 preparation_errors.push((path, Err(error)));
                 continue;
             }
         };
-        let config = match context.for_source(&path, Arc::clone(&source), effective.config) {
-            Ok(config) => config,
+        let source = Arc::clone(&input.text);
+        let prepared = match recover_panic(|| {
+            context.for_source(&path, Arc::clone(&source), effective.config)
+        }) {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                preparation_errors.push((path, Err(error)));
+                continue;
+            }
             Err(error) => {
+                context = project_context::ProjectContext::default();
+                let error = format!("{}: {error}", path.display());
                 preparation_errors.push((path, Err(error)));
                 continue;
             }
@@ -400,7 +453,9 @@ fn execute(args: &Args) -> Result<i32, String> {
             kind: FileKind::from_path(&path).expect("selected file has a supported extension"),
             path,
             source,
-            config,
+            input,
+            config: prepared.config,
+            input_graph: prepared.input_graph,
             config_sources: effective.sources,
             matched_overrides: effective.matched_overrides,
             cache: None,
@@ -424,7 +479,13 @@ fn execute(args: &Args) -> Result<i32, String> {
     let mut cache = persistent_cache::PersistentCache::default();
     if !args.trace && !args.trace_detail && args.lines.is_none() {
         for job in &mut jobs {
-            job.cache = cache.request(&job.path, &job.source, job.kind, &job.config);
+            job.cache = cache.request(
+                &job.path,
+                &job.source,
+                job.kind,
+                &job.config,
+                job.input_graph,
+            );
         }
     }
     let mut results = if jobs.len() <= 1 {
@@ -495,15 +556,15 @@ fn execute(args: &Args) -> Result<i32, String> {
                 continue;
             }
         };
+        let job = job.expect("successful work has a prepared job");
         match work.cache_status {
             persistent_cache::Status::Hit => cache_hits += 1,
             persistent_cache::Status::Miss => cache_misses += 1,
             persistent_cache::Status::Bypassed => {}
         }
         if args.trace || args.trace_detail {
-            if let Some(job) = job {
-                trace_configuration(&path, &job.config_sources, job.matched_overrides);
-            }
+            trace_configuration(&path, &job.config_sources, job.matched_overrides);
+            encoding_trace(&path, &job.input);
             print_trace(&path, &work.trace);
             print_detail_trace(&path, &work.details);
         }
@@ -513,10 +574,11 @@ fn execute(args: &Args) -> Result<i32, String> {
         }
         let differs = work.differs;
         if let Some(target) = &target {
+            let _lock = lock_output(&target.path)?;
             write_target(
                 target,
-                work.formatted.text.as_bytes(),
-                Some((&path, work.original.as_bytes())),
+                work.output_bytes(),
+                Some((&path, job.input.original_bytes())),
                 None,
             )?;
             changed += usize::from(differs);
@@ -526,19 +588,19 @@ fn execute(args: &Args) -> Result<i32, String> {
         } else if args.print {
             changed += usize::from(differs);
             output
-                .write_all(work.formatted.text.as_bytes())
+                .write_all(work.output_bytes())
                 .map_err(|e| format!("stdout: {e}"))?;
         } else if args.check {
             changed += usize::from(differs);
         } else if !args.diff && differs {
-            let written = if let Some(count) = args.backup {
-                create_backup(&path, work.original.as_bytes(), count)
-                    .and_then(|()| atomic_write(&path, &work.original, &work.formatted.text))
-            } else {
-                atomic_write(&path, &work.original, &work.formatted.text)
-            };
+            let written = commit_input(
+                &path,
+                job.input.original_bytes(),
+                work.output_bytes(),
+                args.backup,
+            );
             match written {
-                Ok(()) => changed += 1,
+                Ok(written) => changed += usize::from(written),
                 Err(error) => {
                     eprintln!("error: {error}");
                     failed = true;
@@ -584,40 +646,54 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
         .as_ref()
         .map(|path| TargetSnapshot::new(path))
         .transpose()?;
-    let mut source = String::new();
+    let mut bytes = Vec::new();
     io::stdin()
-        .read_to_string(&mut source)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("stdin: {e}"))?;
-    let (formatted, trace, details) = if effective.excluded {
+    let input =
+        source_encoding::SourceFile::decode(bytes).map_err(|error| format!("stdin: {error}"))?;
+    let source = input.text.as_str();
+    let (mut formatted, trace, details) = if effective.excluded {
         (
             FormatOutput {
-                text: source.clone(),
+                text: source.to_owned(),
                 diagnostics: Vec::new(),
             },
             Vec::new(),
             Vec::new(),
         )
     } else {
-        let config = project_context::ProjectContext::default().for_source(
+        let prepared = project_context::ProjectContext::default().for_source(
             path,
-            Arc::new(source.clone()),
+            Arc::clone(&input.text),
             effective.config,
         )?;
         let mut cache = persistent_cache::PersistentCache::default();
         let request = if !args.trace && !args.trace_detail && args.lines.is_none() {
             let cwd = std::env::current_dir().map_err(|e| format!("stdin: {e}"))?;
-            cache.request(&config_io::absolute(path, &cwd), &source, kind, &config)
+            cache.request(
+                &config_io::absolute(path, &cwd),
+                source,
+                kind,
+                &prepared.config,
+                prepared.input_graph,
+            )
         } else {
             None
         };
         let (output, trace, details, _) =
-            format_cached_source(&source, kind, &config, args, request.as_ref())
+            format_cached_source(source, kind, &prepared.config, args, request.as_ref())
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         cache.flush();
         (output, trace, details)
     };
+    let encoded = input.encode(&formatted.text)?;
+    for diagnostic in &mut formatted.diagnostics {
+        diagnostic.span = input.original_span(diagnostic.span.clone());
+    }
     if args.trace || args.trace_detail {
         trace_configuration(path, &effective.sources, effective.matched_overrides);
+        encoding_trace(path, &input);
         if effective.excluded {
             eprintln!("{}: trace: input excluded by configuration", path.display());
         }
@@ -631,15 +707,16 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if let Some(target) = &target {
-        write_target(target, formatted.text.as_bytes(), None, None)?;
+        let _lock = lock_output(&target.path)?;
+        write_target(target, &encoded, None, None)?;
         if !args.quiet {
             eprintln!("Formatted output: {}", target.path.display());
         }
     } else if args.diff && changed {
-        print_diff(&mut output, path, &source, &formatted.text)?;
+        print_diff(&mut output, path, source, &formatted.text)?;
     } else if !args.check && !args.diff {
         output
-            .write_all(formatted.text.as_bytes())
+            .write_all(&encoded)
             .map_err(|e| format!("stdout: {e}"))?;
     }
     output.flush().map_err(|e| format!("stdout: {e}"))?;
@@ -710,6 +787,11 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<InputPath>, String> {
 }
 
 fn format_job(job: &Job, args: &Args) -> Result<Work, String> {
+    recover_panic(|| format_job_inner(job, args))
+        .map_err(|error| format!("{}: {error}", job.path.display()))?
+}
+
+fn format_job_inner(job: &Job, args: &Args) -> Result<Work, String> {
     let metadata =
         fs::symlink_metadata(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
     if !metadata.is_file() {
@@ -723,6 +805,14 @@ fn format_job(job: &Job, args: &Args) -> Result<Work, String> {
         format_cached_source(&original, job.kind, &job.config, args, job.cache.as_ref())
             .map_err(|e| format!("{}: {e}", job.path.display()))?;
     let differs = original.as_str() != formatted.text;
+    let encoded = job
+        .input
+        .encode(&formatted.text)
+        .map_err(|error| format!("{}: {error}", job.path.display()))?;
+    let encoded = (!job.input.is_utf8()).then(|| encoded.into_owned());
+    for diagnostic in &mut formatted.diagnostics {
+        diagnostic.span = job.input.original_span(diagnostic.span.clone());
+    }
     if args.check && !args.diff {
         // Cache storage and detailed traces are complete. Check-only results
         // need the comparison and diagnostics, so release each output before
@@ -732,6 +822,11 @@ fn format_job(job: &Job, args: &Args) -> Result<Work, String> {
     Ok(Work {
         original,
         formatted,
+        encoded: if args.check && !args.diff {
+            None
+        } else {
+            encoded
+        },
         differs,
         trace,
         details,
@@ -962,6 +1057,15 @@ fn diagnostics(path: &Path, diagnostics: &[Diagnostic], quiet: bool) -> bool {
     failed
 }
 
+fn encoding_trace(path: &Path, input: &source_encoding::SourceFile) {
+    if !input.is_utf8() {
+        eprintln!(
+            "{}: trace: stage byte counts and ranges address decoded UTF-8 text; diagnostics address original file bytes",
+            path.display()
+        );
+    }
+}
+
 fn print_diff(
     output: &mut impl Write,
     path: &Path,
@@ -1062,6 +1166,73 @@ fn source_unchanged(path: &Path, original: &[u8]) -> Result<(), String> {
     }
 }
 
+fn lock_output(path: &Path) -> Result<fs::File, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: expected an output filename", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent =
+        fs::canonicalize(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    #[cfg(windows)]
+    let lower_name = name.to_string_lossy().to_lowercase();
+    #[cfg(windows)]
+    let name = std::ffi::OsStr::new(&lower_name);
+    let id = blake3::hash(name.as_encoded_bytes()).to_hex();
+    let lock_path = parent.join(format!(".tift-lock-{id}"));
+    let lock_error = |error: io::Error| {
+        format!(
+            "{}: cannot lock output ({}): {error}",
+            path.display(),
+            lock_path.display()
+        )
+    };
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    let lock = match options.clone().create_new(true).open(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(&lock_path)
+                .map_err(lock_error)?
+                .is_file()
+            {
+                return Err(format!(
+                    "{}: output lock must be a regular file",
+                    lock_path.display()
+                ));
+            }
+            options.open(&lock_path).map_err(lock_error)?
+        }
+        Err(error) => return Err(lock_error(error)),
+    };
+    // Keep the sidecar inode stable while any process could be waiting on it.
+    fs2::FileExt::lock_exclusive(&lock).map_err(lock_error)?;
+    Ok(lock)
+}
+
+fn commit_input(
+    path: &Path,
+    original: &[u8],
+    formatted: &[u8],
+    backups: Option<usize>,
+) -> Result<bool, String> {
+    let _lock = lock_output(path)?;
+    // Another tift process may already have committed the same result.
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && fs::read(path).is_ok_and(|current| current == formatted)
+    {
+        return Ok(false);
+    }
+    source_unchanged(path, original)?;
+    if let Some(count) = backups {
+        create_backup(path, original, count)?;
+    }
+    atomic_write(path, original, formatted)?;
+    Ok(true)
+}
+
 fn write_target(
     target: &TargetSnapshot,
     formatted: &[u8],
@@ -1158,7 +1329,7 @@ fn create_backup(path: &Path, original: &[u8], count: usize) -> Result<(), Strin
     )
 }
 
-fn atomic_write(path: &Path, original: &str, formatted: &str) -> Result<(), String> {
+fn atomic_write(path: &Path, original: &[u8], formatted: &[u8]) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!(
@@ -1167,7 +1338,7 @@ fn atomic_write(path: &Path, original: &str, formatted: &str) -> Result<(), Stri
         ));
     }
     let current = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if current != original.as_bytes() {
+    if current != original {
         return Err(format!(
             "{}: file changed during formatting; original content was preserved",
             path.display()
@@ -1177,7 +1348,7 @@ fn atomic_write(path: &Path, original: &str, formatted: &str) -> Result<(), Stri
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| format!("{}: cannot create temporary file: {e}", path.display()))?;
     temporary
-        .write_all(formatted.as_bytes())
+        .write_all(formatted)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     temporary
         .flush()
@@ -1195,7 +1366,7 @@ fn atomic_write(path: &Path, original: &str, formatted: &str) -> Result<(), Stri
     if !fs::symlink_metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .is_file()
-        || fs::read(path).map_err(|e| format!("{}: {e}", path.display()))? != original.as_bytes()
+        || fs::read(path).map_err(|e| format!("{}: {e}", path.display()))? != original
     {
         return Err(format!(
             "{}: file changed during formatting; original content was preserved",

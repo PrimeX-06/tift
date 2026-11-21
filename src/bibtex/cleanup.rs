@@ -1,15 +1,15 @@
 //! Optional bibliography data edits over the shared BibTeX value parser.
 
 use super::{
-    braced_value_end, find_comment_end, find_entry_end, line_end, normalization, protected_ranges,
-    quoted_value_end, skip_whitespace,
+    braced_value_end, entry_type, find_comment_end, find_entry_end, line_end, normalization,
+    protected_ranges, quoted_value_end, skip_whitespace,
 };
 use crate::{Diagnostic, FormatError, Severity};
 use normalization::{Field, Fields};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::ops::Range;
 
@@ -28,7 +28,7 @@ pub struct CleanupConfig {
     pub remove_duplicate_fields: bool,
     /// Remove literal fields whose value contains only whitespace.
     pub remove_empty_fields: bool,
-    /// Merge compatible records with the same citation key.
+    /// Consolidate identical records with the same citation key.
     pub merge_duplicate_entries: bool,
     /// Normalize safe literal URL and DOI values.
     pub normalize_urls: bool,
@@ -138,7 +138,7 @@ fn literal(value: &str) -> Option<(&str, char, char)> {
 
 fn entries(
     source: &str,
-    allow_empty: bool,
+    generate_keys: bool,
 ) -> Result<(Vec<Entry<'_>>, Vec<Range<usize>>), FormatError> {
     let protected = protected_ranges(source)?;
     let mut output = Vec::new();
@@ -162,19 +162,11 @@ fn entries(
             continue;
         }
         let start = cursor;
-        cursor += 1;
-        let type_start = cursor;
-        while source
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        {
+        let Some((kind, type_end)) = entry_type(source, cursor) else {
             cursor += 1;
-        }
-        if type_start == cursor {
             continue;
-        }
-        let kind = &source[type_start..cursor];
+        };
+        cursor = type_end;
         let open = skip_whitespace(source, cursor, source.len());
         if !matches!(source.as_bytes().get(open), Some(b'{' | b'(')) {
             cursor = line_end(source, cursor, source.len());
@@ -199,7 +191,11 @@ fn entries(
             run += 1;
         }
         previous_end = cursor;
-        let parsed = normalization::parse_fields_allow_empty(source, open + 1, close, allow_empty)?;
+        let parsed = normalization::parse_fields(source, open + 1, close)?;
+        if parsed.key.is_empty() && !generate_keys {
+            run += 1;
+            continue;
+        }
         output.push(Entry {
             span: start..cursor,
             kind,
@@ -371,175 +367,87 @@ fn clean_fields(entry: &mut Entry<'_>, config: &CleanupConfig, diagnostics: &mut
     entry.fields = fields;
 }
 
-type FieldLookup = HashMap<String, HashMap<u64, Vec<usize>>>;
-
-fn field_lookup(entry: &Entry<'_>, hash: &RandomState) -> FieldLookup {
-    let mut fields: FieldLookup = HashMap::new();
-    for (index, field) in entry.fields.iter().enumerate() {
-        fields
-            .entry(field.name.to_ascii_lowercase())
-            .or_default()
-            .entry(hash.hash_one(field.value.as_ref()))
-            .or_default()
-            .push(index);
-    }
-    fields
-}
-
-#[derive(Hash, PartialEq, Eq)]
-struct EntrySignature {
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct EntrySignature<'a> {
     kind: String,
-    fields: Vec<(String, u64)>,
+    fields: Vec<(String, &'a str)>,
 }
 
-fn signature(entry: &Entry<'_>, hash: &RandomState) -> EntrySignature {
+fn signature<'a>(entry: &'a Entry<'_>) -> (EntrySignature<'a>, Vec<usize>) {
     let mut fields: Vec<_> = entry
         .fields
         .iter()
-        .map(|field| {
-            (
-                field.name.to_ascii_lowercase(),
-                hash.hash_one(field.value.as_ref()),
-            )
+        .enumerate()
+        .map(|(index, field)| (field.name.to_ascii_lowercase(), field.value.as_ref(), index))
+        .collect();
+    // Preserve the order of repeated assignments to the same field.
+    fields.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut indices = Vec::with_capacity(fields.len());
+    let fields = fields
+        .into_iter()
+        .map(|(name, value, index)| {
+            indices.push(index);
+            (name, value)
         })
         .collect();
-    // Stable ordering retains the meaning of conflicting repeated assignments.
-    fields.sort_by(|left, right| left.0.cmp(&right.0));
-    EntrySignature {
-        kind: entry.kind.to_ascii_lowercase(),
-        fields,
-    }
-}
-
-fn same_fields(left: &Entry<'_>, right: &Entry<'_>) -> bool {
-    let sorted = |entry: &Entry<'_>| {
-        let mut indices: Vec<_> = (0..entry.fields.len()).collect();
-        indices.sort_by_cached_key(|&index| entry.fields[index].name.to_ascii_lowercase());
-        indices
-    };
-    left.fields.len() == right.fields.len()
-        && left.kind.eq_ignore_ascii_case(right.kind)
-        && sorted(left)
-            .into_iter()
-            .zip(sorted(right))
-            .all(|(left_index, right_index)| {
-                left.fields[left_index]
-                    .name
-                    .eq_ignore_ascii_case(right.fields[right_index].name)
-                    && left.fields[left_index].value == right.fields[right_index].value
-            })
-}
-
-struct MergeGroup {
-    primary: usize,
-    fields: FieldLookup,
-    // Conflicting records make the target of later complementary records
-    // ambiguous. Exact duplicates can still be resolved by their signatures.
-    exact: Option<HashMap<EntrySignature, Vec<usize>>>,
+    (
+        EntrySignature {
+            kind: entry.kind.to_ascii_lowercase(),
+            fields,
+        },
+        indices,
+    )
 }
 
 fn merge_entries(entries: &mut [Entry<'_>], diagnostics: &mut Vec<Diagnostic>) {
-    let hash = RandomState::new();
-    let mut seen: HashMap<(usize, String), MergeGroup> = HashMap::new();
-    for index in 0..entries.len() {
-        let key = (entries[index].run, entries[index].key.to_string());
-        let Some(group) = seen.get_mut(&key) else {
-            seen.insert(
-                key,
-                MergeGroup {
-                    primary: index,
-                    fields: field_lookup(&entries[index], &hash),
-                    exact: None,
-                },
-            );
-            continue;
-        };
-        if let Some(exact) = &mut group.exact {
-            let fingerprint = signature(&entries[index], &hash);
-            let target = exact.get(&fingerprint).and_then(|candidates| {
-                candidates
+    let mut merges = Vec::new();
+    let mut seen = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let group = seen
+            .entry((entry.run, entry.key.as_ref()))
+            .or_insert_with(BTreeMap::new);
+        let (signature, indices) = signature(entry);
+        let has_other_records = !group.is_empty();
+        match group.entry(signature) {
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                let (target, target_indices): &(usize, Vec<usize>) = slot.get();
+                let fields = target_indices
                     .iter()
                     .copied()
-                    .find(|&candidate| same_fields(&entries[candidate], &entries[index]))
-            });
-            if let Some(target) = target {
-                let mut lookup = field_lookup(&entries[target], &hash);
-                merge_record(entries, target, index, &mut lookup, &hash);
-                continue;
+                    .zip(indices)
+                    .collect::<Vec<_>>();
+                merges.push((*target, index, fields));
             }
-            exact.entry(fingerprint).or_default().push(index);
-        } else {
-            let primary = &entries[group.primary];
-            let compatible = primary.kind.eq_ignore_ascii_case(entries[index].kind)
-                && entries[index].fields.iter().all(|field| {
-                    group
-                        .fields
-                        .get(&field.name.to_ascii_lowercase())
-                        .is_none_or(|values| {
-                            values.len() == 1
-                                && values
-                                    .get(&hash.hash_one(field.value.as_ref()))
-                                    .is_some_and(|bucket| {
-                                        bucket
-                                            .iter()
-                                            .all(|&at| primary.fields[at].value == field.value)
-                                    })
-                        })
-                });
-            if compatible {
-                merge_record(entries, group.primary, index, &mut group.fields, &hash);
-                continue;
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                if has_other_records {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        message: format!(
+                            "duplicate BibTeX key {} preserved: records have different types or fields",
+                            entry.key
+                        ),
+                        span: entry.span.clone(),
+                    });
+                }
+                slot.insert((index, indices));
             }
-            let mut exact = HashMap::new();
-            exact.insert(signature(primary, &hash), vec![group.primary]);
-            exact
-                .entry(signature(&entries[index], &hash))
-                .or_insert_with(Vec::new)
-                .push(index);
-            group.exact = Some(exact);
-            group.fields.clear();
-        }
-        diagnostics.push(Diagnostic {
-            severity: Severity::Warning,
-            message: format!("duplicate BibTeX key {} preserved: conflicting records make complementary merging ambiguous", entries[index].key),
-            span: entries[index].span.clone(),
-        });
-    }
-}
-
-fn merge_record(
-    entries: &mut [Entry<'_>],
-    target: usize,
-    removed: usize,
-    lookup: &mut FieldLookup,
-    hash: &RandomState,
-) {
-    let (prefix, suffix) = entries.split_at_mut(removed);
-    let target = &mut prefix[target];
-    let removed = &mut suffix[0];
-    for field in std::mem::take(&mut removed.fields) {
-        let values = lookup.entry(field.name.to_ascii_lowercase()).or_default();
-        let fingerprint = hash.hash_one(field.value.as_ref());
-        let existing = values.get(&fingerprint).and_then(|bucket| {
-            bucket
-                .iter()
-                .copied()
-                .find(|&at| target.fields[at].value == field.value)
-        });
-        if let Some(existing) = existing {
-            target.fields[existing].after.extend(field.before);
-            target.fields[existing].after.extend(field.after);
-        } else {
-            values
-                .entry(fingerprint)
-                .or_default()
-                .push(target.fields.len());
-            target.fields.push(field);
         }
     }
-    target.trailing.append(&mut removed.trailing);
-    target.changed = true;
-    removed.removed = true;
+    drop(seen);
+    for (target, removed, fields) in merges {
+        let (prefix, suffix) = entries.split_at_mut(removed);
+        let target = &mut prefix[target];
+        let removed = &mut suffix[0];
+        for (target_index, removed_index) in fields {
+            let destination = &mut target.fields[target_index].after;
+            let source = &mut removed.fields[removed_index];
+            destination.append(&mut source.before);
+            destination.append(&mut source.after);
+        }
+        target.trailing.append(&mut removed.trailing);
+        target.changed = true;
+        removed.removed = true;
+    }
 }
 
 fn clean_value<'a>(
@@ -670,10 +578,120 @@ fn sentence_case(text: &str) -> Cow<'_, str> {
     {
         return Cow::Borrowed(text);
     }
+    // Short uppercase words are ambiguous initials in an all-uppercase title.
+    // Retain them unless they are ordinary connecting words. Digit-bearing
+    // terms retain their spelling as well (UTF8, H2O, 3D).
+    let mut initials = Vec::new();
+    let mut word = None;
+    for (at, character) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if character.is_alphanumeric() {
+            word.get_or_insert(at);
+        } else if let Some(start) = word.take() {
+            let token = &text[start..at];
+            let common = matches!(
+                token,
+                "A" | "AN"
+                    | "AND"
+                    | "AS"
+                    | "AT"
+                    | "BE"
+                    | "BY"
+                    | "FOR"
+                    | "FROM"
+                    | "IF"
+                    | "IN"
+                    | "INTO"
+                    | "IS"
+                    | "IT"
+                    | "ITS"
+                    | "NO"
+                    | "NOR"
+                    | "NOT"
+                    | "OF"
+                    | "ON"
+                    | "OR"
+                    | "OUT"
+                    | "OVER"
+                    | "PER"
+                    | "SO"
+                    | "THAN"
+                    | "THAT"
+                    | "THE"
+                    | "THIS"
+                    | "TO"
+                    | "UP"
+                    | "VIA"
+                    | "VS"
+                    | "WAS"
+                    | "WE"
+                    | "WERE"
+                    | "WITH"
+                    | "ALL"
+                    | "ANY"
+                    | "CAN"
+                    | "DID"
+                    | "DO"
+                    | "GET"
+                    | "HAD"
+                    | "HAS"
+                    | "HER"
+                    | "HIM"
+                    | "HIS"
+                    | "HOW"
+                    | "LET"
+                    | "MAY"
+                    | "NEW"
+                    | "NOW"
+                    | "OFF"
+                    | "OLD"
+                    | "ONE"
+                    | "OUR"
+                    | "OWN"
+                    | "SEE"
+                    | "SET"
+                    | "TOO"
+                    | "TWO"
+                    | "USE"
+                    | "WAY"
+                    | "WHO"
+                    | "WHY"
+                    | "YET"
+                    | "YOU"
+            );
+            if token.chars().any(|character| character.is_ascii_digit())
+                || (2..=3).contains(&token.chars().count()) && !common
+                || matches!(
+                    token,
+                    "ASCII"
+                        | "HTML"
+                        | "HTTP"
+                        | "HTTPS"
+                        | "IEEE"
+                        | "ISBN"
+                        | "ISSN"
+                        | "JSON"
+                        | "NASA"
+                        | "NATO"
+                        | "OECD"
+                        | "UNESCO"
+                        | "UNICEF"
+                )
+            {
+                initials.push(start..at);
+            }
+        }
+    }
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     // The first unprotected letter starts the sentence; protected acronyms survive.
     for &(at, character) in letters.iter().skip(1) {
+        let index = initials.partition_point(|range| range.end <= at);
+        if initials.get(index).is_some_and(|range| range.start <= at) {
+            continue;
+        }
         output.push_str(&text[cursor..at]);
         output.extend(character.to_lowercase());
         cursor = at + character.len_utf8();

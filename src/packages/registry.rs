@@ -169,6 +169,7 @@ macro_rules! providers {
             Literal {
                 headers: (6, code::header_signature),
                 adders: (2, code::add_command_rules),
+                context_data: (2, code::context_command_data_ranges),
             }
             Literal {
                 headers: (7, code_environments::header_signature),

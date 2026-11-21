@@ -240,9 +240,11 @@ fn infer_declaration_config_impl(
             let base = command.trim_end_matches('*');
             if indexed {
                 let complete = declaration_reader_complete(source, command, cursor, end)
+                    && !(matches!(base, "string" | "noexpand")
+                        && skip_trivia(source, end) == source.len())
                     && !(inferred_condition(base, source, end)
                         && !primitive_condition(base)
-                        && source[end..].trim().is_empty());
+                        && skip_trivia(source, end) == source.len());
                 reader_complete &= complete;
             }
             if append_safe && !declaration_reader_complete(source, command, cursor, end) {

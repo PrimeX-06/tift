@@ -36,6 +36,7 @@ pub(crate) fn format_docstrip(
     settings.wrap.mode = "preserve".into();
     settings.sentences.enabled = false;
     settings.protect.expl3 = true;
+    settings.replacements.clear();
     settings
         .syntax
         .commands
@@ -47,18 +48,22 @@ pub(crate) fn format_docstrip(
     let input = opaque.source();
     let formatted = if kind == FileKind::Dtx {
         let documentation = documentation_config(class.as_deref(), &structural)?;
-        format_dtx_structure(
-            input,
-            &structural,
-            documentation.as_ref().unwrap_or(&structural),
-        )?
+        let mut code = config.config.clone();
+        code.replacements.clear();
+        let code =
+            CompiledConfig::new(code).map_err(|error| FormatError::Syntax(error.to_string()))?;
+        format_dtx_structure(input, documentation.as_ref().unwrap_or(&structural), &code)?
     } else {
         crate::format(input, FileKind::Style, &structural)?.text
     };
     let restored = opaque.restore(&formatted).ok_or_else(|| {
         FormatError::Syntax("docstrip layout could not retain an opaque source region".into())
     })?;
-    let mut output = code_layout::format_code(&restored, kind, config)?.text;
+    let mut output = if kind == FileKind::Dtx {
+        restored
+    } else {
+        code_layout::format_code(&restored, kind, config)?.text
+    };
     if !source.ends_with('\n') {
         output = output.trim_end_matches(['\r', '\n']).to_owned();
     }
@@ -97,10 +102,24 @@ pub(crate) fn documentation_config(
         .map_err(|error| FormatError::Syntax(error.to_string()))
 }
 
+pub(crate) fn macrocode_boundary(line: &str) -> Option<bool> {
+    let body = line
+        .trim_start_matches([' ', '\t'])
+        .strip_prefix('%')?
+        .trim_start();
+    if body.starts_with("\\begin{macrocode}") || body.starts_with("\\begin{macrocode*}") {
+        Some(true)
+    } else if body.starts_with("\\end{macrocode}") || body.starts_with("\\end{macrocode*}") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn format_dtx_structure(
     source: &str,
-    config: &CompiledConfig,
     documentation_config: &CompiledConfig,
+    code_config: &CompiledConfig,
 ) -> Result<String, FormatError> {
     let mut output = String::new();
     let mut code = String::new();
@@ -109,7 +128,7 @@ fn format_dtx_structure(
         if code.is_empty() {
             return Ok(());
         }
-        match crate::format(code, FileKind::Style, config) {
+        match crate::format(code, FileKind::Style, code_config) {
             Ok(formatted) => output.push_str(&formatted.text),
             Err(FormatError::Syntax(_)) => output.push_str(code),
             Err(error) => return Err(error),
@@ -122,8 +141,20 @@ fn format_dtx_structure(
             if documentation.is_empty() {
                 return Ok(());
             }
-            match crate::format(documentation, FileKind::Tex, documentation_config) {
-                Ok(formatted) => {
+            let stripped: String = documentation
+                .split_inclusive('\n')
+                .map(|line| {
+                    let body = &line[1..];
+                    body.strip_prefix(' ').unwrap_or(body)
+                })
+                .collect();
+            match crate::format(&stripped, FileKind::Tex, documentation_config) {
+                Ok(formatted)
+                    if !formatted
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == crate::Severity::Error) =>
+                {
                     for line in formatted.text.split_inclusive('\n') {
                         output.push('%');
                         if !line.trim_matches(['\r', '\n']).is_empty() {
@@ -132,28 +163,37 @@ fn format_dtx_structure(
                         output.push_str(line);
                     }
                 }
-                Err(FormatError::Syntax(_)) => {
-                    for line in documentation.split_inclusive('\n') {
-                        output.push_str("% ");
-                        output.push_str(line);
-                    }
-                }
+                Ok(_) | Err(FormatError::Syntax(_)) => output.push_str(documentation),
                 Err(error) => return Err(error),
             }
             documentation.clear();
             Ok(())
         };
+    let mut macrocode = false;
     for line in source.split_inclusive('\n') {
+        if let Some(open) = macrocode_boundary(line) {
+            flush_documentation(&mut output, &mut documentation)?;
+            flush_code(&mut output, &mut code)?;
+            output.push_str(line);
+            macrocode = open;
+            continue;
+        }
+        if macrocode {
+            if line.starts_with("%<") {
+                flush_code(&mut output, &mut code)?;
+                output.push_str(line);
+            } else {
+                code.push_str(line);
+            }
+            continue;
+        }
         if let Some(body) = line.strip_prefix('%') {
             flush_code(&mut output, &mut code)?;
-            if body.starts_with(['%', '<'])
-                || body.trim_start().starts_with("\\begin{macrocode")
-                || body.trim_start().starts_with("\\end{macrocode")
-            {
+            if body.starts_with(['%', '<']) {
                 flush_documentation(&mut output, &mut documentation)?;
                 output.push_str(line);
             } else {
-                documentation.push_str(body.strip_prefix(' ').unwrap_or(body));
+                documentation.push_str(line);
             }
         } else {
             flush_documentation(&mut output, &mut documentation)?;
@@ -231,17 +271,25 @@ pub(crate) fn format_documentation(
         text: config.text.clone(),
         syntax: config.syntax.clone(),
     };
-    let mut offsets = Vec::with_capacity(lines.len());
+    let mut line_state = Vec::with_capacity(lines.len());
     let mut offset = 0;
+    let mut macrocode = false;
     for line in &lines {
-        offsets.push(offset);
+        let boundary = macrocode_boundary(line);
+        line_state.push((offset, !macrocode && boundary.is_none()));
+        if let Some(open) = boundary {
+            macrocode = open;
+        }
         offset += line.len();
     }
     let mut output = String::with_capacity(source.len());
     let mut position = 0;
     let eligible = |index: usize| {
         let line = lines[index];
-        let start = offsets[index];
+        let (start, documentation) = line_state[index];
+        if !documentation {
+            return false;
+        }
         let next = merged.partition_point(|range| range.end <= start);
         if merged
             .get(next)
@@ -253,8 +301,6 @@ pub(crate) fn format_documentation(
             return false;
         };
         !body.starts_with(['%', '<'])
-            && !body.trim().starts_with("\\begin{macrocode")
-            && !body.trim().starts_with("\\end{macrocode")
     };
     while position < lines.len() {
         if !eligible(position) {

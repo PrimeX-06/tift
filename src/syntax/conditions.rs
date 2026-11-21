@@ -75,6 +75,7 @@ impl ConditionalBindings {
     }
 
     pub(super) fn meaning(&self, name: &str, config: &Config) -> ConditionalMeaning {
+        let name = canonical_condition_control(name);
         if let Some(meaning) = self
             .scopes
             .iter()
@@ -86,7 +87,9 @@ impl ConditionalBindings {
         match name {
             "iftrue" => ConditionalMeaning::True,
             "iffalse" => ConditionalMeaning::False,
-            "ifcase" => ConditionalMeaning::Case,
+            "if_true:" => ConditionalMeaning::True,
+            "if_false:" => ConditionalMeaning::False,
+            "ifcase" | "if_case:w" => ConditionalMeaning::Case,
             "else" => ConditionalMeaning::Else,
             "or" => ConditionalMeaning::Or,
             "fi" => ConditionalMeaning::Fi,
@@ -172,6 +175,28 @@ impl ConditionalBindings {
         if matches!(base, "long" | "outer" | "protected") {
             return;
         }
+        if let Some((target, value, _, global)) = super::command_copy(source, base, end) {
+            let mut meaning = self.meaning(value, config);
+            if uncertain && meaning != self.meaning(target, config) {
+                meaning = ConditionalMeaning::Other;
+            }
+            self.assign(target, meaning, self.global || global);
+            self.global = false;
+            return;
+        }
+        if let Some(declaration) = super::expl3_command_declaration(source, 0, name, end) {
+            self.assign(
+                &declaration.name,
+                if super::opens_final_condition(&source[declaration.body]) {
+                    ConditionalMeaning::Other
+                } else {
+                    ConditionalMeaning::Ordinary
+                },
+                self.global || base.starts_with("cs_gset"),
+            );
+            self.global = false;
+            return;
+        }
         let primitive = matches!(base, "def" | "gdef" | "edef" | "xdef" | "let" | "futurelet");
         if primitive
             || latex_macro_definition(base)
@@ -184,6 +209,11 @@ impl ConditionalBindings {
             }
             if let Some((target_name, target_end)) = command_at(source, target) {
                 let mut meaning = ConditionalMeaning::Ordinary;
+                if let Some(body) = super::macro_body(source, base, end)
+                    && super::opens_final_condition(&source[body.start + 1..body.end - 1])
+                {
+                    meaning = ConditionalMeaning::Other;
+                }
                 if matches!(base, "let" | "futurelet") {
                     let mut operand = skip_trivia(source, target_end);
                     if base == "futurelet" {
@@ -212,6 +242,23 @@ impl ConditionalBindings {
             }
         }
         self.global = false;
+    }
+}
+
+pub(super) fn canonical_condition_control(name: &str) -> &str {
+    match name {
+        "MH_let:NwN" => "let",
+        "MH_else:" => "else",
+        "MH_or:" => "or",
+        "MH_fi:" => "fi",
+        "MH_if_num:w" => "ifnum",
+        "MH_if_dim:w" => "ifdim",
+        "MH_if_case:w" => "ifcase",
+        "ltx@newif" | "newife" => "newif",
+        "else:" => "else",
+        "or:" => "or",
+        "fi:" => "fi",
+        _ => name,
     }
 }
 
@@ -396,6 +443,11 @@ fn numeric_operand_end(source: &str, mut start: usize, dimension: bool) -> Optio
             start = skip_trivia(source, start + 1);
         }
         let (name, end) = command_at(source, start)?;
+        // A conditional can expand to the number being scanned. Keep its
+        // control tokens visible so its own branches are paired independently.
+        if super::primitive_condition(name) {
+            return None;
+        }
         return match name {
             "the" | "number" => {
                 start = end;
@@ -409,6 +461,9 @@ fn numeric_operand_end(source: &str, mut start: usize, dimension: bool) -> Optio
                     if source.as_bytes()[cursor] == b'%' {
                         cursor = line_end(source, cursor);
                     } else if let Some((name, finish)) = command_at(source, cursor) {
+                        if super::primitive_condition(name) {
+                            return None;
+                        }
                         if name == "relax" {
                             return Some(finish);
                         }
@@ -424,8 +479,22 @@ fn numeric_operand_end(source: &str, mut start: usize, dimension: bool) -> Optio
     }
 }
 
+fn integer_operand_is_group_character(source: &str, start: usize) -> bool {
+    let mut cursor = skip_trivia(source, start);
+    while matches!(source.as_bytes().get(cursor), Some(b'+' | b'-')) {
+        cursor = skip_trivia(source, cursor + 1);
+    }
+    if source.as_bytes().get(cursor) != Some(&b'`') {
+        return false;
+    }
+    matches!(source.as_bytes().get(cursor + 1), Some(b'{' | b'}'))
+}
+
 pub(super) fn numeric_test_end(source: &str, name: &str, start: usize) -> Option<usize> {
     let dimension = name.contains("dim");
+    if !dimension && integer_operand_is_group_character(source, start) {
+        return None;
+    }
     let left = numeric_operand_end(source, start, dimension)?;
     if name == "ifodd" {
         return Some(left);
@@ -434,7 +503,11 @@ pub(super) fn numeric_test_end(source: &str, name: &str, start: usize) -> Option
     if !matches!(source.as_bytes().get(relation), Some(b'<' | b'=' | b'>')) {
         return None;
     }
-    numeric_operand_end(source, relation + 1, dimension)
+    let right = relation + 1;
+    if !dimension && integer_operand_is_group_character(source, right) {
+        return None;
+    }
+    numeric_operand_end(source, right, dimension)
 }
 
 pub(super) fn literal_numeric_condition(
@@ -457,6 +530,9 @@ pub(super) fn literal_numeric_condition(
             literal_integer(source, start)
         }
     };
+    if !dimensions && integer_operand_is_group_character(source, end) {
+        return None;
+    }
     let (mut left, mut finish) = read(end)?;
     let result = if name == "ifodd" {
         left % 2 != 0
@@ -464,6 +540,9 @@ pub(super) fn literal_numeric_condition(
         let relation = skip_trivia(source, finish);
         let operator = *source.as_bytes().get(relation)?;
         if !matches!(operator, b'<' | b'=' | b'>') {
+            return None;
+        }
+        if !dimensions && integer_operand_is_group_character(source, relation + 1) {
             return None;
         }
         let (mut right, next) = read(relation + 1)?;
@@ -509,23 +588,11 @@ pub(super) fn literal_case_number(
     end: usize,
     bindings: &ConditionalBindings,
 ) -> Option<(i32, usize)> {
-    let mut cursor = skip_trivia(source, end);
-    let start = cursor;
-    if matches!(source.as_bytes().get(cursor), Some(b'+' | b'-')) {
-        cursor += 1;
-    }
-    let digits = cursor;
-    while source
-        .as_bytes()
-        .get(cursor)
-        .is_some_and(u8::is_ascii_digit)
-    {
-        cursor += 1;
-    }
-    if digits == cursor {
+    let (value, mut cursor) = literal_integer(source, end)?;
+    let value = i32::try_from(value).ok()?;
+    if value == i32::MIN {
         return None;
     }
-    let value = source[start..cursor].parse().ok()?;
     match source.as_bytes().get(cursor) {
         Some(b'%') => return None,
         Some(b'\\') => {

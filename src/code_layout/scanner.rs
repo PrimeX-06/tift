@@ -26,7 +26,9 @@ pub(super) fn commands<'a>(
                 .map_or(source.len(), |end| cursor + end + 1);
         } else if let Some((name, end)) = syntax::command_at(source, cursor) {
             output.push((cursor, name, end));
-            cursor = syntax::primitive_data_end(source, name, end).unwrap_or(end);
+            cursor = syntax::primitive_data_end(source, name, end)
+                .or_else(|| syntax::let_declaration_end(source, name, end))
+                .unwrap_or(end);
         } else {
             cursor += source[cursor..]
                 .chars()
@@ -47,17 +49,29 @@ pub(super) fn environment<'a>(source: &'a str, name: &str, end: usize) -> Option
     Some((source[begin + 1..finish - 1].trim(), finish))
 }
 
+pub(super) fn algorithm_header_end(source: &str, end: usize) -> usize {
+    let start = trivia::skip(source, end);
+    syntax::balanced_end(source, start, b'[', b']').unwrap_or(end)
+}
+
 pub(super) fn environments(
     source: &str,
     protected: &[Range<usize>],
 ) -> Vec<(String, Range<usize>)> {
     let mut stack = Vec::new();
     let mut output = Vec::new();
+    let mut header_end = 0;
     for (start, name, end) in commands(source, protected) {
+        if start < header_end {
+            continue;
+        }
         let Some((environment, finish)) = self::environment(source, name, end) else {
             continue;
         };
         if name == "begin" {
+            if super::algorithm_environment(environment) {
+                header_end = algorithm_header_end(source, finish);
+            }
             stack.push((environment, start));
         } else if let Some(index) = stack.iter().rposition(|(open, _)| *open == environment) {
             let (_, begin) = stack.remove(index);
@@ -70,12 +84,28 @@ pub(super) fn environments(
 pub(super) fn expl3_regions(source: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut output = Vec::new();
     let mut open = None;
+    let mut delayed_end = 0;
     for (start, name, mut end) in commands(source, protected) {
+        if start < delayed_end {
+            continue;
+        }
+        if let Some(finish) = syntax::delayed_data_end(source, name, end).or_else(|| {
+            crate::source_model::expl3_stored_arguments(source, name, end)
+                .map(|argument| argument.end)
+        }) {
+            delayed_end = finish;
+            continue;
+        }
         if name == "ExplSyntaxOff" {
             if let Some(begin) = open.take() {
                 output.push(begin..start);
             }
-        } else if open.is_none() && (name == "ExplSyntaxOn" || name.starts_with("ProvidesExpl")) {
+        } else if open.is_none()
+            && matches!(
+                name,
+                "ExplSyntaxOn" | "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile"
+            )
+        {
             if name != "ExplSyntaxOn" {
                 for _ in 0..4 {
                     let begin = trivia::skip(source, end);
@@ -84,6 +114,11 @@ pub(super) fn expl3_regions(source: &str, protected: &[Range<usize>]) -> Vec<Ran
                     };
                     end = finish;
                 }
+            }
+            // Leading horizontal trivia separates the opening control word
+            // from letter tokens when the first code is on the same line.
+            while matches!(source.as_bytes().get(end), Some(b' ' | b'\t')) {
+                end += 1;
             }
             if source[end..].starts_with("\r\n") {
                 end += 2;

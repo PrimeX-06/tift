@@ -83,6 +83,10 @@ tift --dump-config > tift.toml      # create a project configuration
 
 Formatting preserves prose line breaks by default. Add `--backup` to keep a copy of each file before formatting.
 
+Concurrent tift processes serialize writes to the same output path, including backup rotation. Hidden `.tift-lock-*` files next to outputs provide a stable lock across atomic replacements.
+
+Files use UTF-8 by default. Declare another encoding in a header comment, such as `% !TeX encoding = windows-1252` or `% Encoding: latin1` in a bibliography. Formatting preserves the declared encoding.
+
 Use `tift --help` or the [command-line guide](https://github.com/PrimeX-06/tift/wiki/CLI) for more options.
 
 ## Configuration

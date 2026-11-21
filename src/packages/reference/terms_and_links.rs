@@ -218,6 +218,21 @@ fn signature(source: &str, name: &str, cursor: usize, command: Command) -> Optio
 }
 
 fn contextual_command(name: &str, context: &super::InvocationContext<'_>) -> Option<Command> {
+    if matches!(name, "CodeLinkAnchor" | "CodeLinkRef") && context.has_package("xlistings") {
+        return Some(Command {
+            shape: "om",
+            data: 3,
+            modifier: Modifier::None,
+        });
+    }
+    // ltxdockit.sty uses a single cross-reference label in changelog entries.
+    if name == "see" && context.has_package("ltxdockit") {
+        return Some(Command {
+            shape: "m",
+            data: 1,
+            modifier: Modifier::None,
+        });
+    }
     if !matches!(
         name.trim_end_matches('*'),
         "acs" | "acsp" | "acl" | "Acl" | "aclp" | "Aclp"
@@ -365,4 +380,50 @@ pub(crate) fn command_header_end(source: &str, name: &str, cursor: usize) -> Opt
     }
     let end = crate::syntax::arguments::signature_end(source, start, &command.shape[..prefix])?;
     (end > cursor).then_some(end)
+}
+
+/// xv6 book source references are expanded before TeX reads the document.
+/// Regex braces, percent signs and math shifts remain literal pattern data.
+pub(crate) fn preprocessed_reference_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    if !matches!(name, "lineref" | "linerefs") {
+        return None;
+    }
+    let start = crate::trivia::skip(source, end);
+    let body = source.get(start..)?.strip_prefix('{')?;
+    let colon = body.find(":/")?;
+    if body[..colon].contains(['{', '}', '\n', '%']) {
+        return None;
+    }
+    let mut cursor = start + 1 + colon + 2;
+    let patterns = if name == "linerefs" { 2 } else { 1 };
+    for index in 0..patterns {
+        loop {
+            match *source.as_bytes().get(cursor)? {
+                b'\n' | b'\r' => return None,
+                b'\\' if source.as_bytes().get(cursor + 1) == Some(&b'/') => cursor += 2,
+                b'/' => {
+                    cursor += 1;
+                    break;
+                }
+                _ => cursor += 1,
+            }
+        }
+        if matches!(source.as_bytes().get(cursor), Some(b'+' | b'-')) {
+            cursor += 1;
+            while source
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                cursor += 1;
+            }
+        }
+        if index + 1 < patterns {
+            if source.get(cursor..cursor + 2)? != ",/" {
+                return None;
+            }
+            cursor += 2;
+        }
+    }
+    (source.as_bytes().get(cursor) == Some(&b'}')).then_some(cursor + 1)
 }

@@ -1000,7 +1000,11 @@ fn expand_group(
     Some(output)
 }
 
-pub(crate) fn is_active(config: &CompiledConfig) -> bool {
+pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
+    load_arguments_present(source, config) || width_layout_is_active(config)
+}
+
+fn width_layout_is_active(config: &CompiledConfig) -> bool {
     settings("includegraphics", config).is_some()
         || config
             .config
@@ -1041,7 +1045,14 @@ pub(crate) fn format_arguments_with_context(
     kind: crate::FileKind,
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
-    if !is_active(config) {
+    let normalized;
+    let source = if load_arguments_present(source, config) {
+        normalized = normalize_load_arguments(source, config, parsing)?;
+        &normalized
+    } else {
+        source
+    };
+    if !width_layout_is_active(config) {
         return Ok(source.into());
     }
     // Raw command candidates are a superset of executable invocations. A name
@@ -1229,4 +1240,97 @@ pub(crate) fn format_arguments_with_context(
     } else {
         Ok(output)
     }
+}
+
+const LOADERS: &[&str] = &[
+    "usepackage",
+    "RequirePackage",
+    "RequirePackageWithOptions",
+    "documentclass",
+    "LoadClass",
+    "LoadClassWithOptions",
+];
+
+fn load_arguments_present(source: &str, config: &CompiledConfig) -> bool {
+    config.config.arguments.mode != "preserve" && LOADERS.iter().any(|name| source.contains(name))
+}
+
+/// Loader names and outer option separators have a literal grammar. Keep
+/// nested option values and commented arguments byte-for-byte intact.
+fn normalize_load_arguments(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, FormatError> {
+    let parsed = parsing.snapshot(source, true, false)?;
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let mut edits = Vec::new();
+    for token in parsed.tokens.as_deref().expect("loader tokens") {
+        if token.kind != syntax::TokenKind::Command {
+            continue;
+        }
+        let Some((name, after)) = syntax::command_at(source, token.span.start) else {
+            continue;
+        };
+        if !LOADERS.contains(&name)
+            || config.config.syntax.commands.contains_key(name)
+            || config.config.arguments.rules.contains_key(name)
+            || analysis
+                .model()
+                .invocation_rule(token.span.start)
+                .is_some_and(|rule| rule.origin != crate::source_model::RuleOrigin::Builtin)
+        {
+            continue;
+        }
+        let signature = if name.ends_with("WithOptions") {
+            "m"
+        } else {
+            "om"
+        };
+        for argument in
+            crate::layout::signature_argument_ranges(source, after..source.len(), signature.bytes())
+        {
+            // Loader arguments can be unbraced token arguments. They are
+            // already in their TeX form and have no key-list body to edit.
+            // Restrict normalization to the delimiters understood by the
+            // loader grammar so a one-token argument cannot underflow here.
+            let Some((&open, &close)) = source
+                .as_bytes()
+                .get(argument.start)
+                .zip(source.as_bytes().get(argument.end.saturating_sub(1)))
+            else {
+                continue;
+            };
+            if !matches!((open, close), (b'{', b'}') | (b'[', b']'))
+                || argument.end <= argument.start + 1
+            {
+                continue;
+            }
+            let body = argument.start + 1..argument.end - 1;
+            let text = &source[body.clone()];
+            if text.contains(['%', '\\', '\r', '\n']) {
+                continue;
+            }
+            let mut normalized = String::with_capacity(text.len());
+            for entry in crate::packages::keys::definition_entries(text) {
+                let entry = &text[entry];
+                let (value, comma) = entry.strip_suffix(',').map_or((entry, ""), |s| (s, ","));
+                normalized.push_str(value.trim_matches([' ', '\t']));
+                normalized.push_str(comma);
+            }
+            if normalized != text {
+                edits.push((body, normalized));
+            }
+        }
+    }
+    let mut output = source.to_owned();
+    for (range, text) in edits.into_iter().rev() {
+        output.replace_range(range, &text);
+    }
+    Ok(output)
 }

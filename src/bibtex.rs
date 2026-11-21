@@ -188,17 +188,12 @@ fn format_bibtex_prepared(
             continue;
         }
         let entry_start = cursor;
-        cursor += 1;
-        let type_start = cursor;
-        while cursor < source.len()
-            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_')
-        {
+        let Some((kind, type_end)) = entry_type(source, cursor) else {
             cursor += 1;
-        }
-        if cursor == type_start {
             continue;
-        }
-        let kind = &source[type_start..cursor];
+        };
+        let type_start = cursor + 1;
+        cursor = type_end;
         let open = skip_whitespace(source, cursor, source.len());
         if !matches!(bytes.get(open), Some(b'{' | b'(')) {
             if kind.eq_ignore_ascii_case("comment") {
@@ -420,18 +415,11 @@ pub(crate) fn protected_ranges(source: &str) -> Result<Vec<Range<usize>>, Format
             continue;
         }
         let entry_start = cursor;
-        cursor += 1;
-        let type_start = cursor;
-        while bytes
-            .get(cursor)
-            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
-        {
+        let Some((kind, type_end)) = entry_type(source, cursor) else {
             cursor += 1;
-        }
-        if cursor == type_start {
             continue;
-        }
-        let kind = &source[type_start..cursor];
+        };
+        cursor = type_end;
         let open = skip_whitespace(source, cursor, source.len());
         if kind.eq_ignore_ascii_case("comment") {
             cursor = if matches!(bytes.get(open), Some(b'{' | b'(')) {
@@ -561,6 +549,33 @@ fn skip_trivia(source: &str, mut cursor: usize, end: usize) -> (usize, Vec<&str>
     }
 }
 
+/// Entry types use BibTeX identifiers, including package-defined names such
+/// as ABNT-options. All passes must agree on where the type ends.
+fn entry_type(source: &str, at: usize) -> Option<(&str, usize)> {
+    let start = at + 1;
+    let bytes = source.as_bytes();
+    if !bytes
+        .get(start)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes.get(end).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.' | b':')
+    }) {
+        end += 1;
+    }
+    Some((&source[start..end], end))
+}
+
+fn valid_citation_key(key: &str, brace_entry: bool) -> bool {
+    // BibTeX reads the key up to its comma. Punctuation used by custom
+    // bibliography styles (e.g. option=value keys) is part of the key.
+    !key.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '"') || !brace_entry && c == ')')
+}
+
 fn find_entry_end(source: &str, open: usize) -> Result<usize, FormatError> {
     scan_entry_end(source, open, None)
 }
@@ -584,15 +599,9 @@ fn scan_entry_end(
             && bytes[cursor] != b'%'
         {
             if bytes[cursor] == b'@' {
-                let start = cursor + 1;
-                let mut finish = start;
-                while bytes
-                    .get(finish)
-                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                if let Some((kind, finish)) = entry_type(source, cursor)
+                    && kind.eq_ignore_ascii_case("comment")
                 {
-                    finish += 1;
-                }
-                if source[start..finish].eq_ignore_ascii_case("comment") {
                     let open = skip_whitespace(source, finish, source.len());
                     cursor = if matches!(bytes.get(open), Some(b'{' | b'(')) {
                         find_comment_end(source, open).map_or(source.len(), |close| close + 1)
@@ -733,10 +742,7 @@ fn format_fields(
                 output.push_str(closing);
                 return Ok(output);
             }
-            if key
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '(' | ')' | '"' | '='))
-            {
+            if !valid_citation_key(key, opening.ends_with('{')) {
                 return Err(syntax_error(
                     cursor,
                     "invalid citation key or missing key comma",
@@ -747,11 +753,7 @@ fn format_fields(
             return Ok(output);
         };
         let key = source[cursor..comma].trim();
-        if key.is_empty()
-            || key
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '(' | ')' | '"' | '='))
-        {
+        if !valid_citation_key(key, opening.ends_with('{')) {
             return Err(syntax_error(cursor, "invalid citation key"));
         }
         output.push_str(key);

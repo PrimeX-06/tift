@@ -88,6 +88,13 @@ fn group(source: &str, cursor: &mut usize) -> Option<Range<usize>> {
 }
 
 impl Signature {
+    pub(crate) fn boolean_slots(&self) -> u16 {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| *index < 9 && matches!(slot.kind, Kind::Token(_)))
+            .fold(0, |mask, (index, _)| mask | (1 << index))
+    }
     /// The command lexer includes an adjacent star. Revisit it only when a
     /// leading argument slot can consume that star as an xparse switch.
     pub(crate) fn invocation_cursor(&self, source: &str, end: usize) -> usize {
@@ -189,7 +196,20 @@ impl Signature {
                     }
                 }
                 b's' => Kind::Token(Cow::Borrowed("*")),
-                b't' => Kind::Token(token(source, &mut cursor)?.into()),
+                b't' => {
+                    let start = trivia::skip(source, cursor);
+                    if source.as_bytes().get(start) == Some(&b'{') {
+                        let range = group(source, &mut cursor)?;
+                        let mut position = range.start;
+                        let value = token(source, &mut position)?;
+                        if trivia::skip(source, position) != range.end {
+                            return None;
+                        }
+                        Kind::Token(value.into())
+                    } else {
+                        Kind::Token(token(source, &mut cursor)?.into())
+                    }
+                }
                 b'e' | b'E' => {
                     let range = group(source, &mut cursor)?;
                     let mut position = range.start;

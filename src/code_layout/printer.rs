@@ -1,6 +1,6 @@
 //! Bounded printers for braced algorithm statements and expl3 calls.
 
-use crate::{syntax, trivia};
+use crate::syntax;
 
 const MAX_DEPTH: usize = 256;
 
@@ -13,14 +13,14 @@ fn compact(source: &str) -> String {
             let end = source[cursor..]
                 .find('\n')
                 .map_or(source.len(), |offset| cursor + offset + 1);
-            if space && !result.is_empty() {
+            if space && !result.is_empty() && !result.ends_with('\n') {
                 result.push(' ');
             }
             result.push_str(&source[cursor..end]);
             cursor = end;
             space = false;
         } else if let Some((_, end)) = syntax::command_at(source, cursor) {
-            if space && !result.is_empty() {
+            if space && !result.is_empty() && !result.ends_with('\n') {
                 result.push(' ');
             }
             result.push_str(&source[cursor..end]);
@@ -32,7 +32,8 @@ fn compact(source: &str) -> String {
             if character.is_ascii_whitespace() {
                 space = true;
             } else {
-                if space && !result.is_empty() && character != '}' && !result.ends_with('{') {
+                if space && !result.is_empty() && character != '}' && !result.ends_with(['{', '\n'])
+                {
                     result.push(' ');
                 }
                 result.push(character);
@@ -43,13 +44,52 @@ fn compact(source: &str) -> String {
     result
 }
 
-struct Printer {
+struct Printer<'a> {
     output: String,
     width: usize,
     level: usize,
+    expl3_scope_depth: usize,
+    marker_prefix: &'a str,
 }
 
-impl Printer {
+impl Printer<'_> {
+    // Unrecognized TeX commands and opaque readers can depend on a physical
+    // line ending (for example, \endinput or a verbatim environment's end).
+    // Keep their existing line boundaries while formatting the surrounding
+    // expl3 statements. Argument compaction remains a separate operation.
+    fn text(&mut self, source: &str, expl3: bool) {
+        if expl3 {
+            for line in source.split_inclusive('\n') {
+                self.append(&compact(line));
+                if line.ends_with('\n') {
+                    self.newline();
+                }
+            }
+        } else {
+            self.append(&compact(source));
+        }
+    }
+
+    // Trivia between actual arguments may contain comments. Keep their bytes
+    // and the distinction between an inline comment and a standalone one.
+    fn argument_comments(&mut self, gap: &str) {
+        if let Some(comment) = gap.find('%') {
+            if gap[..comment].contains('\n') {
+                self.newline();
+            } else if !self.output.ends_with([' ', '\n']) {
+                self.append(" ");
+            }
+            let tail = gap[comment..].trim_end_matches([' ', '\t']);
+            self.append(tail);
+        }
+    }
+
+    fn argument_space(&mut self) {
+        if !self.output.ends_with([' ', '\n']) {
+            self.append(" ");
+        }
+    }
+
     fn append(&mut self, source: &str) {
         if source.is_empty() {
             return;
@@ -103,8 +143,8 @@ impl Printer {
         let mut text = 0;
         while cursor < source.len() {
             if source.as_bytes()[cursor] == b'%' {
-                self.append(&compact(&source[text..cursor]));
-                if !self.output.ends_with(['\n', ' ']) {
+                self.text(&source[text..cursor], expl3);
+                if !self.output.is_empty() && !self.output.ends_with(['\n', ' ']) {
                     self.append(" ");
                 }
                 let end = source[cursor..]
@@ -124,31 +164,73 @@ impl Printer {
                     .len_utf8();
                 continue;
             };
+            if name
+                .strip_prefix(self.marker_prefix)
+                .is_some_and(|suffix| suffix.starts_with("DISPLAY"))
+            {
+                self.text(&source[text..cursor], expl3);
+                self.newline();
+                let end = end + usize::from(source[end..].starts_with("{}")) * 2;
+                self.append(&source[cursor..end]);
+                self.newline();
+                cursor = end;
+                text = end;
+                continue;
+            }
             if name == "begin"
                 && let Some((environment, header)) = super::scanner::environment(source, name, end)
                 && super::algorithm_environment(environment)
                 && let Some((_, range)) = super::scanner::environments(&source[cursor..], &[])
                     .into_iter()
                     .find(|(candidate, range)| candidate == environment && range.start == 0)
+                && let fragment_end = cursor + range.end
+                && let header = super::scanner::algorithm_header_end(source, header)
+                && let Some(body_and_close) = source.get(header..fragment_end)
+                && let Some((offset, _, _)) = super::scanner::commands(body_and_close, &[])
+                    .into_iter()
+                    .rev()
+                    .find(|&(_, command, end)| {
+                        command == "end"
+                            && super::scanner::environment(body_and_close, command, end)
+                                == Some((environment, body_and_close.len()))
+                    })
             {
-                self.append(&compact(&source[text..cursor]));
+                let closing = header + offset;
+                self.text(&source[text..cursor], expl3);
                 self.newline();
                 self.append(&compact(&source[cursor..header]));
                 self.newline();
                 self.level += 1;
-                let fragment_end = cursor + range.end;
-                let closing = super::scanner::commands(&source[header..fragment_end], &[])
-                    .into_iter()
-                    .rev()
-                    .find(|(_, command, _)| *command == "end")
-                    .map(|(offset, _, _)| header + offset)
-                    .expect("algorithm closing");
                 self.body(&source[header..closing], false, false, depth + 1);
                 self.newline();
                 self.level -= 1;
                 self.append(&source[closing..fragment_end]);
                 self.newline();
                 cursor = fragment_end;
+                text = cursor;
+                continue;
+            }
+            if expl3 && name == "group_begin:" {
+                self.text(&source[text..cursor], true);
+                self.newline();
+                self.append(&source[cursor..end]);
+                self.newline();
+                self.level += 1;
+                self.expl3_scope_depth += 1;
+                cursor = end;
+                text = cursor;
+                continue;
+            }
+            if expl3 && name == "group_end:" {
+                self.text(&source[text..cursor], true);
+                if self.expl3_scope_depth > 0 {
+                    self.level = self.level.saturating_sub(1);
+                    self.expl3_scope_depth -= 1;
+                }
+                self.newline();
+                self.append(&source[cursor..end]);
+                self.newline();
+                cursor = end;
                 text = cursor;
                 continue;
             }
@@ -165,7 +247,7 @@ impl Printer {
                     std::iter::repeat_n(b'm', count),
                 );
                 if arguments.len() == count {
-                    self.append(&compact(&source[text..cursor]));
+                    self.text(&source[text..cursor], expl3);
                     self.newline();
                     self.append(&source[cursor..end]);
                     for (index, argument) in arguments.iter().enumerate() {
@@ -186,66 +268,51 @@ impl Printer {
                     continue;
                 }
             }
-            if expl3 && name.contains(':') {
-                self.append(&compact(&source[text..cursor]));
+            if expl3 && super::expl3::is_expl3_name(name) {
+                let Some(call) = super::expl3::parse_call(source, name, end) else {
+                    self.text(&source[text..cursor], true);
+                    self.append(&source[cursor..]);
+                    return;
+                };
+                self.text(&source[text..cursor], expl3);
                 self.newline();
                 self.append(&source[cursor..end]);
-                let suffix = name.rsplit_once(':').expect("expl3 name").1;
-                let definition = name.starts_with("cs_new")
-                    || name.starts_with("cs_set")
-                    || name.starts_with("cs_gset");
                 let mut finish = end;
-                for (slot, kind) in suffix.chars().enumerate() {
-                    let begin = trivia::skip(source, finish);
-                    if kind == 'p' {
-                        let mut scan = begin;
-                        while scan < source.len() && source.as_bytes()[scan] != b'{' {
-                            scan = syntax::command_at(source, scan).map_or_else(
-                                || {
-                                    scan + source[scan..]
-                                        .chars()
-                                        .next()
-                                        .expect("source character")
-                                        .len_utf8()
-                                },
-                                |(_, end)| end,
-                            );
-                        }
-                        let parameters = compact(&source[begin..scan]);
+                for (slot, argument) in call.arguments.iter().enumerate() {
+                    let range = &argument.range;
+                    self.argument_comments(&source[finish..range.start]);
+                    if argument.kind == super::expl3::ArgumentKind::ParameterText {
+                        let parameters = &source[range.clone()];
                         if !parameters.is_empty() {
-                            self.append(" ");
-                            self.append(&parameters);
+                            self.argument_space();
+                            if parameters.contains('%') {
+                                self.append(parameters.trim_end_matches([' ', '\t']));
+                            } else {
+                                self.append(&compact(parameters));
+                            }
                         }
-                        finish = scan;
-                        continue;
-                    }
-                    if source.as_bytes().get(begin) == Some(&b'{') {
-                        let Some(close) = syntax::balanced_end(source, begin, b'{', b'}') else {
-                            break;
-                        };
-                        let body = &source[begin + 1..close - 1];
-                        if name == "keys_define:nn" && slot == 1 {
+                    } else if source.as_bytes().get(range.start) == Some(&b'{') {
+                        let body = &source[range.start + 1..range.end - 1];
+                        let kind = call.signature.as_bytes()[slot];
+                        if call.base == "keys_define" && slot == 1 {
                             self.newline();
                             self.level += 1;
                             self.keys_group(body);
                             self.level -= 1;
-                        } else if definition && slot + 1 == suffix.len() {
+                        } else if super::expl3::is_code_argument(&call, slot, kind) {
                             self.newline();
                             self.level += 1;
                             self.group(body, true, false, depth);
                             self.level -= 1;
                         } else {
-                            self.append(" ");
-                            self.append(&compact(&source[begin..close]));
+                            self.argument_space();
+                            self.append(&compact(&source[range.clone()]));
                         }
-                        finish = close;
-                    } else if let Some((_, close)) = syntax::command_at(source, begin) {
-                        self.append(" ");
-                        self.append(&source[begin..close]);
-                        finish = close;
                     } else {
-                        break;
+                        self.argument_space();
+                        self.append(&source[range.clone()]);
                     }
+                    finish = range.end;
                 }
                 // Keep a source-line comment attached to its statement. Moving
                 // it to column zero would turn code comments into DTX prose on
@@ -263,12 +330,12 @@ impl Printer {
                     finish = end + usize::from(end < source.len());
                 }
                 self.newline();
-                cursor = finish;
+                cursor = call.end.max(finish);
                 text = cursor;
                 continue;
             }
             if name == ";" && statements {
-                self.append(&compact(&source[text..end]));
+                self.text(&source[text..end], expl3);
                 let next = end
                     + source[end..]
                         .bytes()
@@ -283,17 +350,19 @@ impl Printer {
             }
             cursor = end;
         }
-        self.append(&compact(&source[text..]));
+        self.text(&source[text..], expl3);
     }
 }
 
-pub(super) fn format(source: &str, expl3: bool, width: usize) -> String {
+pub(super) fn format(opaque: &super::Opaque, expl3: bool, width: usize) -> String {
     let mut printer = Printer {
         output: String::new(),
         width,
         level: 0,
+        expl3_scope_depth: 0,
+        marker_prefix: opaque.marker_prefix.trim_start_matches('\\'),
     };
-    printer.body(source, expl3, false, 0);
+    printer.body(opaque.source(), expl3, false, 0);
     printer.newline();
     printer.output
 }

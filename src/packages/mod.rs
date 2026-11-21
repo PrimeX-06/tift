@@ -90,7 +90,9 @@ pub(crate) fn scoped_invocation_signature(
     cursor: usize,
     name: &str,
 ) -> Option<&'static str> {
-    visual_languages::invocation_signature(source, cursor, name)
+    matches!(name, "function" | "variable" | "codedescribe")
+        .then_some("om")
+        .or_else(|| visual_languages::invocation_signature(source, cursor, name))
         .or_else(|| tikz_diagrams::header_signature(name))
         .or_else(|| typography::header_signature(name))
         .or_else(|| cjk::header_signature(name))

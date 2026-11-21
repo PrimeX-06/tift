@@ -1,9 +1,9 @@
 //! Normalization and ordering reuse the value lexer without rewriting expressions.
 
 use super::{
-    BibtexConfig, braced_value_end, entry_indent, find_comment_end, find_entry_end, line_end,
-    protected_ranges, quoted_value_end, read_expression, skip_trivia, skip_whitespace,
-    syntax_error, write_comments,
+    BibtexConfig, braced_value_end, entry_indent, entry_type, find_comment_end, find_entry_end,
+    line_end, protected_ranges, quoted_value_end, read_expression, skip_trivia, skip_whitespace,
+    syntax_error, valid_citation_key, write_comments,
 };
 use crate::{Diagnostic, FormatError, Severity};
 use std::borrow::Cow;
@@ -154,24 +154,16 @@ pub(super) struct Fields<'a> {
     pub(super) trailing: Vec<&'a str>,
 }
 
-fn parse_fields(source: &str, start: usize, end: usize) -> Result<Fields<'_>, FormatError> {
-    parse_fields_allow_empty(source, start, end, false)
-}
-
-pub(super) fn parse_fields_allow_empty(
+pub(super) fn parse_fields(
     source: &str,
     start: usize,
     end: usize,
-    allow_empty: bool,
 ) -> Result<Fields<'_>, FormatError> {
     let (mut cursor, mut before) = skip_trivia(source, start, end);
     let comma = source[cursor..end].find(',').map(|offset| cursor + offset);
     let key_end = comma.unwrap_or(end);
     let key = source[cursor..key_end].trim();
-    if key.chars().any(|character| {
-        character.is_whitespace() || matches!(character, '{' | '}' | '(' | ')' | '"' | '=')
-    }) || comma.is_some() && key.is_empty() && !allow_empty
-    {
+    if !valid_citation_key(key, source.as_bytes()[start - 1] == b'{') {
         return Err(syntax_error(cursor, "invalid citation key"));
     }
     let Some(comma) = comma else {
@@ -345,6 +337,12 @@ fn quote_safe(inner: &str) -> bool {
     let mut braces = 0usize;
     let mut escaped = false;
     for character in inner.chars() {
+        // BibTeX closes a quoted value at every outer-level quote. A
+        // backslash before the quote belongs to TeX's accent command and does
+        // not escape BibTeX's delimiter.
+        if character == '"' && braces == 0 {
+            return false;
+        }
         if escaped {
             escaped = false;
         } else {
@@ -352,7 +350,6 @@ fn quote_safe(inner: &str) -> bool {
                 '\\' => escaped = true,
                 '{' => braces += 1,
                 '}' => braces = braces.saturating_sub(1),
-                '"' if braces == 0 => return false,
                 _ => (),
             }
         }
@@ -405,7 +402,7 @@ pub(super) fn format_parsed_fields(
     let mut output = opening.to_owned();
     output.push_str(&entry.key);
     if entry.fields.is_empty() {
-        if !entry.trailing.is_empty() {
+        if !entry.trailing.is_empty() || entry.key.is_empty() {
             if let Some(body) = original_body {
                 output.truncate(opening.len());
                 output.push_str(&source[body]);
@@ -613,18 +610,12 @@ pub(super) fn sort_entries(
             continue;
         }
         let start = cursor;
-        cursor += 1;
-        let type_start = cursor;
-        while cursor < source.len()
-            && (source.as_bytes()[cursor].is_ascii_alphabetic()
-                || source.as_bytes()[cursor] == b'_')
-        {
+        let Some((kind, type_end)) = entry_type(source, cursor) else {
             cursor += 1;
-        }
-        if cursor == type_start {
             continue;
-        }
-        let kind = source[type_start..cursor].to_ascii_lowercase();
+        };
+        let kind = kind.to_ascii_lowercase();
+        cursor = type_end;
         let open = skip_whitespace(source, cursor, source.len());
         if !matches!(source.as_bytes().get(open), Some(b'{' | b'(')) {
             cursor = line_end(source, cursor, source.len());
@@ -651,6 +642,11 @@ pub(super) fn sort_entries(
             continue;
         }
         let fields = parse_fields(source, open + 1, close)?;
+        // Without a citation key this record is a boundary, even if it is
+        // the only anonymous record in the bibliography.
+        if fields.key.is_empty() {
+            continue;
+        }
         let mut values = HashMap::new();
         let mut resolvable = true;
         for field in fields.fields {

@@ -11,12 +11,14 @@ use tift::syntax::{self, TokenKind};
 use tift::{CompiledConfig, Config, FileKind};
 
 use super::config_io::absolute;
+use super::source_encoding::SourceFile;
 
 /// Immutable input snapshots and declaration contexts shared by one CLI run.
 /// Explicit root comments supply context; unmarked files never search for parents.
 #[derive(Default)]
 pub struct ProjectContext {
     sources: HashMap<PathBuf, Arc<String>>,
+    source_files: HashMap<usize, Arc<SourceFile>>,
     /// Canonical identities are stable for this invocation's source snapshot.
     /// Relative requests retain their working directory in the cache key.
     normalized_paths: HashMap<(PathBuf, PathBuf), PathBuf>,
@@ -26,14 +28,21 @@ pub struct ProjectContext {
     siblings: HashMap<PathBuf, Vec<Arc<String>>>,
     sibling_configs: HashMap<(PathBuf, usize), Arc<CompiledConfig>>,
     graphs: HashMap<(PathBuf, usize), Arc<InputGraph>>,
-    compiled: HashMap<(PathBuf, usize), Arc<CompiledConfig>>,
+    compiled: HashMap<(PathBuf, usize), PreparedSource>,
     compiled_states: HashMap<(usize, SyntaxConfig, ProtectConfig), Arc<CompiledConfig>>,
     bases: HashMap<usize, Arc<CompiledConfig>>,
+}
+
+#[derive(Clone)]
+pub struct PreparedSource {
+    pub config: Arc<CompiledConfig>,
+    pub input_graph: Option<blake3::Hash>,
 }
 
 #[derive(Default)]
 struct InputGraph {
     source: String,
+    fingerprint: Option<blake3::Hash>,
     declaration_index: syntax::DeclarationIndex,
     // Keep the full source for positions, restoration and error diagnostics.
     // Independently neutral spans need only one newline in later inference.
@@ -49,6 +58,7 @@ struct InputGraph {
     alias_events: HashMap<PathBuf, Vec<tift::config::EnvironmentAliasEvent>>,
     argument_events: HashMap<PathBuf, Vec<tift::config::EnvironmentArgumentEvent>>,
     package_events: HashMap<PathBuf, Vec<tift::config::PackageLoadEvent>>,
+    command_events: HashMap<PathBuf, Vec<tift::config::CommandImportEvent>>,
     preamble_end: Option<usize>,
     revision: u64,
     last_options: Option<DeclarationMemo>,
@@ -102,6 +112,7 @@ type DeclarationSnapshot = (
     std::collections::BTreeMap<String, Option<tift::config::EnvironmentAlias>>,
     std::collections::BTreeMap<String, Option<tift::config::EnvironmentArguments>>,
     std::collections::BTreeMap<String, bool>,
+    std::collections::BTreeMap<String, tift::config::ImportedCommand>,
 );
 
 fn declaration_snapshot(source: &str, config: &Config) -> DeclarationSnapshot {
@@ -121,6 +132,7 @@ fn declaration_snapshot(source: &str, config: &Config) -> DeclarationSnapshot {
         aliases,
         model.exported_environment_arguments().clone(),
         model.exported_packages(),
+        model.exported_commands().clone(),
     )
 }
 
@@ -508,6 +520,19 @@ fn scalar_binding_command(name: &str) -> bool {
 }
 
 impl ProjectContext {
+    pub fn read_file_with_identity(
+        &mut self,
+        path: &Path,
+        identity: Option<PathBuf>,
+    ) -> Result<Arc<SourceFile>, String> {
+        let text = self.read_source_with_identity(path, identity)?;
+        Ok(Arc::clone(
+            self.source_files
+                .get(&(Arc::as_ptr(&text) as usize))
+                .expect("filesystem source has an encoded snapshot"),
+        ))
+    }
+
     fn normalized_path(&mut self, path: &Path) -> Result<PathBuf, String> {
         let cwd = if path.is_absolute() {
             PathBuf::new()
@@ -587,9 +612,13 @@ impl ProjectContext {
         if let Some(source) = self.sources.get(path) {
             return Ok(Arc::clone(source));
         }
-        let source = Arc::new(
-            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?,
+        let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let file = Arc::new(
+            SourceFile::decode(bytes).map_err(|error| format!("{}: {error}", path.display()))?,
         );
+        let source = Arc::clone(&file.text);
+        self.source_files
+            .insert(Arc::as_ptr(&source) as usize, file);
         self.sources.insert(path.to_path_buf(), Arc::clone(&source));
         Ok(source)
     }
@@ -599,14 +628,17 @@ impl ProjectContext {
         path: &Path,
         source: Arc<String>,
         config: Arc<CompiledConfig>,
-    ) -> Result<Arc<CompiledConfig>, String> {
+    ) -> Result<PreparedSource, String> {
         if config.config.replacement_only
             || matches!(
                 FileKind::from_path(path),
                 Some(FileKind::Bibtex | FileKind::Dtx | FileKind::Ins)
             )
         {
-            return Ok(config);
+            return Ok(PreparedSource {
+                config,
+                input_graph: None,
+            });
         }
         let path = if self.sources.contains_key(path) {
             path.to_path_buf()
@@ -619,7 +651,7 @@ impl ProjectContext {
             .entry(key.1)
             .or_insert_with(|| Arc::clone(&config));
         if let Some(cached) = self.compiled.get(&key) {
-            return Ok(Arc::clone(cached));
+            return Ok(cached.clone());
         }
         self.sources.insert(path.clone(), Arc::clone(&source));
         let marker = root_marker(&source, &config.config)
@@ -656,7 +688,8 @@ impl ProjectContext {
                 })
             })
         };
-        let result = if marker.is_some() || has_inputs {
+        let mut input_graph = None;
+        let config = if marker.is_some() || has_inputs {
             let graph_key = (root.clone(), key.1);
             let graph = if let Some(graph) = self.graphs.get(&graph_key) {
                 Arc::clone(graph)
@@ -670,10 +703,14 @@ impl ProjectContext {
                     &mut HashSet::new(),
                     &mut graph,
                 )?;
+                if config.config.cache.enabled {
+                    graph.fingerprint = Some(blake3::hash(graph.source.as_bytes()));
+                }
                 let graph = Arc::new(graph);
                 self.graphs.insert(graph_key, Arc::clone(&graph));
                 graph
             };
+            input_graph = graph.fingerprint;
             let options = if let Some(options) = graph.file_options.get(&path) {
                 Arc::clone(options)
             } else if let Some(end) = graph.file_ends.get(&path) {
@@ -720,6 +757,12 @@ impl ProjectContext {
             if let Some(events) = graph.package_events.get(&path) {
                 options.syntax.package_load_events = events.clone();
             }
+            if let Some(events) = graph.command_events.get(&path) {
+                // Executed source bindings are applied at their loader and
+                // restored with TeX scope. Retain explicit user rules here.
+                options.syntax.commands = config.config.syntax.commands.clone();
+                options.syntax.command_import_events = events.clone();
+            }
             self.compile_options(&config, &options)?
         } else {
             // Sibling declarations only supply list environment names. With
@@ -735,7 +778,11 @@ impl ProjectContext {
                 config
             }
         };
-        self.compiled.insert(key, Arc::clone(&result));
+        let result = PreparedSource {
+            config,
+            input_graph,
+        };
+        self.compiled.insert(key, result.clone());
         Ok(result)
     }
 
@@ -808,7 +855,13 @@ impl ProjectContext {
         }
         let source = self.read_normalized_source(path)?;
         let loader_occurrences = tift::source_model::SourceModel::loader_occurrences(&source);
-        let (entry_aliases, entry_arguments, entry_packages) = graph.declaration_snapshot(config);
+        let (entry_aliases, entry_arguments, entry_packages, entry_commands) =
+            graph.declaration_snapshot(config);
+        let mut command_events = vec![tift::config::CommandImportEvent {
+            at: 0,
+            loader: None,
+            commands: entry_commands,
+        }];
         let mut alias_events = vec![tift::config::EnvironmentAliasEvent {
             at: 0,
             loader: None,
@@ -890,7 +943,7 @@ impl ProjectContext {
             }
             let mut alias_prefix = graph.source.clone();
             alias_prefix.push_str(&source[cursor..input.span.start]);
-            let (before_aliases, before_arguments, before_packages) =
+            let (before_aliases, before_arguments, before_packages, before_commands) =
                 declaration_snapshot(&alias_prefix, config);
             graph.append_prepared_input(
                 &source[cursor..input.span.start],
@@ -908,8 +961,17 @@ impl ProjectContext {
                 }
             }
             graph.append_line("");
-            let (after_aliases, after_arguments, after_packages) =
+            let (after_aliases, after_arguments, after_packages, after_commands) =
                 graph.declaration_snapshot(config);
+            let commands = after_commands
+                .into_iter()
+                .filter(|(name, command)| before_commands.get(name) != Some(command))
+                .collect();
+            command_events.push(tift::config::CommandImportEvent {
+                at: input.span.end,
+                loader: loader_occurrences.get(&input.span.start).cloned(),
+                commands,
+            });
             let changes = before_aliases
                 .keys()
                 .chain(after_aliases.keys())
@@ -953,6 +1015,9 @@ impl ProjectContext {
         }
         graph.append_line(&source[cursor..]);
         if !graph.file_ends.contains_key(path) {
+            graph
+                .command_events
+                .insert(path.to_path_buf(), command_events);
             graph.alias_events.insert(path.to_path_buf(), alias_events);
             graph
                 .argument_events
@@ -1253,9 +1318,7 @@ fn literal_inputs_with_syntax(
                     skip_until = syntax::command_at(source, start).map_or(start, |(_, end)| end);
                     continue;
                 }
-                if depth != 0
-                    || conditions != 0
-                    || environments != 0
+                if conditions != 0
                     || !matches!(
                         command,
                         "input"

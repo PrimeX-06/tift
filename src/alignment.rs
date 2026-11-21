@@ -39,6 +39,8 @@ const DEFAULT_ENVIRONMENTS: &[&str] = &[
     "alignat*",
     "aligned",
     "alignedat",
+    "eqnarray",
+    "eqnarray*",
     "bmatrix",
     "Bmatrix",
     "cases",
@@ -539,15 +541,17 @@ fn format_alignment_with_context(
         && config.config.syntax.environment_aliases.is_empty()
         && config.config.syntax.inferred_environment_aliases.is_empty()
         && config.config.syntax.environment_alias_events.is_empty()
-        && !source.match_indices("\\begin{").any(|(start, _)| {
-            let rest = &source[start + "\\begin{".len()..];
-            rest.find('}').is_some_and(|end| {
-                config
-                    .alignment
-                    .rules
-                    .get(&rest[..end])
-                    .is_some_and(|r| r.settings.enabled)
-            })
+        && !source.match_indices("\\begin").any(|(start, _)| {
+            crate::syntax::command_at(source, start)
+                .and_then(|(command, end)| crate::syntax::env_after_command(source, command, end))
+                .is_some_and(|(name, begin, _)| {
+                    begin
+                        && config
+                            .alignment
+                            .rules
+                            .get(name)
+                            .is_some_and(|rule| rule.settings.enabled)
+                })
         })
     {
         return Ok(source.into());
@@ -839,6 +843,43 @@ fn format_alignment_with_context(
             &uncovered_environment,
             protected,
         );
+        let diagram_separator = (block.name == "tikzcd"
+            && rule.settings.delimiter == "&"
+            && config
+                .config
+                .alignment
+                .rules
+                .get("tikzcd")
+                .is_none_or(|rule| rule.delimiter.is_none()))
+        .then(|| {
+            let header = source[block.body.start..content_start].trim();
+            let options = header.strip_prefix('[')?.strip_suffix(']')?;
+            crate::packages::keys::definition_entries(options)
+                .into_iter()
+                .filter_map(|range| options[range].trim_end_matches(',').split_once('='))
+                .filter(|(_, value)| !value.contains('%'))
+                .rfind(|(key, _)| key.trim() == "ampersand replacement")
+                .map(|(_, value)| {
+                    let value = value.trim();
+                    value
+                        .strip_prefix('{')
+                        .and_then(|s| s.strip_suffix('}'))
+                        .unwrap_or(value)
+                        .trim()
+                })
+        })
+        .flatten()
+        .filter(|value| {
+            crate::syntax::command_at(value, 0).is_some_and(|(_, end)| end == value.len())
+        });
+        let diagram_rule = if let Some(separator) = diagram_separator {
+            let mut settings = rule.settings.clone();
+            settings.delimiter = regex::escape(separator);
+            Some(compile_rule(settings, "tikzcd").map_err(FormatError::Syntax)?)
+        } else {
+            None
+        };
+        let rule = diagram_rule.as_ref().unwrap_or(rule);
         let rows = split_rows(
             source,
             content_start..block.body.end,
@@ -1322,6 +1363,33 @@ fn split_rows(
             cursor = end;
             continue;
         }
+        if environment == "tikzcd"
+            && depth == 0
+            && bytes[cursor] == b'\\'
+            && let Some(newline) = source[cell_start..cursor].rfind('\n')
+            && source[cell_start + newline + 1..cursor].trim().is_empty()
+            && trailing_diagram_arrows(source, cursor, range.end)
+        {
+            let end = cell_start + newline + 1;
+            cells.push(cell_start..end);
+            rows.push(Row {
+                cells,
+                delimiters,
+                tail: range.end..range.end,
+                full: row_start..end,
+                terminator_length: 0,
+                standalone: false,
+            });
+            rows.push(Row {
+                cells: std::iter::once(end..range.end).collect(),
+                delimiters: Vec::new(),
+                tail: range.end..range.end,
+                full: end..range.end,
+                terminator_length: 0,
+                standalone: true,
+            });
+            return Ok(rows);
+        }
         while candidates
             .get(candidate_index)
             .is_some_and(|c| c.0 < cursor)
@@ -1428,9 +1496,59 @@ fn split_rows(
     Ok(rows)
 }
 
+fn trailing_diagram_arrows(source: &str, mut cursor: usize, end: usize) -> bool {
+    while let Some((name, after)) = crate::syntax::command_at(source, cursor) {
+        if !matches!(name, "arrow" | "ar") {
+            return false;
+        }
+        let arguments =
+            crate::layout::signature_argument_ranges(source, after..end, b"o".iter().copied());
+        let Some(argument) = arguments.last() else {
+            return false;
+        };
+        let next = crate::trivia::skip_until(source, argument.end, end);
+        if next == end {
+            return true;
+        }
+        if !source[argument.end..next].contains('\n') {
+            return false;
+        }
+        cursor = next;
+    }
+    false
+}
+
 /// Standalone table rules sit between logical rows. Their source stays outside
 /// the following first cell, including rule parameters and any trailing comment.
 fn standalone_rule_end(source: &str, start: usize, end: usize, environment: &str) -> Option<usize> {
+    if matches!(
+        environment,
+        "longtable" | "xltabular" | "tabularx" | "longtabu"
+    ) && let Some((name, after)) = crate::syntax::command_at(source, start)
+        && matches!(
+            name.trim_end_matches('*'),
+            "caption" | "captionabove" | "captionbelow"
+        )
+        && let Some(argument) =
+            crate::layout::signature_argument_ranges(source, after..end, b"om".iter().copied())
+                .into_iter()
+                .last()
+                .filter(|argument| source.as_bytes()[argument.start] == b'{')
+    {
+        let label = crate::trivia::skip_until(source, argument.end, end);
+        let after = if let Some(("label", after)) = crate::syntax::command_at(source, label) {
+            crate::layout::signature_argument_ranges(source, after..end, b"m".iter().copied())
+                .last()
+                .map_or(argument.end, |argument| argument.end)
+        } else {
+            argument.end
+        };
+        let row_break = crate::trivia::skip_until(source, after, end);
+        if let Some((r"\" | "tabularnewline", after)) = crate::syntax::command_at(source, row_break)
+        {
+            return Some(row_suffix_end(source, after, end).1);
+        }
+    }
     let mut cursor = crate::table_rules::rule_end(source, start, end, environment)?;
     while cursor < end {
         match source.as_bytes()[cursor] {

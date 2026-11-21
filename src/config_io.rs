@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -71,7 +71,7 @@ impl Loader {
             global: None,
         };
         if let Some(path) = loader.explicit.clone() {
-            loader.load(&path, &mut Vec::new())?;
+            loader.load(&path)?;
         }
         Ok(loader)
     }
@@ -95,7 +95,7 @@ impl Loader {
             }
         };
         let document = match &source {
-            Some(path) => Some(self.load(path, &mut Vec::new())?),
+            Some(path) => Some(self.load(path)?),
             None => None,
         };
         let matched: Vec<usize> = document
@@ -201,19 +201,37 @@ impl Loader {
         Ok(found)
     }
 
-    fn load(&mut self, path: &Path, stack: &mut Vec<PathBuf>) -> Result<Arc<Document>, String> {
-        if stack.iter().any(|entry| entry == path) {
-            let mut chain = stack
-                .iter()
-                .map(|entry| entry.display().to_string())
-                .collect::<Vec<_>>();
-            chain.push(path.display().to_string());
-            let chain = chain.join(" -> ");
-            return Err(format!("configuration extend cycle: {chain}"));
+    fn load(&mut self, path: &Path) -> Result<Arc<Document>, String> {
+        let mut pending = Vec::<(PathBuf, toml::Value)>::new();
+        let mut seen = HashSet::new();
+        let mut current = path.to_path_buf();
+        let mut inherited = loop {
+            if let Some(document) = self.documents.get(&current) {
+                break Some(Arc::clone(document));
+            }
+            if !seen.insert(current.clone()) {
+                let chain = pending
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .chain(std::iter::once(current.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                return Err(format!("configuration extend cycle: {chain}"));
+            }
+            let (local, parent) = self.read_document(&current)?;
+            pending.push((current, local));
+            let Some(parent) = parent else {
+                break None;
+            };
+            current = parent;
+        };
+        for (path, local) in pending.into_iter().rev() {
+            inherited = Some(self.compile_document(&path, local, inherited.as_deref())?);
         }
-        if let Some(document) = self.documents.get(path) {
-            return Ok(Arc::clone(document));
-        }
+        inherited.ok_or_else(|| config_error(Some(path), "empty configuration chain"))
+    }
+
+    fn read_document(&self, path: &Path) -> Result<(toml::Value, Option<PathBuf>), String> {
         let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut local: toml::Value =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -231,21 +249,28 @@ impl Loader {
             .transpose()?;
         let root = path.parent().unwrap_or(&self.cwd).to_path_buf();
         normalize_cache_directory(table, &root, Some(path))?;
-        let local_excludes = table
+        let parent = extend
+            .map(|extend| {
+                fs::canonicalize(root.join(&extend))
+                    .map(|path| absolute(&path, &self.cwd))
+                    .map_err(|e| config_error(Some(path), format!("cannot extend {extend:?}: {e}")))
+            })
+            .transpose()?;
+        Ok((local, parent))
+    }
+
+    fn compile_document(
+        &mut self,
+        path: &Path,
+        local: toml::Value,
+        inherited: Option<&Document>,
+    ) -> Result<Arc<Document>, String> {
+        let root = path.parent().unwrap_or(&self.cwd).to_path_buf();
+        let local_excludes = local
             .get("files")
             .and_then(toml::Value::as_table)
             .is_some_and(|files| files.contains_key("exclude"));
-        let local_overrides = table.contains_key("overrides");
-        stack.push(path.to_path_buf());
-        let inherited = if let Some(extend) = extend {
-            let extended = fs::canonicalize(root.join(&extend))
-                .map(|path| absolute(&path, &self.cwd))
-                .map_err(|e| config_error(Some(path), format!("cannot extend {extend:?}: {e}")))?;
-            Some(self.load(&extended, stack)?)
-        } else {
-            None
-        };
-        stack.pop();
+        let local_overrides = local.get("overrides").is_some();
         let exclude_root = if local_excludes {
             root.clone()
         } else {
