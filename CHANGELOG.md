@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.5
+
+- Improve TeX parsing for scoped expl3 syntax, conditionals, custom environments, and delayed command arguments. Preserve literal and macro-definition content across indentation, alignment, and math formatting.
+- Preserve declared source encodings when reading and writing LaTeX and BibTeX files, including encoding declarations in header comments.
+- Serialize concurrent writes and backup rotation for the same output path, using stable lock files alongside atomic file replacements.
+- Refine BibTeX cleanup and normalization, and expand support for document, reference, key-definition, and code-listing commands.
+- Improve project context, configuration handling, and persistent-cache behavior for the expanded syntax and encoding support.
+
+Download the archive for your platform, extract the executable, and add its directory to `PATH`. The archive includes a sample configuration. Cargo installation requires Rust 1.99.1 or later.
+
+```sh
+cargo install tift --version 0.1.5 --locked --registry crates-io
+```
+
+[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
+
 ## 0.1.4
 
 - Configure horizontal formula spacing separately from display line breaks. Keep existing lines, join eligible display bodies onto one line, or wrap to a separate math width with optional operator priorities.
