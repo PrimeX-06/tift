@@ -55,9 +55,13 @@ Label&Value\\Longer label&42\\
 
 ## Install
 
-Download an archive for your platform from [GitHub Releases](https://github.com/PrimeX-06/tift/releases), extract the executable, and add its directory to `PATH`.
+### Download a prebuilt binary (recommended)
 
-Or install with Cargo using **Rust 1.99.1 or later**:
+Download an archive for Windows, Linux, or macOS from the [latest GitHub Release](https://github.com/PrimeX-06/tift/releases/latest), extract the executable, and add its directory to `PATH`.
+
+### Install with Cargo
+
+Install with Cargo using **Rust 1.99.1 or later**:
 
 ```sh
 cargo install tift --locked --registry crates-io
