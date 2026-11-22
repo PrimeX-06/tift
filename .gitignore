@@ -29,11 +29,13 @@
 /reports/texlive-2026-bib-audit/*
 !/reports/texlive-2026-bib-audit/texlive-bib-audit.json
 !/reports/texlive-2026-bib-audit/texlive-bib-audit.md
+!/reports/latex-corpus-test-report.md
 !/tests/
 /tests/*
 !/tests/packages/
 /tests/packages/*
 !/tests/packages/document_layout_additions.rs
+!/tests/packages/expl3_call_stability.rs
 !/tests/packages/graphics_package_additions.rs
 !/tests/packages/package_scientific_additions.rs
 !/tests/packages/reference_additions.rs

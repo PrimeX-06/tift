@@ -11,6 +11,18 @@ mod scanner;
 
 use crate::{CompiledConfig, FileKind, FormatError, syntax};
 
+#[derive(Clone, Copy)]
+pub(crate) struct Activity {
+    algorithm2e: bool,
+    expl3: bool,
+}
+
+impl Activity {
+    pub(crate) fn active(self) -> bool {
+        self.algorithm2e || self.expl3
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CodeConfig {
@@ -27,22 +39,52 @@ impl Default for CodeConfig {
     }
 }
 
-pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
-    config.config.code.algorithm2e
-        && source.contains("\\begin")
-        && (source.contains("algorithm") || source.contains("algocf"))
-        || config.config.code.expl3 && has_expl3_marker(source)
+pub(crate) fn activity(source: &str, config: &CompiledConfig) -> Activity {
+    Activity {
+        algorithm2e: config.config.code.algorithm2e
+            && source.contains("\\begin")
+            && (source.contains("algorithm") || source.contains("algocf")),
+        expl3: config.config.code.expl3 && has_expl3_marker(source),
+    }
 }
 
 pub(crate) fn has_expl3_marker(source: &str) -> bool {
-    scanner::commands(source, &[])
-        .into_iter()
-        .any(|(_, name, _)| {
-            matches!(
+    if ![
+        "\\ExplSyntaxOn",
+        "\\ProvidesExplPackage",
+        "\\ProvidesExplClass",
+        "\\ProvidesExplFile",
+    ]
+    .iter()
+    .any(|marker| source.contains(marker))
+    {
+        return false;
+    }
+    let mut cursor = 0;
+    while cursor < source.len() {
+        if source.as_bytes()[cursor] == b'%' {
+            cursor = source[cursor..]
+                .find('\n')
+                .map_or(source.len(), |offset| cursor + offset + 1);
+        } else if let Some((name, end)) = syntax::command_at(source, cursor) {
+            if matches!(
                 name,
                 "ExplSyntaxOn" | "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile"
-            )
-        })
+            ) {
+                return true;
+            }
+            cursor = syntax::primitive_data_end(source, name, end)
+                .or_else(|| syntax::let_declaration_end(source, name, end))
+                .unwrap_or(end);
+        } else {
+            cursor += source[cursor..]
+                .chars()
+                .next()
+                .expect("source character")
+                .len_utf8();
+        }
+    }
+    false
 }
 
 fn overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
@@ -199,7 +241,30 @@ impl Opaque {
                     break;
                 }
             }
-            let original = &source[range.clone()];
+            let full = &source[range.clone()];
+            let external_indent = syntax::command_at(full, 0)
+                .is_some_and(|(name, _)| mathematical_command(name) || name == "directlua");
+            let starts_line =
+                !external_indent && (range.start == 0 || source[..range.start].ends_with('\n'));
+            let inside_group =
+                range.start > 0 && matches!(source.as_bytes()[range.start - 1], b'{' | b'[');
+            let line_start = source[..range.start]
+                .rfind('\n')
+                .map_or(0, |position| position + 1);
+            let line_prefix = &source[line_start..range.start];
+            let at_line_indent = line_prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t'));
+            let in_comment = line_prefix
+                .rfind('%')
+                .is_some_and(|position| !syntax::is_escaped(line_prefix, position));
+            let leading_space = if starts_line || inside_group || at_line_indent || in_comment {
+                0
+            } else {
+                full.bytes()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                    .count()
+            };
+            output.push_str(&full[..leading_space]);
+            let original = &full[leading_space..];
             let display = if original.starts_with(r"\[") || original.starts_with("$$") {
                 "DISPLAY"
             } else {
@@ -213,10 +278,6 @@ impl Opaque {
             } else if line_tail.ends_with('\n') {
                 output.push('\n');
             }
-            let external_indent = syntax::command_at(original, 0)
-                .is_some_and(|(name, _)| mathematical_command(name) || name == "directlua");
-            let starts_line =
-                !external_indent && (range.start == 0 || source[..range.start].ends_with('\n'));
             let newline_before = source[..range.start].ends_with('\n');
             entries.push((marker, original.to_owned(), starts_line, newline_before));
             cursor = range.end;
@@ -237,12 +298,6 @@ impl Opaque {
         if self.entries.is_empty() {
             return Some(formatted.to_owned());
         }
-        let markers = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, (marker, _, _, _))| (marker.as_str(), index))
-            .collect::<HashMap<_, _>>();
         let mut seen = vec![false; self.entries.len()];
         let mut positions = Vec::with_capacity(self.entries.len());
         for (position, _) in formatted.match_indices(&self.marker_prefix) {
@@ -277,8 +332,19 @@ impl Opaque {
                 continue;
             }
             end += 1;
-            let key = format!("{}{{}}", &formatted[position..word_end]);
-            let Some(&index) = markers.get(key.as_str()) else {
+            let marker_name = &formatted[position..word_end];
+            let Some(suffix) = marker_name.strip_prefix(&self.marker_prefix) else {
+                continue;
+            };
+            let index = opaque_marker_index(suffix, self.entries.len())
+                .filter(|&index| self.entries[index].0.strip_suffix("{}") == Some(marker_name))
+                .or_else(|| {
+                    let suffix = suffix.strip_prefix("DISPLAY")?;
+                    opaque_marker_index(suffix, self.entries.len()).filter(|&index| {
+                        self.entries[index].0.strip_suffix("{}") == Some(marker_name)
+                    })
+                });
+            let Some(index) = index else {
                 continue;
             };
             if std::mem::replace(&mut seen[index], true) {
@@ -388,6 +454,24 @@ impl Opaque {
         }
         Some(output)
     }
+}
+
+fn opaque_marker_index(suffix: &str, count: usize) -> Option<usize> {
+    if suffix.is_empty() {
+        return None;
+    }
+
+    let mut index = 0usize;
+    let mut place = 1usize;
+    for byte in suffix.bytes() {
+        let digit = usize::from(byte.checked_sub(b'A')?);
+        if digit >= 26 {
+            return None;
+        }
+        index = index.checked_add(digit.checked_mul(place)?)?;
+        place = place.checked_mul(26)?;
+    }
+    (index < count).then_some(index)
 }
 
 fn append_tracking_line(output: &mut String, text: &str, line_start: &mut usize) {
@@ -500,11 +584,13 @@ pub(crate) fn format_code(
     kind: FileKind,
     config: &CompiledConfig,
 ) -> Result<CodeOutput, FormatError> {
+    let activity = activity(source, config);
     format_code_with_context(
         source,
         kind,
         config,
         &mut crate::parse_context::ParseContext::new(config),
+        activity,
     )
 }
 
@@ -513,14 +599,15 @@ pub(crate) fn format_code_with_context(
     _kind: FileKind,
     config: &CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
+    activity: Activity,
 ) -> Result<CodeOutput, FormatError> {
-    if !is_active(source, config) {
+    if !activity.active() {
         return Ok(CodeOutput {
             text: source.to_owned(),
             math_recheck: false,
         });
     }
-    let expl3_active = config.config.code.expl3 && has_expl3_marker(source);
+    let expl3_active = activity.expl3;
     let expl3_ranges = if expl3_active && config.config.protect.expl3 {
         Some(parsing.expl3_protected_ranges(source)?)
     } else {
@@ -696,19 +783,87 @@ pub(crate) fn format_code_with_context(
                         ..range.end.min(fragment.end) - fragment.start
                 })
                 .collect::<Vec<_>>();
-            for (start, name, end) in scanner::commands(data, &excluded) {
+            let commands = scanner::commands(data, &excluded);
+            let mut literal_calls = Vec::new();
+            for &(start, name, end) in &commands {
+                let setting = crate::packages::keys::setting_command(name);
+                let has_expanded_argument = name
+                    .rsplit_once(':')
+                    .is_some_and(|(_, signature)| signature.as_bytes().contains(&b'e'));
+                if !setting && !has_expanded_argument {
+                    continue;
+                }
+                let Some(call) = expl3::parse_call(data, name, end) else {
+                    continue;
+                };
+                if setting
+                    && !call.arguments.iter().enumerate().any(|(slot, _)| {
+                        expl3::is_code_argument(&call, slot, call.signature.as_bytes()[slot])
+                    })
+                {
+                    literal_calls.push(start..call.end);
+                    continue;
+                }
+                for (slot, argument) in call.arguments.iter().enumerate() {
+                    if call.signature.as_bytes()[slot] != b'e'
+                        || expl3::is_code_argument(&call, slot, call.signature.as_bytes()[slot])
+                    {
+                        continue;
+                    }
+                    let range = match data.as_bytes().get(argument.range.start) {
+                        Some(b'{' | b'[') if argument.range.len() > 1 => {
+                            argument.range.start + 1..argument.range.end - 1
+                        }
+                        _ => argument.range.clone(),
+                    };
+                    if !range.is_empty() {
+                        literal_calls.push(range);
+                    }
+                }
+            }
+            let literal_calls = merged(literal_calls);
+            nested_data.extend(
+                literal_calls
+                    .iter()
+                    .map(|range| fragment.start + range.start..fragment.start + range.end),
+            );
+            let mut literal_call_index = 0;
+            for (start, name, end) in commands {
+                while literal_calls
+                    .get(literal_call_index)
+                    .is_some_and(|range| range.end <= start)
+                {
+                    literal_call_index += 1;
+                }
+                if literal_calls
+                    .get(literal_call_index)
+                    .is_some_and(|range| range.start <= start)
+                {
+                    continue;
+                }
                 if fragment.start + start < end_of_data {
                     continue;
                 }
                 if let Some(argument) = crate::source_model::expl3_stored_arguments(data, name, end)
                 {
-                    end_of_data = fragment.start + argument.end;
-                    if data.as_bytes().get(argument.start) == Some(&b'{')
-                        && argument.end > argument.start + 2
-                    {
-                        nested_data.push(
-                            fragment.start + argument.start + 1..fragment.start + argument.end - 1,
-                        );
+                    let literal_call = expl3::parse_call(data, name, end).filter(|call| {
+                        !call.arguments.iter().enumerate().any(|(slot, _)| {
+                            expl3::is_code_argument(call, slot, call.signature.as_bytes()[slot])
+                        })
+                    });
+                    if let Some(call) = literal_call {
+                        end_of_data = fragment.start + call.end;
+                        nested_data.push(fragment.start + start..fragment.start + call.end);
+                    } else {
+                        end_of_data = fragment.start + argument.end;
+                        if data.as_bytes().get(argument.start) == Some(&b'{')
+                            && argument.end > argument.start + 2
+                        {
+                            nested_data.push(
+                                fragment.start + argument.start + 1
+                                    ..fragment.start + argument.end - 1,
+                            );
+                        }
                     }
                 }
             }

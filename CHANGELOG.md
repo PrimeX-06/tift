@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.6
+
+- Expand syntax and formatting coverage for expl3 literal data, hook callbacks, opaque source regions, and deeply nested environments.
+- Improve repeated-format performance by reusing activity scans, borrowing expl3 call metadata, reducing opaque-marker allocations, and indexing cross-argument boundaries.
+- Add regression coverage and release-mode benchmarks for syntax stability and real-corpus throughput.
+
+Download the archive for Windows, Linux, or macOS from the [latest GitHub Release](https://github.com/PrimeX-06/tift/releases/latest), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
+
+```sh
+cargo install tift --version 0.1.6 --locked --registry crates-io
+```
+
+[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
+
 ## 0.1.5
 
 - Improve TeX parsing for scoped expl3 syntax, conditionals, custom environments, and delayed command arguments. Preserve literal and macro-definition content across indentation, alignment, and math formatting.

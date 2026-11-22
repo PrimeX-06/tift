@@ -27,6 +27,19 @@ pub(crate) fn command_signature(name: &str) -> Option<&'static str> {
     })
 }
 
+pub(crate) fn setting_command(name: &str) -> bool {
+    matches!(
+        name,
+        "keys_set:nn"
+            | "keys_set:nV"
+            | "keys_set:ne"
+            | "keys_set:no"
+            | "keys_set_known:nnN"
+            | "keys_set_filter:nnn"
+            | "keys_set_groups:nnn"
+    )
+}
+
 pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
     for name in [
         "keys_define:nn",

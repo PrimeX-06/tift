@@ -16,8 +16,8 @@ pub(crate) use crate::block_storage::SharedBlock;
 use crate::block_storage::{BlockName, NamePool, NameStore, OwnedNames, StructuralBlock};
 use crate::config::SyntaxConfig;
 use crate::{Config, FormatError};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -7114,27 +7114,81 @@ fn scoped_pairs(events: &[(usize, bool, Option<usize>)]) -> (BoundaryPairs, Boun
     unmatched_close.sort_by_key(|(position, _)| *position);
 
     let mut cross_pairs = Vec::new();
-    let mut used_closes = HashSet::new();
     // Only infer fragments inside braced source. Top-level errors must still
     // be diagnosed, even if a stored argument contains the opposite delimiter.
-    for (open, open_owner) in unmatched_open
-        .into_iter()
-        .filter_map(|(open, owner)| Some((open, owner?)))
-    {
-        if let Some((index, &(close, _close_owner))) =
-            unmatched_close
-                .iter()
-                .enumerate()
-                .find(|(index, (_, owner))| {
-                    owner.is_some_and(|owner| owner != open_owner) && !used_closes.contains(index)
-                })
-        {
-            used_closes.insert(index);
-            cross_pairs.push((open, close));
+    let has_owned_open = unmatched_open.iter().any(|(_, owner)| owner.is_some());
+    let has_owned_close = unmatched_close.iter().any(|(_, owner)| owner.is_some());
+    if has_owned_open && has_owned_close {
+        let mut closes_by_owner = HashMap::<usize, Vec<usize>>::new();
+        for (index, (_, owner)) in unmatched_close.iter().enumerate() {
+            if let Some(owner) = owner {
+                closes_by_owner.entry(*owner).or_default().push(index);
+            }
+        }
+
+        let mut close_offsets = HashMap::<usize, usize>::with_capacity(closes_by_owner.len());
+        let mut earliest_closes =
+            BinaryHeap::<Reverse<(usize, usize)>>::with_capacity(closes_by_owner.len());
+        for (&owner, closes) in &closes_by_owner {
+            earliest_closes.push(Reverse((closes[0], owner)));
+        }
+
+        for &(open, open_owner) in &unmatched_open {
+            let Some(open_owner) = open_owner else {
+                continue;
+            };
+            let Some(Reverse(first)) = earliest_closes.pop() else {
+                break;
+            };
+            let selected = if first.1 != open_owner {
+                first
+            } else if let Some(Reverse(second)) = earliest_closes.pop() {
+                earliest_closes.push(Reverse(first));
+                second
+            } else {
+                earliest_closes.push(Reverse(first));
+                continue;
+            };
+
+            let (close_index, close_owner) = selected;
+            cross_pairs.push((open, unmatched_close[close_index].0));
+            let offset = close_offsets.entry(close_owner).or_default();
+            *offset += 1;
+            if let Some(&next_close) = closes_by_owner[&close_owner].get(*offset) {
+                earliest_closes.push(Reverse((next_close, close_owner)));
+            }
         }
     }
 
     (local_pairs, cross_pairs)
+}
+
+#[cfg(test)]
+mod scoped_pairs_tests {
+    use super::scoped_pairs;
+
+    #[test]
+    fn cross_pairs_skip_same_owner_and_consume_the_earliest_other_close() {
+        const OWNER_COUNT: usize = 300;
+        let mut events = Vec::with_capacity(OWNER_COUNT * 2);
+        for owner in 0..OWNER_COUNT {
+            events.push((owner * 2, false, Some(owner)));
+            events.push((owner * 2 + 1, true, Some(owner)));
+        }
+
+        let (_, pairs) = scoped_pairs(&events);
+        let expected = (0..OWNER_COUNT)
+            .map(|owner| {
+                let close_owner = if owner.is_multiple_of(2) {
+                    owner + 1
+                } else {
+                    owner - 1
+                };
+                (owner * 2 + 1, close_owner * 2)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, expected);
+    }
 }
 
 fn parse_blocks_from_tokens<S: NameStore>(

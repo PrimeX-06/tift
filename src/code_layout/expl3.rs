@@ -20,9 +20,10 @@ pub(crate) struct Argument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Call {
-    pub(crate) base: String,
-    pub(crate) signature: String,
+pub(crate) struct Call<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) signature: &'a str,
     pub(crate) arguments: Vec<Argument>,
     pub(crate) end: usize,
 }
@@ -58,7 +59,7 @@ fn tex_argument_end(source: &str, start: usize) -> Option<usize> {
     }
 }
 
-pub(crate) fn parse_call(source: &str, name: &str, command_end: usize) -> Option<Call> {
+pub(crate) fn parse_call<'a>(source: &str, name: &'a str, command_end: usize) -> Option<Call<'a>> {
     if !is_expl3_name(name) {
         return None;
     }
@@ -94,8 +95,9 @@ pub(crate) fn parse_call(source: &str, name: &str, command_end: usize) -> Option
     }
 
     Some(Call {
-        base: base.to_owned(),
-        signature: signature.to_owned(),
+        name,
+        base,
+        signature,
         arguments,
         end: cursor,
     })
@@ -104,7 +106,7 @@ pub(crate) fn parse_call(source: &str, name: &str, command_end: usize) -> Option
 pub(crate) fn is_code_argument(call: &Call, slot: usize, kind: u8) -> bool {
     if slot == 1
         && matches!(
-            call.base.as_str(),
+            call.base,
             "str_case" | "str_case_e" | "tl_case" | "int_case" | "dim_case"
         )
     {
@@ -116,20 +118,28 @@ pub(crate) fn is_code_argument(call: &Call, slot: usize, kind: u8) -> bool {
     if call.base == "reverse_if" && slot == 0 && kind == b'N' {
         return true;
     }
+    if slot + 1 == call.arguments.len()
+        && matches!(
+            (call.base, call.signature),
+            ("hook_gput_code", "nnn")
+                | ("hook_gput_next_code", "nn")
+                | ("hook_gput_next_code", "ne")
+        )
+    {
+        return true;
+    }
     if matches!(kind, b'T' | b'F') {
         return true;
     }
-    if crate::syntax::expl3_definition_variant(&format!("{}:{}", call.base, call.signature))
-        .is_some()
-    {
+    if crate::syntax::expl3_definition_variant(call.name).is_some() {
         return slot + 1 == call.arguments.len();
     }
 
-    let name = call.base.as_str();
+    let name = call.base;
     let last = slot + 1 == call.arguments.len();
-    last && (name.split('_').any(|part| part == "inline")
-        || name.contains("_step_inline")
+    let inline_callback = name.split('_').any(|part| part == "inline")
         || ["_do_while", "_while_do", "_do_until", "_until_do"]
             .iter()
-            .any(|pattern| name.contains(pattern)))
+            .any(|pattern| name.contains(pattern));
+    last && matches!(kind, b'm' | b'n') && inline_callback
 }

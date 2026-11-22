@@ -85,7 +85,10 @@ impl Printer<'_> {
     }
 
     fn argument_space(&mut self) {
-        if !self.output.ends_with([' ', '\n']) {
+        while self.output.ends_with([' ', '\t']) {
+            self.output.pop();
+        }
+        if !self.output.is_empty() && !self.output.ends_with('\n') {
             self.append(" ");
         }
     }
@@ -182,7 +185,7 @@ impl Printer<'_> {
                 && super::algorithm_environment(environment)
                 && let Some((_, range)) = super::scanner::environments(&source[cursor..], &[])
                     .into_iter()
-                    .find(|(candidate, range)| candidate == environment && range.start == 0)
+                    .find(|(candidate, range)| *candidate == environment && range.start == 0)
                 && let fragment_end = cursor + range.end
                 && let header = super::scanner::algorithm_header_end(source, header)
                 && let Some(body_and_close) = source.get(header..fragment_end)

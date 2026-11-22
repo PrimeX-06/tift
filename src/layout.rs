@@ -399,7 +399,8 @@ fn format_document_stages(
                     || clean_whitespace(&text, config, &mut parsing),
                 )?;
             }
-            let code_active = crate::code_layout::is_active(&text, config);
+            let code_activity = crate::code_layout::activity(&text, config);
+            let code_active = code_activity.active();
             let mut math_recheck = false;
             let code_changed = optional_stage(
                 "code",
@@ -414,6 +415,7 @@ fn format_document_stages(
                         kind,
                         config,
                         &mut parsing,
+                        code_activity,
                     )?;
                     math_recheck = output.math_recheck;
                     Ok(output.text)

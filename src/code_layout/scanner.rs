@@ -1,5 +1,6 @@
 //! Literal boundaries shared by the native code and docstrip printers.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::{syntax, trivia};
@@ -54,11 +55,14 @@ pub(super) fn algorithm_header_end(source: &str, end: usize) -> usize {
     syntax::balanced_end(source, start, b'[', b']').unwrap_or(end)
 }
 
-pub(super) fn environments(
-    source: &str,
+const ENVIRONMENT_INDEX_DEPTH: usize = 64;
+
+pub(super) fn environments<'a>(
+    source: &'a str,
     protected: &[Range<usize>],
-) -> Vec<(String, Range<usize>)> {
-    let mut stack = Vec::new();
+) -> Vec<(&'a str, Range<usize>)> {
+    let mut stack = Vec::<(&str, usize)>::new();
+    let mut indexed_stack = None::<HashMap<&str, Vec<usize>>>;
     let mut output = Vec::new();
     let mut header_end = 0;
     for (start, name, end) in commands(source, protected) {
@@ -72,10 +76,28 @@ pub(super) fn environments(
             if super::algorithm_environment(environment) {
                 header_end = algorithm_header_end(source, finish);
             }
-            stack.push((environment, start));
+            if let Some(index) = &mut indexed_stack {
+                index.entry(environment).or_default().push(start);
+            } else {
+                stack.push((environment, start));
+                if stack.len() > ENVIRONMENT_INDEX_DEPTH {
+                    let mut index = HashMap::<&str, Vec<usize>>::new();
+                    for (open, begin) in stack.drain(..) {
+                        index.entry(open).or_default().push(begin);
+                    }
+                    indexed_stack = Some(index);
+                }
+            }
+        } else if let Some(index) = &mut indexed_stack {
+            if let Some(begin) = index.get_mut(environment).and_then(Vec::pop) {
+                output.push((environment, begin..finish));
+            }
+        } else if stack.last().is_some_and(|(open, _)| *open == environment) {
+            let (_, begin) = stack.pop().expect("matching environment on stack");
+            output.push((environment, begin..finish));
         } else if let Some(index) = stack.iter().rposition(|(open, _)| *open == environment) {
             let (_, begin) = stack.remove(index);
-            output.push((environment.to_owned(), begin..finish));
+            output.push((environment, begin..finish));
         }
     }
     output

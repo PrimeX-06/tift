@@ -2,7 +2,7 @@
 autotests = false
 autobenches = false
 name = "tift"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A configurable, fast LaTeX source formatter"
@@ -46,3 +46,13 @@ incremental = false
 [[bin]]
 name = "tift"
 path = "src/main.rs"
+
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
+
+[[bench]]
+name = "real_corpus"
+path = "benches/real_corpus.rs"
+harness = false
