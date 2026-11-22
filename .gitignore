@@ -12,6 +12,12 @@
 /.github/workflows/*
 !/.github/workflows/ci.yml
 !/.github/workflows/release.yml
+!/docs/
+/docs/*
+!/docs/branding/
+/docs/branding/*
+!/docs/branding/tift-logo.svg
+!/docs/branding/tift-logo.tex
 !/src/
 !/examples/
 /examples/*

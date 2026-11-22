@@ -1,5 +1,7 @@
 # tift — A fast LaTeX and BibTeX formatter
 
+![tift logo](https://raw.githubusercontent.com/PrimeX-06/tift/main/docs/branding/tift-logo.svg)
+
 [![Rust 1.99.1+](https://img.shields.io/badge/Rust-1.99.1%2B-orange)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 

@@ -1,0 +1,15 @@
+\documentclass[tikz,border=0pt]{standalone}
+\definecolor{tiftindigo}{HTML}{312C84}
+\definecolor{tiftcoral}{HTML}{F04C36}
+
+\begin{document}
+\begin{tikzpicture}[x=1bp,y=-1bp]
+  \path[use as bounding box] (0,0) rectangle (64,64);
+  \fill[tiftindigo]
+    (16,8) -- (24,8) -- (24,16) -- (56,16) -- (56,24)
+    -- (24,24) -- (24,44) -- (28,48) -- (40,48) -- (40,56)
+    -- (24,56) -- (16,48) -- (16,24) -- (8,24) -- (8,16)
+    -- (16,16) -- cycle;
+  \fill[tiftcoral] (32,32) rectangle (48,40);
+\end{tikzpicture}
+\end{document}

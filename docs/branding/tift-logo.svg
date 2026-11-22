@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"
+     width="64" height="64" role="img" aria-labelledby="tift-logo-title">
+  <title id="tift-logo-title">tift</title>
+  <path fill="#312C84"
+        d="M16 8H24V16H56V24H24V44L28 48H40V56H24L16 48V24H8V16H16Z"/>
+  <rect fill="#F04C36" x="32" y="32" width="16" height="8"/>
+</svg>
