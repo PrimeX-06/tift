@@ -563,6 +563,29 @@ fn parse_into(
                 }
                 Justification::Center
             }
+            // dcolumn.sty defines D{input separator}{output separator}{places}.
+            b'D' => {
+                for _ in 0..3 {
+                    cursor = skip(source, cursor);
+                    cursor = group(source, cursor, b'{', b'}')?.end + 1;
+                }
+                Justification::Right
+            }
+            // array.sty 2.6 defines w/W{alignment}{width} fixed-width columns.
+            b'w' | b'W' => {
+                cursor = skip(source, cursor);
+                let alignment_group = group(source, cursor, b'{', b'}')?;
+                let alignment_name = source[alignment_group.clone()].trim();
+                let justification = match alignment_name {
+                    "l" => Justification::Left,
+                    "c" => Justification::Center,
+                    "r" => Justification::Right,
+                    _ => return None,
+                };
+                cursor = skip(source, alignment_group.end + 1);
+                cursor = group(source, cursor, b'{', b'}')?.end + 1;
+                justification
+            }
             b'|' | b':' => {
                 if let Some(layout) = &mut layout {
                     layout.record(byte, start..cursor)?;

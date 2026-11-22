@@ -11,6 +11,7 @@ mod foreach;
 pub mod layout;
 pub mod literal_expansion;
 pub mod math_layout;
+#[path = "packages/package_support_registry.rs"]
 mod packages;
 mod parse_context;
 pub mod ranges;

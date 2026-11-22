@@ -15,6 +15,9 @@ specifications! {
     "DeclareSIPower" | "DeclareSIPrefix" | "DeclareBinaryPrefix" => ("mmm", "UUU", "mmm"),
     "DeclareSIQualifier" | "DeclareSIPrePower" | "DeclareSIPostPower" => ("mm", "UU", "mm"),
     "DeclareSIUnit" => ("omm", "UUU", "omm"),
+    // units.sty: unit values and the numerator/denominator expressions are
+    // kept together, with an optional leading value in either command.
+    "unitfrac" => ("omm", "UUU", "omm"),
 }
 
 pub(super) fn is_context_metadata(name: &str) -> bool {
@@ -35,6 +38,38 @@ pub(super) fn context_specification(
     name: &str,
     context: &InvocationContext<'_>,
 ) -> Option<CommandSpec> {
+    if context.has_package("SIunits") {
+        match name.trim_end_matches('*') {
+            "unit" => return Some(CommandSpec::new("mm", "UU", "mm")),
+            "power" => return Some(CommandSpec::new("mm", "UU", "mm")),
+            _ => (),
+        }
+    }
+    if context.has_package("physunits")
+        && matches!(
+            name,
+            "V" | "Volt"
+                | "Coulomb"
+                | "Ohm"
+                | "Amp"
+                | "Farad"
+                | "Henry"
+                | "Tesla"
+                | "Gauss"
+                | "calorie"
+                | "Hz"
+                | "barP"
+                | "Pa"
+                | "Ba"
+                | "Torr"
+                | "Celsius"
+                | "Fahrenheit"
+                | "Rankine"
+                | "Kelvin"
+        )
+    {
+        return Some(CommandSpec::new("o", "U", "o"));
+    }
     (name.trim_end_matches('*') == "qty"
         && context.has_package("siunitx")
         && !context.possibly_has_package("physics"))

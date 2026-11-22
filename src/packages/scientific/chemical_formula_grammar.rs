@@ -28,6 +28,26 @@ specifications! {
     "chemnameinit" => ("m", "T", ""),
     "chemabove" | "chembelow" | "Chemabove" | "Chembelow" => ("omm", "UMM", "o"),
     "chargedot" | "chargeddot" | "chargerect" | "chargeline" => ("o", "U", "o"),
+    // chemnum compound IDs are stored labels, not printable TeX formulas.
+    // The star defines a label, plus refers to an existing label.
+    "cmpd" => ("s t+ o m", "UUUU", "s t+ o"),
+    "refcmpd" | "labelcmpd" | "initcmpd" => ("om", "UU", "om"),
+    "replacecmpd" => ("s t+ o m", "UUUU", "s t+ o"),
+    "cmpdplain" => ("m", "U", "m"),
+    "subcmpdplain" | "submaincmpdplain" => ("mm", "UU", "mm"),
+    "cmpdproperty" => ("mm", "UU", "mm"),
+    "subcmpdproperty" => ("mmm", "UUU", "mmm"),
+    "setchemnum" => ("m", "U", "m"),
+    // elements.sty queries and declares names, symbols, distributions and
+    // isotope lists using atomic numbers or element identifiers.
+    "elementname" | "elementsymbol" | "atomicnumber" | "elconf" | "Z"
+    | "mainelementisotope" => ("m", "U", "m"),
+    "setatomname" | "DeclareAtomName" => ("omm", "UUU", "omm"),
+    "saveelementname" | "saveelementsymbol" | "saveatomicnumber"
+    | "saveelementisotopes" | "savemainelementisotope" => ("mm", "UU", "mm"),
+    "setatomsymbol" | "DeclareAtomSymbol" | "setelectrondistribution"
+    | "DeclareElectronDistribution" | "setatomisotopes" | "DeclareAtomIsotopes"
+        => ("mm", "UU", "mm"),
 }
 
 pub(super) fn is_context_metadata(name: &str) -> bool {

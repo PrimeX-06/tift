@@ -46,6 +46,48 @@ macro_rules! commands {
 }
 
 commands! {
+    // memoir.cls page geometry and margin-note layout controls.
+    "settypeblocksize" | "setlrmarginsandblock" | "setulmarginsandblock" => "mmm",
+    "setlrmargins" | "setulmargins" => "mmm",
+    "settrimmedsize" => "mmm",
+    "setstocksize" => "mm",
+    "setheadfoot" => "mm",
+    "setbinding" => "m",
+    "setcolsepandrule" => "mm",
+    "setheaderspaces" | "setmarginnotes" => "mmm",
+    // memoir.cls pagestyle construction and rule geometry.
+    "makerunningwidth" => "mom",
+    "makepagestyle" | "makepsmarks" => "m",
+    "aliaspagestyle" | "copypagestyle" => "mm",
+    "makeheadrule" => "mmm",
+    "makefootrule" => "mmmm",
+    "makeheadfootruleprefix" => "mmm",
+    "checkandfixthelayout" => "o",
+    "recalctypearea" => "",
+    // KOMA-Script font-element and option controls.
+    "setkomafont" | "addtokomafont" | "KOMAoption" => "mm",
+    "usekomafont" | "KOMAoptions" => "m",
+    "setparsizes" => "mmm",
+    "areaset" => "omm",
+    "typearea" => "om",
+    // footmisc: a custom symbol list can be starred and select a math/text style.
+    "DefineFNsymbols" => "smom",
+    "DefineFNsymbolsTM" => "smm",
+    "setfnsymbol" | "footref" => "m",
+    "mpfootnotemark" => "o",
+    // floatpag.sty selects page styles for normal and rotated float pages.
+    "floatpagestyle" | "rotfloatpagestyle" | "thisfloatpagestyle" => "m",
+    // fncychap.sty formatting hooks store their replacement declaration.
+    "ChNameVar" | "ChNumVar" | "ChTitleVar" | "ChRuleWidth" | "mghrulefill" => "m",
+    // sectsty.sty stores font declarations for section heading families.
+    "allsectionsfont" | "partfont" | "chapterfont" | "sectionfont" | "subsectionfont"
+        | "subsubsectionfont" | "paragraphfont" | "subparagraphfont" => "m",
+    // tocbibind.sty changes the printed names of auxiliary contents lists.
+    "setindexname" | "settocname" | "setlotname" | "setlofname" | "settocbibname" => "m",
+    // nextpage.sty optionally fills a blank page while advancing parity.
+    "cleartoevenpage" | "cleartooddpage" | "cleartoevenpage*" | "cleartooddpage*" => "o",
+    // chngcntr.sty and the LaTeX kernel counter-within interface.
+    "counterwithin" | "counterwithout" => "mm",
     "ihead" | "chead" | "ohead" | "ifoot" | "cfoot" | "ofoot"
         | "lehead" | "cehead" | "rehead" | "lohead" | "cohead" | "rohead"
         | "lefoot" | "cefoot" | "refoot" | "lofoot" | "cofoot" | "rofoot" => "om",
@@ -99,8 +141,24 @@ fn next_token(source: &str, cursor: usize) -> Option<u8> {
 }
 
 pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Option<&'static str> {
-    let fixed = fixed_signature(name)?;
     let base = name.trim_end_matches('*');
+    let fixed = match base {
+        // caption.sty: keep caption metadata in the argument parser without
+        // registering it as a caller-defined text command.
+        "captionsetup" => "om",
+        "captionof" => "mom",
+        "captionlistentry" => "om",
+        "DeclareCaptionFormat"
+        | "DeclareCaptionLabelFormat"
+        | "DeclareCaptionTextFormat"
+        | "DeclareCaptionLabelSeparator"
+        | "DeclareCaptionFont"
+        | "DeclareCaptionJustification"
+        | "DeclareCaptionStyle" => "mm",
+        "DeclareCaptionSubType" => "om",
+        "captionsetupfont" | "captionnamefont" | "captiontitlefont" => "m",
+        _ => fixed_signature(name)?,
+    };
     let separated_star = !name.ends_with('*') && next_token(source, cursor) == Some(b'*');
     match base {
         "titleformat" if name.ends_with('*') => Some("mm"),
@@ -146,6 +204,9 @@ pub(crate) fn is_metadata_command(name: &str) -> bool {
 pub(crate) fn command_header_end(source: &str, name: &str, cursor: usize) -> Option<usize> {
     let base = name.trim_end_matches('*');
     let signature = match base {
+        "captionof" => return None,
+        // KOMAoptions feeds the ordinary key-value argument formatter.
+        "KOMAoptions" => return None,
         "textls" => {
             if !name.ends_with('*') && next_token(source, cursor) == Some(b'*') {
                 "mo"

@@ -29,4 +29,12 @@ commands! {
         | "fxuselayouts" | "fxuseenvlayout" | "fxusetargetlayout" => ("m", "m"),
     "FXRegisterAuthor" => ("mmm", "mmm"),
     "listoffixmes" => ("", ""),
+    // pdfcomment.sty: annotation options precede their printable text. Markup
+    // and tooltip forms keep both display text arguments formatable.
+    "pdfcomment" | "pdfmargincomment" | "pdffreetextcomment" | "pdfsquarecomment"
+        | "pdfcirclecomment" | "pdflinecomment" => ("om", "o"),
+    "pdfmarkupcomment" | "pdftooltip" => ("omm", "o"),
+    "pdfcommentsetup" => ("om", "om"),
+    "listofpdfcomments" => ("o", "o"),
+    "setliststyle" | "defineliststyle" | "defineavatar" | "definestyle" => ("mm", "mm"),
 }

@@ -58,14 +58,30 @@ macro_rules! specifications {
     };
 }
 
-mod arrows;
-mod calculus;
-mod chemistry;
-mod equations;
-mod fonts;
-mod physics;
-mod proofs;
-mod units;
+#[path = "equation_arrow_grammar.rs"]
+mod equation_arrow_grammar;
+use equation_arrow_grammar as arrows;
+#[path = "calculus_command_grammar.rs"]
+mod calculus_command_grammar;
+use calculus_command_grammar as calculus;
+#[path = "chemical_formula_grammar.rs"]
+mod chemical_formula_grammar;
+use chemical_formula_grammar as chemistry;
+#[path = "equation_command_grammar.rs"]
+mod equation_command_grammar;
+use equation_command_grammar as equations;
+#[path = "math_font_command_grammar.rs"]
+mod math_font_command_grammar;
+use math_font_command_grammar as fonts;
+#[path = "physics_command_grammar.rs"]
+mod physics_command_grammar;
+use physics_command_grammar as physics;
+#[path = "proof_command_grammar.rs"]
+mod proof_command_grammar;
+use proof_command_grammar as proofs;
+#[path = "unit_command_grammar.rs"]
+mod unit_command_grammar;
+use unit_command_grammar as units;
 
 macro_rules! domains {
     ($($module:ident),+ $(,)?) => {
@@ -92,6 +108,7 @@ fn contextual_specification(name: &str, context: &InvocationContext<'_>) -> Opti
     }
     units::context_specification(name, context)
         .or_else(|| chemistry::context_specification(name, context))
+        .or_else(|| physics::context_specification(name, context))
         .or_else(|| proofs::context_specification(name, context))
         .or_else(|| arrows::context_specification(name, context))
 }

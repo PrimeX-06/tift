@@ -78,7 +78,12 @@ command_signatures! {
     "syncallcounters" | "flushpage" | "resetbackgroundcolor" => "",
     "twosided" | "normalcolumncolor" | "normalcolseprulecolor" | "switchcolumn" => "o",
     // paracol.sty:2699--2710,2805--2817: [model]{color}[column].
-    "columncolor" | "colseprulecolor" => "omo",
+    "colseprulecolor" => "omo",
+    // colortbl/xcolor: optional model, mandatory color, then left/right
+    // overhangs. These trailing options belong to the color declaration.
+    "rowcolor" | "cellcolor" | "columncolor" => "omoo",
+    "arrayrulecolor" => "om",
+    "rowcolors" => "ommm",
     // paracol.sty:2827--2884: {region}[column][model]{color}.
     "backgroundcolor" => "moom",
     "nobackgroundcolor" => "mo",
@@ -161,6 +166,7 @@ pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Opti
                 },
             )
         }
+        "columncolor" => Some("omoo"),
         _ => fixed_command_signature(name),
     }
 }

@@ -27,6 +27,24 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     })
 }
 
+pub(crate) fn command_signature(_source: &str, name: &str, _cursor: usize) -> Option<&'static str> {
+    Some(match name.trim_end_matches('*') {
+        // float.sty and newfloat.sty keep the extension/placement metadata
+        // separate from the printable caption and body.
+        "newfloat" => "mmmo",
+        "DeclareFloatingEnvironment" => "om",
+        "SetupFloatingEnvironment" | "floatname" => "mm",
+        "floatstyle" => "m",
+        "restylefloat" => "om",
+        // subfig.sty: [list entry][caption]{subfloat body}.
+        "subfloat" => "oom",
+        "subref" => "m",
+        // bookcover.cls: component type, part, optional four margins, content.
+        "bookcovercomponent" => "mmom",
+        _ => return None,
+    })
+}
+
 pub(crate) fn is_box(name: &str) -> bool {
     matches!(name, "threeparttable" | "measuredfigure")
 }

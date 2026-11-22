@@ -207,6 +207,53 @@ fn default_package_commands() -> std::collections::BTreeMap<String, crate::confi
         ("setulcolor", 1, false),
         ("setstcolor", 1, false),
         ("sethlcolor", 1, false),
+        // Kernel line-breaking and page-breaking controls.
+        ("linebreak", 0, true),
+        ("nolinebreak", 0, true),
+        ("pagebreak", 0, true),
+        ("nopagebreak", 0, true),
+        ("newpage", 0, false),
+        ("clearpage", 0, false),
+        ("cleardoublepage", 0, false),
+        ("hyphenation", 1, false),
+        ("discretionary", 3, false),
+        // Text accents and accent composition commands.
+        ("'", 1, false),
+        ("`", 1, false),
+        ("^", 1, false),
+        ("\"", 1, false),
+        ("~", 1, false),
+        ("=", 1, false),
+        (".", 1, false),
+        ("u", 1, false),
+        ("v", 1, false),
+        ("H", 1, false),
+        ("c", 1, false),
+        ("k", 1, false),
+        ("b", 1, false),
+        ("d", 1, false),
+        ("r", 1, false),
+        ("textcircled", 1, false),
+        ("textcompwordmark", 0, false),
+        ("textcopyright", 0, false),
+        ("textregistered", 0, false),
+        ("texttrademark", 0, false),
+        ("textdegree", 0, false),
+        ("textbullet", 0, false),
+        ("textellipsis", 0, false),
+        ("textemdash", 0, false),
+        ("textendash", 0, false),
+        ("textbackslash", 0, false),
+        ("textasciitilde", 0, false),
+        ("textasciicircum", 0, false),
+        ("textunderscore", 0, false),
+        ("textbar", 0, false),
+        ("textless", 0, false),
+        ("textgreater", 0, false),
+        ("kvsetkeys", 2, false),
+        ("kv@define@key", 3, true),
+        ("hologo", 1, false),
+        ("Hologo", 1, false),
     ] {
         commands.insert(
             name.into(),
@@ -248,6 +295,9 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
     }
     if let Some(shape) = stored_kernel_signature(name) {
         return Some(shape);
+    }
+    if matches!(name.trim_end_matches('*'), "lipsum" | "lipsumexp") {
+        return Some("o");
     }
     let separated = separated_star(source, name, end);
     Some(match name.trim_end_matches('*') {
@@ -375,6 +425,23 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
     crate::syntax::arguments::signature_end(source, end, shape).filter(|&finish| finish > end)
 }
 
+pub(crate) fn command_data_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if !matches!(name, "DeclareOption" | "DeclareOption*") {
+        return None;
+    }
+    let mut start = crate::trivia::skip(source, cursor);
+    if name == "DeclareOption" {
+        start = syntax::balanced_end(source, start, b'{', b'}')?;
+        start = crate::trivia::skip(source, start);
+    }
+    let finish = syntax::balanced_end(source, start, b'{', b'}')?;
+    Some(vec![start + 1..finish - 1])
+}
+
 fn stored_kernel_signature(name: &str) -> Option<&'static str> {
     match name.trim_end_matches('*') {
         // The kernel stores this control-sequence name in its preamble list.
@@ -384,9 +451,30 @@ fn stored_kernel_signature(name: &str) -> Option<&'static str> {
         // its element/name, argument count and optional default value.
         "defbeamertemplate" => Some("mmoom"),
         "markdownSetup" => Some("m"),
+        // bookcover.cls component selection separates type, part, optional
+        // margins, and printable content. hologo remains a single logo name.
+        "bookcovercomponent" => Some("mmom"),
+        "newbookcovercomponenttype"
+        | "renewbookcovercomponenttype"
+        | "newnamebookcovercomponenttype"
+        | "letnamebookcovercomponenttype"
+        | "newbookcoverpart"
+        | "renewbookcoverpart"
+        | "newnamebookcoverpart" => Some("mm"),
+        "setbookcover" => Some("m"),
         "DeclareOptionX" => Some("mom"),
+        // LaTeX package/class option declarations and forwarding.
+        "DeclareOption" if name.ends_with('*') => Some("m"),
+        "DeclareOption" => Some("mm"),
+        "ProcessOptions" => Some("o"),
+        "ExecuteOptions" => Some("m"),
+        "PassOptionsToPackage" | "PassOptionsToClass" => Some("mm"),
         // Hook registrations store their replacement text for a later run.
         "AddToHook" | "AddToHookNext" | "AddToHookWithArguments" => Some("mom"),
+        "DeclareHook" => Some("om"),
+        "DeclareHookRule" => Some("mmmm"),
+        "UseHook" => Some("om"),
+        "RemoveFromHook" => Some("om"),
         "AtBeginDocument"
         | "AtEndDocument"
         | "AtEndOfPackage"

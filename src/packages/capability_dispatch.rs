@@ -55,6 +55,7 @@ macro_rules! providers {
                 commands: (2, commands::command_signature),
                 data_ends: (0, commands::command_header_end),
                 metadata: (0, commands::is_metadata_command),
+                data: (0, commands::command_data_ranges),
             }
             Foundation {
                 commands: (3, key_command),
@@ -99,6 +100,7 @@ macro_rules! providers {
             }
             Layout {
                 headers: (4, equation_floats::header_signature),
+                commands: (2, equation_floats::command_signature),
                 adders: (0, equation_floats::add_command_rules),
             }
             Layout {

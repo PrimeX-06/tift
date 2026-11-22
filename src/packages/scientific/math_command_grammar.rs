@@ -18,6 +18,46 @@ pub(crate) fn command(name: &str) -> Option<Signature> {
         "prescript" => ("mmm", "MMM"),
         "crampedsubstack" | "undertilde" => ("m", "M"),
         "mathlarger" | "mathsmaller" => ("m", "M"),
+        // amsmath's stacked annotations and named operators contain ordinary
+        // math/text atoms whose inner formatting should remain available.
+        "substack" => ("m", "M"),
+        "operatorname" => ("m", "T"),
+        // Common alphabet wrappers supplied by amsfonts, bbm, dsfont,
+        // mathrsfs, bbold, mathbbol and bm.
+        "mathbb" | "mathfrak" | "mathcal" | "mathscr" | "mathbbm" | "mathds" | "bm" => ("m", "M"),
+        // centernot measures and overlays one complete relation operand.
+        "centernot" => ("m", "M"),
+        // esvect vectors are a single math operand; the starred spelling
+        // adds a second operand for an attached subscript.
+        "vv" if name.ends_with('*') => ("mm", "MM"),
+        "vv" => ("m", "M"),
+        // scalerel wrappers use metadata constraints before math operands.
+        "scalerel" | "stretchrel" => ("s o o m m", "UUUMM"),
+        "scaleto" | "stretchto" => ("omm", "UMM"),
+        "scaleleftright" | "stretchleftright" => ("ommm", "UMMM"),
+        "hstretch" | "vstretch" | "scaleobj" => ("mm", "UM"),
+        // leftidx takes literal index tokens around a math object.
+        "leftidx" => ("mmm", "UMU"),
+        "ltrans" => ("m", "M"),
+        // faktor optionally applies a math style to both quotient operands.
+        "factor" => ("omm", "UMM"),
+        // stackengine's primitive and compact two-item stacking commands.
+        "stackengine" => ("mmmmmmmm", "UMMUUUUU"),
+        "stackon" | "stackunder" | "stackanchor" => ("omm", "UII"),
+        "Shortstack" | "Longstack" | "Shortunderstack" | "Longunderstack" | "Centerstack"
+        | "Vectorstack" => ("om", "UI"),
+        // tabstackengine stacks tab-delimited rows or vectors.
+        "tabbedstackon" | "alignstackon" | "tabbedstackunder" | "alignstackunder"
+        | "tabbedstackanchor" | "alignstackanchor" => ("omm", "UII"),
+        "tabularstackon" | "tabularstackunder" | "tabularstackanchor" => ("ommm", "UIII"),
+        // isomath and common alphabet packages use ordinary single math slots.
+        "mathbfit" | "mathsfit" | "mathsfbfit" | "vectorsym" | "matrixsym" | "tensorsym" => {
+            ("m", "M")
+        }
+        // amsmath: optional smash alignment selector, then a math body.
+        "smash" => ("om", "IM"),
+        // mathtools provides these semantic aliases with ordinary math bodies.
+        "mathmakebox" => ("oom", "UUM"),
         "cancel" | "bcancel" | "xcancel" => ("m", "I"),
         "cancelto" => ("mm", "MM"),
         "nicefrac" => ("omm", "UII"),
@@ -61,13 +101,16 @@ pub(crate) fn command(name: &str) -> Option<Signature> {
 }
 
 pub(crate) const ALIGNMENT_ENVIRONMENTS: &[&str] = &[
-    "dcases", "dcases*", "rcases", "rcases*", "drcases", "drcases*", "cases*", "darray",
+    "dcases", "dcases*", "rcases", "rcases*", "drcases", "drcases*", "cases*", "darray", "mmatrix",
 ];
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
-        "dcases" | "dcases*" | "rcases" | "rcases*" | "drcases" | "drcases*" | "cases*" => "",
+        // nccmath's compact equation wrappers accept a single optional size.
+        "fleqn" | "ceqn" => "",
+        "medsize" | "mmatrix" => "",
         "dmath" | "dmath*" | "dseries" | "dseries*" | "dgroup" | "dgroup*" | "darray" => "o",
+        "dcases" | "dcases*" | "rcases" | "rcases*" | "drcases" | "drcases*" | "cases*" => "",
         _ => return super::scientific::header_signature(name),
     })
 }
@@ -75,7 +118,7 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 pub(crate) fn is_math_environment(name: &str) -> bool {
     ALIGNMENT_ENVIRONMENTS.contains(&name)
         || super::scientific::is_math_environment(name)
-        || matches!(name, "dmath" | "dmath*")
+        || matches!(name, "dmath" | "dmath*" | "medsize")
 }
 
 pub(crate) fn text_case_column(name: &str) -> bool {

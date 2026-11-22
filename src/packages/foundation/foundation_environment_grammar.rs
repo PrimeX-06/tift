@@ -192,6 +192,33 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         | "VNiceArrayRC" => "omo",
         // tcbraster.code.tex:131, 240, 246, 250.
         "tcolorbox" | "tcbraster" | "tcbitemize" => "o",
+        // varwidth.sty reads the maximum width before its text body.
+        "varwidth" => "m",
+        // lineno.sty wrappers control numbering around their paragraph/math body.
+        "linenumbers" | "linenumbers*" => "o",
+        "internallinenumbers" | "internallinenumbers*" | "linenomath" | "linenomath*" => "",
+        // rotating.sty float wrappers accept ordinary placement metadata.
+        "sidewaysfigure" | "sidewaystable" => "o",
+        "sideways" => "",
+        "turn" | "rotate" => "m",
+        // verse.sty stanza wrappers and its width-limited verse environment.
+        "verse" => "o",
+        "altverse" | "patverse" | "patverse*" => "",
+        // lscape/pdflscape rotate page content without header parameters.
+        "landscape" => "",
+        // boxedminipage.sty and quoting.sty collect width/local settings.
+        "boxedminipage" => "m",
+        "quoting" => "o",
+        // parnotes.sty prints its notes after each paragraph.
+        "autopn" => "",
+        // quotchap.sty saves a chapter epigraph at a caller-selected width.
+        "savequote" => "o",
+        // sidecap.sty orders relative caption width before float placement.
+        "SCfigure" | "SCtable" | "SCfigure*" | "SCtable*" => "oo",
+        // parallel.sty uses an optional mode followed by left/right widths.
+        "Parallel" => "omm",
+        // parcolumns.sty selects a column count after its key list.
+        "parcolumns" => "om",
         "tcboxedraster" | "tcboxeditemize" => "om",
         // algorithm2e.sty:2487, 2740--2815; algorithmicx.sty:74.
         "algorithm" | "algorithm*" | "algorithm2e" | "algorithm2e*" | "algocf" | "algocf*"
@@ -203,6 +230,11 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         // Ordinary bxjscls and bidi text wrappers have no header arguments.
         "titlepage" | "chapterabstract" | "LTR" | "LTR*" | "RTL" | "RTL*" | "LTRitems"
         | "RTLitems" | "LTRbibitems" | "RTLbibitems" => "",
+        // bookcover.cls creates a sequence of bookcovercomponent entries.
+        "bookcover" => "",
+        "bookcoverelement" => "mmom",
+        // lipsum.sty also exposes its paragraph generator as an environment.
+        "lipsum" => "o",
         // These signatures also describe the protected opening token.
         "minted" | "tcbexternal" => "om",
         // The ordinary minted float uses only positioning. moreverb's
@@ -366,6 +398,13 @@ pub(crate) fn is_box(name: &str) -> bool {
                 | "minsizebox*"
                 | "maxsizebox"
                 | "maxsizebox*"
+                | "varwidth"
+                | "sidewaysfigure"
+                | "sidewaystable"
+                | "sideways"
+                | "turn"
+                | "rotate"
+                | "boxedminipage"
         )
 }
 

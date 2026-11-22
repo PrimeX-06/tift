@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, ops::Range};
 enum Modifier {
     None,
     Star,
+    SimpleStar,
     /// glossaries' hyperlink switch accepts either a star or a plus.
     Hyper,
 }
@@ -154,13 +155,152 @@ commands! {
     // optional division command; putbib accepts an optional database list.
     "defaultbibliography" | "defaultbibliographystyle" => ("m", 0b1, None),
     "bibliographyunit" | "putbib" => ("o", 0b1, None),
+    // cite.sty: number-only citation aliases keep their optional note separate
+    // from the literal citation-key list.
+    "citen" | "citenum" | "citeonline" => ("om", 0b10, None),
+    // natbib: alias definitions have one key followed by printable alias text.
+    "defcitealias" => ("mm", 0b01, None),
+    "citetalias" | "citepalias" => ("oom", 0b100, None),
+    // natbib also exposes the same alias commands under biblatex's
+    // natbib-compatibility module.
+    "bibpunct" => ("ommmmmm", 0b1111111, None),
+    "setcitestyle" => ("m", 0b1, None),
+    // bibentry.sty: bibliography entries are referenced by one key; the
+    // bibliography file list is delayed metadata.
+    "bibentry" => ("m", 0b1, None),
+    "nobibliography" => ("m", 0b1, None),
+    // nomencl.sty: the optional sort prefix and symbol are data, while the
+    // description remains available for ordinary text and nested math.
+    "nomenclature" => ("omm", 0b011, None),
+    "nomgroup" => ("m", 0b1, None),
+    "makenomenclature" => ("", 0, None),
+    "printnomenclature" => ("o", 0b1, None),
+    // multibib and chapterbib declarations and file inputs.
+    "newcites" => ("mm", 0b11, None),
+    "cbinput" => ("m", 0b1, None),
+    // jurabib: citations can temporarily switch between bibliography modes;
+    // these selectors contain comma-separated citation keys, not prose.
+    "nextciteshort" | "nextcitefull" | "nextcitenotitle" | "nextcitereset"
+        | "citeswithoutentry" => ("m", 0b1, None),
+    "citetitlefortype" | "citenotitlefortype" => ("m", 0b1, None),
+    // jurabib's field lookup reads an optional page range, field name and key.
+    "citefield" => ("omm", 0b111, None),
+    // bibleref.sty uses a small reference language across its book/chapter/
+    // verse arguments. Keep each operand intact for that package parser.
+    "bibleverse" | "biblechvs" | "biblevs" | "bible" => ("omm", 0b111, None),
+    "biblerefcategory" => ("om", 0b11, None),
+    "biblerefmap" => ("mm", 0b11, None),
+    // bibleref-parse adds a passage parser with a per-call option form.
+    "biblerefparseset" => ("m", 0b1, None),
+    "pbibleverse" | "pibibleverse" | "pbiblechvs" | "pbiblevs" => ("om", 0b11, None),
+    // Harvard's author-as-subject and possessive forms preserve the optional
+    // locator and citation key. The second \citeaffixed argument is prose.
+    "citeasnoun" | "possessivecite" => ("om", 0b10, None),
+    "citeaffixed" => ("omm", 0b010, None),
+    "citationmode" | "citationstyle" | "harvardparenthesis" | "harvardyearparenthesis" => ("m", 0b1, None),
+    // apacite's classic interface supports an angle pre-note and square
+    // post-note before its literal citation-key list.
+    "citeA" | "citeNP" | "shortciteA" | "shortciteNP" => ("d<> o m", 0b100, SimpleStar),
+    "citeauthorNP" | "citeyearNP" | "shortciteauthor" | "shortciteauthorNP" => ("m", 0b1, SimpleStar),
+    // achemso, footbib and mciteplus bibliography controls.
+    "bibnote" | "bibnotemark" | "bibnotetext" => ("o", 0b1, None),
+    "printbibnotes" | "noibid" => ("", 0, None),
+    "footnocite" | "footbibliographystyle" | "footbibliography" => ("m", 0b1, None),
+    "mciteSetMidEndSepPunct" | "mciteSetBstMidEndSepPunct" => ("mmm", 0b111, None),
+    // Refstyle, titleref and typedref references.
+    "newref" | "RSaddto" => ("mm", 0b11, None),
+    "titleref" => ("m", 0b1, None),
+    "currenttitle" => ("", 0, None),
+    "figureref" | "Figureref" | "sectionref" | "Sectionref" | "tableref" | "Tableref"
+        | "chapterref" | "Chapterref" | "theoremref" | "Theoremref" | "equationref"
+        | "Equationref" => ("m", 0b1, None),
+    // Inline bibliography citation forms and the pageranges helper.
+    "fullycite" => ("om", 0b10, None),
+    "fullcitenext" | "shortcitenext" => ("m", 0b1, None),
+    "bibliographycomment" => ("m", 0, None),
+    "pages" => ("m", 0b1, None),
+    // refcount: counter/reference pairs and expandable reference lookups.
+    "setcounterref" | "addtocounterref" | "setcounterpageref" | "addtocounterpageref" => ("mm", 0b11, None),
+    "getrefnumber" | "getpagerefnumber" | "setrefcountdefault" => ("m", 0b1, None),
+    "getrefbykeydefault" => ("mmm", 0b111, None),
+    "IfRefUndefinedExpandable" | "IfRefUndefinedBabel" => ("mmm", 0b001, None),
+    // aliascnt and totcount counter declarations and queries.
+    "newaliascnt" => ("mm", 0b11, None),
+    "aliascntresetthe" => ("m", 0b1, None),
+    "newtotcounter" | "regtotcounter" => ("om", 0b11, None),
+    "usetotcountfile" => ("m", 0b1, None),
+    "addtotcounter" => ("mm", 0b11, None),
+    "total" | "totvalue" => ("m", 0b1, None),
+    // totalcount defines accessors for counters declared by the user.
+    "DeclareTotalCounter" => ("m", 0b1, None),
+    "totalfigures" | "totaltables" | "iftotalfigures" | "iftotaltables" => ("", 0, None),
+    // backref formatting hooks receive lists and display templates.
+    "backref" => ("m", 0, None),
+    "backrefalt" => ("mmmm", 0, None),
+    "backrefentrycount" => ("mm", 0, None),
+    "backrefsetup" => ("m", 0b1, None),
+    // crossreftools label metadata and the optional-name/label cross-reference.
+    "crtprovidecurrentlabel" | "crtprovidecurrentlabelname" => ("m", 0, None),
+    "crtprovidecurrentlabelinfo" => ("mm", 0, None),
+    "crtcrossreflabel" => ("omo", 0b100, SimpleStar),
+    "crtnameref" => ("m", 0b1, None),
+    // perpage counter registration and label listings.
+    "MakePerPage" => ("om", 0b11, None),
+    "MakeSorted" | "MakeSortedPerPage" => ("m", 0b1, None),
+    "listoflabels" => ("o", 0b1, None),
+    "showlabel" => ("om", 0b11, None),
+    "showrefnames" | "norefnames" => ("", 0, None),
+    // theoremref and smartref use one label/counter identifier per lookup.
+    "thlabel" | "thref" | "thnameref" => ("m", 0b1, None),
+    "addtoreflist" => ("m", 0b1, None),
+    "smartref" | "byname" | "byshortname" => ("m", 0b1, None),
+    "schapterref" | "srefchapterref" | "partref" | "spartref" | "srefpartref" => ("m", 0b1, None),
+    // upref renders a label reference in upright text.
+    "upref" => ("m", 0b1, None),
+    // amsrefs entries, database selection and reusable field aliases.
+    "bib" => ("mmm", 0b111, None),
+    "bibselect" => ("m", 0b1, None),
+    "DefineName" => ("mm", 0b11, None),
+    "DefineJournal" => ("mmmm", 0b1111, None),
+    "DefinePublisher" => ("mmmm", 0b1111, None),
+    // opcit references and citation state controls.
+    "bibref" => ("m", 0b1, None),
+    "cited" => ("m", 0b1, None),
+    "resetcites" | "hereafter" => ("", 0, None),
+    // BibArts full and shortened reference forms.
+    "vli" => ("ommmo", 0b00001, None),
+    "kli" => ("ommo", 0b0001, None),
+    "printvli" | "printvkc" => ("", 0, None),
+    // citeref controls the bibliography page list and introduction.
+    "bibitempages" => ("m", 0b1, None),
+    "bibintro" => ("m", 0, None),
+    // Chicago author-date commands take a locator and a key.
+    "citeN" | "shortciteN" => ("om", 0b10, None),
+    // multibbl bibliography declarations and chbibref heading text.
+    "newbibliography" => ("m", 0b1, None),
+    "setbibref" => ("m", 0, None),
+    // sublabel switches and styles name a counter.
+    "sublabon" | "sublaboff" | "substyle" => ("m", 0b1, None),
+    // bibtopicprefix sets a reference-label prefix inside btSect.
+    "bibprefix" => ("m", 0b1, None),
 }
 
 pub(crate) const LIST_ENVIRONMENTS: &[&str] = &["acronym"];
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[];
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
-    matches!(name, "acronym" | "bibunit").then_some("o")
+    Some(match name {
+        "acronym" | "bibunit" => "o",
+        // bibtopic.sty: \begin{btSect}[<style>]{<bib-files>}.
+        "btSect" | "category" => "om",
+        // amsrefs keeps bibliography styling in environment headers.
+        "bibdiv" => "",
+        "bibchapter" | "bibsection" => "o",
+        "biblist" => "o s g",
+        // footnoterange environments do not take a begin header.
+        "footnoterange" => "",
+        _ => return None,
+    })
 }
 
 pub(crate) fn environment_for_command(name: &str) -> Option<&str> {
@@ -179,7 +319,10 @@ fn modifier_at(source: &str, name: &str, cursor: usize, modifier: Modifier) -> b
                 modifier,
                 source.as_bytes().get(trivia::skip(source, cursor))
             ),
-            (Modifier::Star | Modifier::Hyper, Some(b'*')) | (Modifier::Hyper, Some(b'+'))
+            (
+                Modifier::Star | Modifier::Hyper | Modifier::SimpleStar,
+                Some(b'*')
+            ) | (Modifier::Hyper, Some(b'+'))
         )
 }
 
@@ -206,6 +349,9 @@ fn signature(source: &str, name: &str, cursor: usize, command: Command) -> Optio
         return Some(command.shape);
     }
     Some(match command.shape {
+        "d<> o m" if command.modifier == Modifier::SimpleStar => "s d<> o m",
+        "omo" if command.modifier == Modifier::SimpleStar => "somo",
+        "m" if command.modifier == Modifier::SimpleStar => "s m",
         "m" => "mm",
         "mm" => "mmm",
         "om" => "mom",
@@ -218,6 +364,21 @@ fn signature(source: &str, name: &str, cursor: usize, command: Command) -> Optio
 }
 
 fn contextual_command(name: &str, context: &super::InvocationContext<'_>) -> Option<Command> {
+    if context.has_package("multibbl") {
+        let (shape, data) = match name {
+            "cite" => ("omm", 0b110),
+            "bibliography" => ("mmm", 0b011),
+            "bibliographystyle" => ("mm", 0b11),
+            _ => ("", 0),
+        };
+        if !shape.is_empty() {
+            return Some(Command {
+                shape,
+                data,
+                modifier: Modifier::None,
+            });
+        }
+    }
     if matches!(name, "CodeLinkAnchor" | "CodeLinkRef") && context.has_package("xlistings") {
         return Some(Command {
             shape: "om",
@@ -265,6 +426,14 @@ pub(crate) fn context_ambiguous(
     name: &str,
     context: &super::InvocationContext<'_>,
 ) -> Option<&'static str> {
+    if matches!(name, "cite" | "bibliography" | "bibliographystyle")
+        && context.possibly_has_package("multibbl")
+        && !context.has_package("multibbl")
+    {
+        return Some(
+            "multibbl changes citation and bibliography argument signatures, or its loading is conditional",
+        );
+    }
     if matches!(
         name.trim_end_matches('*'),
         "acs" | "acsp" | "acl" | "Acl" | "aclp" | "Aclp"

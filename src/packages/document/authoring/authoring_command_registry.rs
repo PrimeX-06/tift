@@ -13,9 +13,15 @@ macro_rules! commands {
     };
 }
 
-mod review;
-mod theorems;
-mod writing;
+#[path = "review_annotation_grammar.rs"]
+mod review_annotation_grammar;
+use review_annotation_grammar as review;
+#[path = "theorem_environment_grammar.rs"]
+mod theorem_environment_grammar;
+use theorem_environment_grammar as theorems;
+#[path = "document_writing_grammar.rs"]
+mod document_writing_grammar;
+use document_writing_grammar as writing;
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     theorems::header_signature(name).or_else(|| review::header_signature(name))

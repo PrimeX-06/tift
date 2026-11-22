@@ -66,6 +66,21 @@ macro_rules! commands {
 // The second shape protects only leading settings or delayed code. Printable
 // content remains available for nested formatting.
 commands! {
+    // enumitem.sty: list defaults take optional list/level selectors before
+    // the mandatory key list. List declarations always have three names/data.
+    "setlist" => ("oom", "oo"),
+    "newlist" | "renewlist" => ("mmm", "mmm"),
+    "setlistdepth" => ("m", "m"),
+    "setlistformat" | "setitemize" | "setenumerate" | "setdescription" => ("mm", "mm"),
+    // tablefootnote.sty uses the ordinary printed note argument in table cells.
+    "tablefootnote" => ("m", ""),
+    // verse.sty poem setup accepts line/indent values and title text.
+    "poemtitle" => ("om", "o"),
+    "poemlines" | "verselinenumfont" | "indentpattern" => ("m", ""),
+    "setverselinenums" => ("mm", "mm"),
+    // multirow.sty: [vpos]{rows}[bigstruts]{width}[vmove]{text}. The
+    // command's attached star changes total-height calculation, not its arity.
+    "multirow" => ("omomom", "omomo"),
     "afterpage" => ("m", "m"),
     "epigraph" | "qitem" => ("mm", ""),
     "epigraphhead" => ("om", "o"),
@@ -77,6 +92,15 @@ commands! {
     "larger" | "smaller" => ("o", "o"),
     "textlarger" | "textsmaller" => ("om", "o"),
     "textscale" => ("mm", "m"),
+    // sidenotes.sty: optional mark and vertical offset precede the text.
+    "sidenote" | "sidenotetext" => ("oom", "oo"),
+    "sidenotemark" => ("o", "o"),
+    // lineno.sty accepts optional starting numbers/moduli on these controls.
+    "linenumbers" | "runninglinenumbers" | "resetlinenumber" | "modulolinenumbers" => ("o", "o"),
+    "firstlinenumber" | "linelabel" => ("m", "m"),
+    "setrunninglinenumbers" | "setpagewiselinenumbers" | "switchlinenumbers"
+        | "leftlinenumbers" | "rightlinenumbers" | "pagewiselinenumbers"
+        | "realpagewiselinenumbers" | "runningpagewiselinenumbers" => ("", ""),
     "mathlarger" | "mathsmaller" => ("m", ""),
     "TPGrid" => ("omm", "omm"),
     "TPMargin" | "TPReferencePosition" | "TPoptions" | "textblocklabel"

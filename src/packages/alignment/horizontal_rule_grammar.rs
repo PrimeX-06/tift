@@ -28,6 +28,9 @@ pub(crate) fn rule_end(
         "addrowspace" if tabularray => "o",
         "hline" | "morecmidrules" | "endfirsthead" | "endhead" | "endfoot" | "endlastfoot" => "",
         "cline" | "hhline" | "Xhline" | "noalign" => "m",
+        // arydshln.sty: \\hdashline[gap] and \\cdashline{i-j}[gap].
+        "hdashline" => "o",
+        "cdashline" => "mo",
         "Xcline" => "mm",
         "toprule" | "midrule" | "bottomrule" | "addlinespace" => "o",
         "cmidrule" => "opm",

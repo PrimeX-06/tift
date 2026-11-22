@@ -20,6 +20,25 @@
 !/examples/pre-commit-config.yaml
 !/examples/print_config.rs
 !/examples/tift.toml
+!/scripts/
+/scripts/*
+!/scripts/verify_texlive.py
+!/reports/
+/reports/*
+!/reports/texlive-2026-bib-audit/
+/reports/texlive-2026-bib-audit/*
+!/reports/texlive-2026-bib-audit/texlive-bib-audit.json
+!/reports/texlive-2026-bib-audit/texlive-bib-audit.md
+!/tests/
+/tests/*
+!/tests/packages/
+/tests/packages/*
+!/tests/packages/document_layout_additions.rs
+!/tests/packages/graphics_package_additions.rs
+!/tests/packages/package_scientific_additions.rs
+!/tests/packages/reference_additions.rs
+!/tests/packages/required_package_support.rs
+!/tests/packages/table_extension_additions.rs
 
 **/target/
 *.bak

@@ -90,6 +90,10 @@ pub(crate) fn is_metadata_command(name: &str) -> bool {
             | "animategraphics"
             | "newframe"
             | "multiframe"
+            | "smartdiagramset"
+            | "smartdiagramlibrary"
+            | "psset"
+            | "pgfplotstableset"
     )
 }
 
@@ -114,6 +118,30 @@ pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
             ("newframe", 0, true),
             ("multiframe", 3, false),
             ("multiframebreak", 0, false),
+            // smartdiagram.sty: public list/settings and connector commands.
+            ("smartdiagram", 1, true),
+            ("smartdiagramadd", 2, true),
+            ("smartdiagramconnect", 3, true),
+            ("smartdiagramset", 1, false),
+            ("smartdiagramlibrary", 1, false),
+            // pstricks/pst-node public setup, node and placement controls.
+            ("psset", 1, false),
+            ("pnode", 1, false),
+            ("rnode", 2, false),
+            ("rput", 1, true),
+            ("cnode", 2, true),
+            ("psframe", 0, true),
+            ("pscircle", 1, true),
+            ("psdot", 0, true),
+            // pgfplotstable.sty table declarations, data transforms, and output.
+            ("pgfplotstabletypeset", 1, true),
+            ("pgfplotstabletypesetfile", 1, true),
+            ("pgfplotstablesave", 2, true),
+            ("pgfplotstabletranspose", 2, true),
+            ("pgfplotstableset", 1, false),
+            ("pgfplotstablecreatecol", 2, true),
+            ("pgfplotstablemodifyeachcol", 2, true),
+            ("pgfplotstablegetelem", 2, false),
         ],
     );
 }
@@ -131,6 +159,49 @@ fn mandatory_argument_end(source: &str, start: usize) -> Option<usize> {
 /// Complete invocation ranges retain the printed argument after an opaque
 /// metadata prefix and bound ownership before the next document group.
 pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    if matches!(name.trim_end_matches('*'), "includesvg" | "includeinkscape") {
+        return Some("om");
+    }
+    if matches!(name, "svgpath" | "svgsetup") {
+        return Some("m");
+    }
+    if let Some(signature) = match name {
+        "pgfplotstabletypeset" | "pgfplotstabletypesetfile" => Some("om"),
+        "pgfplotstablesave"
+        | "pgfplotstabletranspose"
+        | "pgfplotstablecreatecol"
+        | "pgfplotstablemodifyeachcol" => Some("omm"),
+        "pgfplotstableset" => Some("m"),
+        "pgfplotstablegetelem" => Some("mm"),
+        _ => None,
+    } {
+        return Some(signature);
+    }
+    if matches!(name.trim_end_matches('*'), "smartdiagram") {
+        return Some("om");
+    }
+    if name == "smartdiagramadd" {
+        return Some("omm");
+    }
+    if name == "smartdiagramconnect" {
+        return Some("ommm");
+    }
+    if matches!(name, "smartdiagramset" | "smartdiagramlibrary") {
+        return Some("m");
+    }
+    if let Some(signature) = match name {
+        "psset" => Some("m"),
+        "pnode" => Some("pm"),
+        "rnode" => Some("mm"),
+        "rput" => Some("opm"),
+        "cnode" => Some("opmm"),
+        "psframe" => Some("opp"),
+        "pscircle" => Some("opm"),
+        "psdot" => Some("op"),
+        _ => None,
+    } {
+        return Some(signature);
+    }
     let separated_star = !name.ends_with('*')
         && source.as_bytes().get(crate::trivia::skip(source, end)) == Some(&b'*');
     Some(match name.trim_end_matches('*') {
@@ -152,6 +223,20 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
 /// hooks as data. The final OCG link or multiframe body remains ordinary TeX.
 /// The caller gives explicit syntax and source redefinitions precedence.
 pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    match name.trim_end_matches('*') {
+        "smartdiagramset" | "smartdiagramlibrary" | "psset" | "pgfplotstableset" => {
+            return crate::syntax::arguments::signature_end(source, end, "m");
+        }
+        "smartdiagram" | "smartdiagramadd" | "smartdiagramconnect" => {
+            let start = crate::trivia::skip(source, end);
+            return if source.as_bytes().get(start) == Some(&b'[') {
+                crate::syntax::balanced_end(source, start, b'[', b']')
+            } else {
+                None
+            };
+        }
+        _ => (),
+    }
     let (metadata, optional, accepts_star, content) = match name.trim_end_matches('*') {
         "switchocg" | "showocg" | "hideocg" => (1, true, true, true),
         "actionsocg" => (3, true, true, true),
