@@ -46,13 +46,3 @@ incremental = false
 [[bin]]
 name = "tift"
 path = "src/main.rs"
-
-[[bench]]
-name = "throughput"
-path = "benches/throughput.rs"
-harness = false
-
-[[bench]]
-name = "real_corpus"
-path = "benches/real_corpus.rs"
-harness = false

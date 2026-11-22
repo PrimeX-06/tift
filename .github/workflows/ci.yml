@@ -36,6 +36,17 @@ jobs:
               ".github/workflows/release.yml", "examples/conform.lua",
               "examples/latex-workshop.json", "examples/pre-commit-config.yaml",
               "examples/print_config.rs", "examples/tift.toml",
+              "scripts/verify_texlive.py",
+              "reports/latex-corpus-test-report.md",
+              "reports/texlive-2026-bib-audit/texlive-bib-audit.json",
+              "reports/texlive-2026-bib-audit/texlive-bib-audit.md",
+              "tests/packages/document_layout_additions.rs",
+              "tests/packages/expl3_call_stability.rs",
+              "tests/packages/graphics_package_additions.rs",
+              "tests/packages/package_scientific_additions.rs",
+              "tests/packages/reference_additions.rs",
+              "tests/packages/required_package_support.rs",
+              "tests/packages/table_extension_additions.rs",
           }
           files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
           for name in filter(None, files):

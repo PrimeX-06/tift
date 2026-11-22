@@ -159,7 +159,7 @@ pub(super) fn expl3_regions(source: &str, protected: &[Range<usize>]) -> Vec<Ran
 pub(super) fn math_ranges(source: &str, protected: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     for (name, range) in environments(source, protected) {
-        if super::math_environment(&name) {
+        if super::math_environment(name) {
             ranges.push(range);
         }
     }

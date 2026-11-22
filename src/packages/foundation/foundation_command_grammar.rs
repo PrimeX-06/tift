@@ -439,7 +439,7 @@ pub(crate) fn command_data_ranges(
         start = crate::trivia::skip(source, start);
     }
     let finish = syntax::balanced_end(source, start, b'{', b'}')?;
-    Some(vec![start + 1..finish - 1])
+    Some(std::iter::once(start + 1..finish - 1).collect())
 }
 
 fn stored_kernel_signature(name: &str) -> Option<&'static str> {
