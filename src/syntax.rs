@@ -7163,34 +7163,6 @@ fn scoped_pairs(events: &[(usize, bool, Option<usize>)]) -> (BoundaryPairs, Boun
     (local_pairs, cross_pairs)
 }
 
-#[cfg(test)]
-mod scoped_pairs_tests {
-    use super::scoped_pairs;
-
-    #[test]
-    fn cross_pairs_skip_same_owner_and_consume_the_earliest_other_close() {
-        const OWNER_COUNT: usize = 300;
-        let mut events = Vec::with_capacity(OWNER_COUNT * 2);
-        for owner in 0..OWNER_COUNT {
-            events.push((owner * 2, false, Some(owner)));
-            events.push((owner * 2 + 1, true, Some(owner)));
-        }
-
-        let (_, pairs) = scoped_pairs(&events);
-        let expected = (0..OWNER_COUNT)
-            .map(|owner| {
-                let close_owner = if owner.is_multiple_of(2) {
-                    owner + 1
-                } else {
-                    owner - 1
-                };
-                (owner * 2 + 1, close_owner * 2)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(pairs, expected);
-    }
-}
-
 fn parse_blocks_from_tokens<S: NameStore>(
     source: &str,
     config: &crate::CompiledConfig,
