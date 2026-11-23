@@ -89,16 +89,26 @@
             </div>
             <div class="source-editor">
               <pre aria-hidden="true"><code id="source-highlight"></code></pre>
-              <textarea id="playground-source" aria-describedby="playground-help" wrap="off" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="Paste your code here" dir="ltr">\begin{align}
-f(x)&amp;=x^2+2x+1\\
-&amp;=(x+1)^2
+              <textarea id="playground-source" aria-describedby="playground-help" wrap="off" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="Paste your code here" dir="ltr">\section{Partial sums}
+Each row  adds one more term.
+
+\begin{align}
+S_n&amp;=1+2+\cdots+n\\
+ &amp;=\frac{n(n+1)}{2},\\
+S_4&amp;=1+2+3+4=10
 \end{align}
 
-\begin{tabular}{lr}
-Item&amp;Price\\
-Notebook&amp;12\\
-Pen&amp;3
+\begin{table}[ht]
+\centering
+\begin{tabular}{rr}
+$n$&amp;$S_n$\\
+\hline
+2&amp;3\\
+ 3&amp;6\\
+4&amp;10
 \end{tabular}
+\caption{Partial sums}
+\end{table}
 </textarea>
             </div>
           </div>

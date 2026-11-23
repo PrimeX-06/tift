@@ -61,10 +61,25 @@ function setupPlayground() {
   const languages = document.querySelector(".language-switch");
   const drafts = {
     latex: source.value,
-    bibtex: "@book{knuth1984,\n"
-      + "title={The {TeXbook}}, year=1984,\n"
-      + "   author={Donald E. Knuth},\n"
-      + "publisher={Addison-Wesley},\n}\n",
+    bibtex: `% TeX and LaTeX references
+@string{aw="Addison-Wesley"}
+
+@book{knuth1984,
+title={The {TeXbook}}, year=1984,
+   author={Donald E. Knuth},
+publisher=aw,
+volume={A}
+}
+
+@book{lamport1994,
+author="Leslie Lamport",year=1994,
+  title={{LaTeX}: A
+    Document  Preparation System},
+edition={2},
+publisher=aw,
+keywords={latex, writing}
+}
+`,
   };
   let language = languages.querySelector(":checked").value;
   let revision = 0;
