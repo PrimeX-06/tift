@@ -31,7 +31,7 @@ jobs:
           from pathlib import Path
 
           allowed = {
-              ".gitignore", "AGENTS.md", "Cargo.toml", "Cargo.lock", "LICENSE",
+              ".gitignore", "Cargo.toml", "Cargo.lock", "LICENSE",
               "README.md", "CHANGELOG.md", "rust-toolchain.toml",
               ".github/workflows/ci.yml", ".github/workflows/release.yml",
               ".github/workflows/pages.yml", "examples/tift.toml",

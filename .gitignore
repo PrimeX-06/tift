@@ -1,6 +1,5 @@
 /*
 !/.gitignore
-!/AGENTS.md
 !/README.md
 !/Cargo.toml
 !/Cargo.lock
@@ -35,6 +34,7 @@
 /benches/
 /scripts/
 /reports/
+AGENTS.md
 **/target/
 *.bak
 __pycache__/
