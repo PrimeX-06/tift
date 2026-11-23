@@ -18,6 +18,8 @@
 /docs/branding/*
 !/docs/branding/tift-logo.svg
 !/docs/branding/tift-logo.tex
+!/docs/branding/tift-latex-formatting.png
+!/docs/branding/tift-bibtex-formatting.png
 !/src/
 !/examples/
 /examples/*

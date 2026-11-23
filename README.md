@@ -7,41 +7,9 @@
 
 tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents consistently indented, align tables and equations, and format bibliographies from the command line or your editor. Available on Windows, Linux, and macOS.
 
-Default formatting uses four spaces and preserves prose line breaks:
+![LaTeX before and after formatting, showing environment indentation, math spacing, and alignment of equations and table columns](docs/branding/tift-latex-formatting.png)
 
-<table>
-<thead><tr><th>Input</th><th>Output</th></tr></thead>
-<tbody><tr><td width="50%">
-
-```tex
-\begin{itemize}
-\item Measurement: $E=mc^2$.
-Its explanation continues here.
-\item Reference value.
-\end{itemize}
-
-\begin{tabular}{ll}
-Label&Value\\Longer label&42\\
-\end{tabular}
-```
-
-</td><td width="50%">
-
-```tex
-\begin{itemize}
-    \item Measurement: $E = mc^2$.
-        Its explanation continues here.
-    \item Reference value.
-\end{itemize}
-
-\begin{tabular}{ll}
-    Label        & Value \\
-    Longer label & 42 \\
-\end{tabular}
-```
-
-</td></tr></tbody>
-</table>
+![BibTeX before and after formatting, showing field indentation and aligned equals signs](docs/branding/tift-bibtex-formatting.png)
 
 **[User guide](https://github.com/PrimeX-06/tift/wiki)** · **[Formatting examples](https://github.com/PrimeX-06/tift/wiki/Formatting-Examples)** · **[Report an issue](https://github.com/PrimeX-06/tift/issues)**
 
