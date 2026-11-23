@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/pages.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "src/**"
       - "site/index.html"
       - "site/homepage.css"
       - "site/homepage.js"
@@ -32,6 +36,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@v5
+      - name: Build Playground formatter
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tift-target
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          cargo rustc --locked --lib --profile playground \
+            --target wasm32-unknown-unknown --crate-type cdylib
+          bindgen_package=$(cargo pkgid --locked wasm-bindgen)
+          cargo install wasm-bindgen-cli --locked --bin wasm-bindgen \
+            --version "=${bindgen_package##*@}" --root "$RUNNER_TEMP/wasm-bindgen"
+          "$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" \
+            --target web --no-typescript --out-name tift_playground \
+            --out-dir "$RUNNER_TEMP/tift-wasm" \
+            "$CARGO_TARGET_DIR/wasm32-unknown-unknown/playground/tift.wasm"
       - name: Assemble homepage
         shell: bash
         run: |
@@ -44,6 +64,9 @@ jobs:
             test -f "site/$file"
             test ! -L "site/$file"
             install -D -m 0644 "site/$file" "$output/$file"
+          done
+          for file in tift_playground.js tift_playground_bg.wasm; do
+            install -D -m 0644 "$RUNNER_TEMP/tift-wasm/$file" "$output/$file"
           done
       - uses: actions/upload-pages-artifact@v3
         with:

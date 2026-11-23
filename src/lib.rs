@@ -14,6 +14,8 @@ pub mod math_layout;
 #[path = "packages/package_support_registry.rs"]
 mod packages;
 mod parse_context;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod playground;
 pub mod ranges;
 pub mod replacements;
 mod source_analysis;

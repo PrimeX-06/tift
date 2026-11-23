@@ -15,9 +15,6 @@ keywords = ["latex", "formatter", "tex", "bibtex"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-clap_complete = "4.5"
-clap_mangen = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 regex = "1"
@@ -25,19 +22,32 @@ fancy-regex = "0.17"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 memchr = "2"
+similar = "2"
+blake3 = "1"
+thiserror = "2"
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
 ignore = "0.4"
 rayon = "1"
-similar = "2"
 tempfile = "3"
-blake3 = "1"
 serde_json = "1"
-thiserror = "2"
 fs2 = "0.4"
 encoding_rs = "0.8"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2.130"
 
 [profile.release]
 lto = false
 codegen-units = 1
+
+[profile.playground]
+inherits = "release"
+opt-level = "s"
+lto = true
 
 [profile.dev]
 debug = 0
