@@ -1,0 +1,52 @@
+name: Deploy homepage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/pages.yml"
+      - "site/index.html"
+      - "site/homepage.css"
+      - "site/homepage.js"
+      - "site/branding/tift-logo.svg"
+      - "site/branding/tift-latex-formatting.png"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@v5
+      - name: Assemble homepage
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/tift-homepage"
+          test ! -L site
+          test ! -L site/branding
+          for file in index.html homepage.css homepage.js \
+              branding/tift-logo.svg branding/tift-latex-formatting.png; do
+            test -f "site/$file"
+            test ! -L "site/$file"
+            install -D -m 0644 "site/$file" "$output/$file"
+          done
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/tift-homepage
+      - uses: actions/deploy-pages@v4
+        id: deployment

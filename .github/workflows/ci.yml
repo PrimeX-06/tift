@@ -31,29 +31,20 @@ jobs:
           from pathlib import Path
 
           allowed = {
-              ".gitignore", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "CHANGELOG.md",
-              "rust-toolchain.toml", ".github/workflows/ci.yml",
-              ".github/workflows/release.yml", "docs/branding/tift-logo.svg",
-              "docs/branding/tift-logo.tex", "examples/conform.lua",
-              "examples/latex-workshop.json", "examples/pre-commit-config.yaml",
-              "examples/print_config.rs", "examples/tift.toml",
-              "scripts/verify_texlive.py",
-              "reports/latex-corpus-test-report.md",
-              "reports/texlive-2026-bib-audit/texlive-bib-audit.json",
-              "reports/texlive-2026-bib-audit/texlive-bib-audit.md",
-              "tests/packages/document_layout_additions.rs",
-              "tests/packages/expl3_call_stability.rs",
-              "tests/packages/graphics_package_additions.rs",
-              "tests/packages/package_scientific_additions.rs",
-              "tests/packages/reference_additions.rs",
-              "tests/packages/required_package_support.rs",
-              "tests/packages/table_extension_additions.rs",
+              ".gitignore", "AGENTS.md", "Cargo.toml", "Cargo.lock", "LICENSE",
+              "README.md", "CHANGELOG.md", "rust-toolchain.toml",
+              ".github/workflows/ci.yml", ".github/workflows/release.yml",
+              ".github/workflows/pages.yml", "examples/tift.toml",
+              "site/index.html", "site/homepage.css", "site/homepage.js",
+              "site/branding/tift-bibtex-formatting.png", "site/branding/tift-latex-formatting.png",
+              "site/branding/tift-logo.svg", "site/branding/tift-logo.tex",
           }
           files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
           for name in filter(None, files):
               source = name.startswith("src/") and name.endswith(".rs")
-              if name not in allowed and not source:
-                  raise SystemExit("A file outside the public source list is tracked")
+              wiki_page = name.startswith("site/wiki/") and Path(name).suffix.lower() == ".md"
+              if name not in allowed and not source and not wiki_page:
+                  raise SystemExit("A non-public file is tracked")
               if source:
                   text = Path(name).read_text(encoding="utf-8")
                   if re.search(r"#\s*\[\s*(?:test\b|cfg\s*\(\s*test\b)", text):
