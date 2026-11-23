@@ -34,6 +34,7 @@ pub(crate) fn format_docstrip(
     settings.code.expl3 = false;
     settings.math.enabled = false;
     settings.wrap.mode = "preserve".into();
+    settings.wrap.collapse_spaces = false;
     settings.sentences.enabled = false;
     settings.protect.expl3 = true;
     settings.replacements.clear();

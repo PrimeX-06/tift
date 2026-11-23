@@ -1,9 +1,7 @@
 //! BibTeX layout with a dedicated value lexer.
 //!
-//! Defaults align assignments while preserving name case, field order and
-//! the source of every value expression. Braced
-//! and quoted values, concatenation, macros, string definitions, and preambles
-//! are parsed without applying LaTeX whitespace transformations inside values.
+//! Defaults align assignments and collapse repeated spaces in ordinary literal
+//! field values while preserving name case, field order and expression syntax.
 
 use crate::syntax::{self, FormatDirectiveState};
 use crate::{CompiledConfig, Diagnostic, FormatError, FormatOutput, Severity};
@@ -799,7 +797,11 @@ fn format_fields(
         output.push_str(name);
         output.push_str(" = ");
         let printed_start = output.len();
-        output.push_str(&source[value.clone()]);
+        if string_definition {
+            output.push_str(&source[value.clone()]);
+        } else {
+            normalization::write_value(&mut output, &source[value.clone()], name, "preserve");
+        }
         if let Some(origins) = &mut origins {
             origins.push((printed_start..output.len(), value));
         }
@@ -884,29 +886,7 @@ fn read_expression(
         if cursor == end {
             return Err(syntax_error(cursor, "missing value"));
         }
-        cursor = match source.as_bytes()[cursor] {
-            b'{' => braced_value_end(source, cursor, end)?,
-            b'"' => quoted_value_end(source, cursor, end)?,
-            b'#' | b',' | b'}' | b')' | b'=' | b'%' => {
-                return Err(syntax_error(cursor, "expected value token"));
-            }
-            _ => {
-                let token_start = cursor;
-                while cursor < end
-                    && !source.as_bytes()[cursor].is_ascii_whitespace()
-                    && !matches!(
-                        source.as_bytes()[cursor],
-                        b'#' | b',' | b'{' | b'}' | b'(' | b')' | b'"' | b'=' | b'%'
-                    )
-                {
-                    cursor += source[cursor..].chars().next().unwrap().len_utf8();
-                }
-                if cursor == token_start {
-                    return Err(syntax_error(cursor, "invalid value token"));
-                }
-                cursor
-            }
-        };
+        cursor = value_token_end(source, cursor, end)?;
         last_token_end = cursor;
         let next = skip_trivia(source, cursor, end).0;
         if next < end && source.as_bytes()[next] == b'#' {
@@ -914,6 +894,31 @@ fn read_expression(
             continue;
         }
         return Ok((start..last_token_end, last_token_end));
+    }
+}
+
+fn value_token_end(source: &str, start: usize, end: usize) -> Result<usize, FormatError> {
+    match source.as_bytes()[start] {
+        b'{' => braced_value_end(source, start, end),
+        b'"' => quoted_value_end(source, start, end),
+        b'#' | b',' | b'}' | b')' | b'=' | b'%' => Err(syntax_error(start, "expected value token")),
+        _ => {
+            let length = source.as_bytes()[start..end]
+                .iter()
+                .take_while(|&&byte| {
+                    !byte.is_ascii_whitespace()
+                        && !matches!(
+                            byte,
+                            b'#' | b',' | b'{' | b'}' | b'(' | b')' | b'"' | b'=' | b'%'
+                        )
+                })
+                .count();
+            if length == 0 {
+                Err(syntax_error(start, "invalid value token"))
+            } else {
+                Ok(start + length)
+            }
+        }
     }
 }
 

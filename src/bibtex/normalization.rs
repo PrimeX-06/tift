@@ -1,9 +1,9 @@
-//! Normalization and ordering reuse the value lexer without rewriting expressions.
+//! Normalization and ordering reuse the value lexer to preserve expression syntax.
 
 use super::{
     BibtexConfig, braced_value_end, entry_indent, entry_type, find_comment_end, find_entry_end,
     line_end, protected_ranges, quoted_value_end, read_expression, skip_trivia, skip_whitespace,
-    syntax_error, valid_citation_key, write_comments,
+    syntax_error, valid_citation_key, value_token_end, write_comments,
 };
 use crate::{Diagnostic, FormatError, Severity};
 use std::borrow::Cow;
@@ -283,54 +283,84 @@ fn field_order(fields: &mut [Field<'_>], order: &[String]) {
     });
 }
 
-fn normalize_value<'a>(
-    source: &'a str,
-    range: Range<usize>,
-    field: &str,
-    mode: &str,
-) -> Cow<'a, str> {
-    let value = &source[range.clone()];
-    if mode == "preserve"
+pub(super) fn write_value(output: &mut String, value: &str, field: &str, mode: &str) {
+    if (mode == "preserve" && !value.contains("  "))
         || matches!(
             field.to_ascii_lowercase().as_str(),
-            "url" | "doi" | "eprint" | "file" | "pdf"
+            "url" | "doi" | "eprint" | "file" | "pdf" | "verba" | "verbb" | "verbc" | "execute"
         )
     {
-        return value.into();
+        output.push_str(value);
+        return;
     }
-    let mut cursor = range.start;
-    let mut copied = cursor;
-    let mut output = String::with_capacity(value.len());
-    while cursor < range.end {
-        let (next, _) = skip_trivia(source, cursor, range.end);
-        cursor = next;
-        if cursor == range.end {
+    let mut cursor = 0;
+    let mut copied = 0;
+    while cursor < value.len() {
+        cursor = crate::trivia::skip_until(value, cursor, value.len());
+        if cursor == value.len() {
             break;
         }
-        let opening = source.as_bytes()[cursor];
-        let end = match opening {
-            b'{' => braced_value_end(source, cursor, range.end).ok(),
-            b'"' => quoted_value_end(source, cursor, range.end).ok(),
-            _ => None,
-        };
-        if let Some(end) = end {
-            let inner = &source[cursor + 1..end - 1];
-            let convert = mode == "braces" && opening == b'"'
-                || mode == "quotes" && opening == b'{' && quote_safe(inner);
-            if convert {
-                output.push_str(&source[copied..cursor]);
-                output.push(if mode == "braces" { '{' } else { '"' });
-                output.push_str(inner);
-                output.push(if mode == "braces" { '}' } else { '"' });
-                copied = end;
-            }
-            cursor = end;
-        } else {
-            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+        let opening = value.as_bytes()[cursor];
+        if opening == b'#' {
+            cursor += 1;
+            continue;
         }
+        // Cleanup can supply its own value. Leave an unrecognized remainder intact.
+        let Ok(end) = value_token_end(value, cursor, value.len()) else {
+            break;
+        };
+        if matches!(opening, b'{' | b'"') {
+            let inner = &value[cursor + 1..end - 1];
+            let (left, right) = if mode == "braces" || opening == b'{' && mode != "quotes" {
+                ('{', '}')
+            } else if opening == b'"' || quote_safe(inner) {
+                ('"', '"')
+            } else {
+                ('{', '}')
+            };
+            output.push_str(&value[copied..cursor]);
+            output.push(left);
+            write_literal(output, inner);
+            output.push(right);
+            copied = end;
+        }
+        cursor = end;
     }
-    output.push_str(&source[copied..range.end]);
-    Cow::Owned(output)
+    output.push_str(&value[copied..]);
+}
+
+fn write_literal(output: &mut String, literal: &str) {
+    let mut copied = 0;
+    let mut offset = 0;
+    for (index, line) in literal.split_inclusive('\n').enumerate() {
+        let end = line
+            .match_indices('%')
+            .find(|&(at, _)| !crate::syntax::is_escaped(line, at))
+            .map_or(line.len(), |(at, _)| at);
+        let text = &line[..end];
+        // Preserve physical line margins and any explicit TeX control space.
+        let start = if index == 0 {
+            0
+        } else {
+            text.len() - text.trim_start_matches([' ', '\t']).len()
+        };
+        let end = if line.ends_with('\n') && end == line.len() {
+            text.trim_end_matches([' ', '\t', '\r', '\n']).len()
+        } else {
+            text.len()
+        };
+        if start < end {
+            for spaces in crate::trivia::repeated_spaces(&text[start..end]) {
+                let at = start + spaces.start;
+                if !crate::syntax::is_escaped(line, at) {
+                    output.push_str(&literal[copied..offset + at + 1]);
+                    copied = offset + start + spaces.end;
+                }
+            }
+        }
+        offset += line.len();
+    }
+    output.push_str(&literal[copied..]);
 }
 
 fn quote_safe(inner: &str) -> bool {
@@ -439,12 +469,12 @@ pub(super) fn format_parsed_fields(
         ));
         output.push_str(" = ");
         let printed_start = output.len();
-        output.push_str(&normalize_value(
+        write_value(
+            &mut output,
             &field.value,
-            0..field.value.len(),
             field.name,
             &config.value_delimiters,
-        ));
+        );
         if let Some(origins) = &mut origins {
             origins.push((printed_start..output.len(), field.span.clone()));
         }

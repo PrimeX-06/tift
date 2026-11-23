@@ -3015,6 +3015,7 @@ fn format_macro_definitions_parsed(
     options.syntax.infer_list_environments = false;
     options.replacements.clear();
     options.wrap.mode = "preserve".into();
+    options.wrap.collapse_spaces = false;
     options.sentences.enabled = false;
     options.alignment.enabled = false;
     options.breaks.enabled = false;

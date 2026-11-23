@@ -1,12 +1,26 @@
 # Changelog
 
+## 0.1.7
+
+- Collapse repeated spaces in ordinary LaTeX prose while preserving existing line breaks. Set `wrap.collapse-spaces = false` to keep repeated spaces. Comments, verbatim content, and literal command arguments retain their spacing.
+- Collapse repeated spaces in ordinary BibTeX field values while preserving expression syntax, string definitions, and literal fields such as URLs and DOIs.
+- Try LaTeX and BibTeX formatting in the [browser Playground](https://primex-06.github.io/tift/#playground), with taller source and output panels on desktop and mobile.
+
+Download the archive for Windows, Linux, or macOS from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.7), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
+
+```sh
+cargo install tift --version 0.1.7 --locked --registry crates-io
+```
+
+[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
+
 ## 0.1.6
 
 - Expand syntax and formatting coverage for expl3 literal data, hook callbacks, opaque source regions, and deeply nested environments.
 - Improve repeated-format performance by reusing activity scans, borrowing expl3 call metadata, reducing opaque-marker allocations, and indexing cross-argument boundaries.
 - Add regression coverage and release-mode benchmarks for syntax stability and real-corpus throughput.
 
-Download the archive for Windows, Linux, or macOS from the [latest GitHub Release](https://github.com/PrimeX-06/tift/releases/latest), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
+Download the archive for Windows, Linux, or macOS from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.6), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
 
 ```sh
 cargo install tift --version 0.1.6 --locked --registry crates-io

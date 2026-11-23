@@ -351,6 +351,19 @@ fn format_document_stages(
                     )
                 },
             )?;
+            let collapse_prose = kind == FileKind::Tex
+                && config.config.wrap.mode == "preserve"
+                && config.config.wrap.collapse_spaces
+                && text.contains("  ");
+            optional_stage(
+                "prose-spaces",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                collapse_prose,
+                |text| crate::wrap::collapse_prose_spaces(text, config, &mut parsing),
+            )?;
             // Resolve structure first so wrapping always measures final indentation.
             needs_cleanup |= optional_stage(
                 "text-before",

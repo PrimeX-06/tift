@@ -196,6 +196,7 @@ nav a:hover, .text-link:hover { text-decoration: underline; }
 .platforms span { color: var(--brand); }
 
 .playground-band {
+  --playground-editor-height: clamp(24rem, 56svh, 36rem);
   --code-value: #805414;
   --code-symbol: #9e3c36;
   border-block: 1px solid var(--line);
@@ -288,8 +289,9 @@ nav a:hover, .text-link:hover { text-decoration: underline; }
 
 .source-editor {
   position: relative;
-  height: 15.5rem;
 }
+
+.source-editor, .formatted-code { height: var(--playground-editor-height); }
 
 .source-editor pre,
 .source-editor textarea,
@@ -331,7 +333,7 @@ nav a:hover, .text-link:hover { text-decoration: underline; }
 .source-editor textarea::selection { background: #dfe3f6; color: var(--ink); }
 .source-editor textarea:focus-visible, .formatted-code:focus-visible { outline-offset: -3px; }
 
-.formatted-code { height: 15.5rem; overflow: auto; }
+.formatted-code { overflow: auto; }
 .syntax-command { color: var(--brand); }
 .syntax-field { color: #216052; }
 .syntax-comment { color: var(--muted); }
@@ -441,9 +443,9 @@ nav a:hover, .text-link:hover { text-decoration: underline; }
   .hero h1 img { width: 3.9rem; height: 3.9rem; }
   .hero-lead { font-size: 1.55rem; }
   .hero-description { font-size: 1rem; }
+  .playground-band { --playground-editor-height: clamp(19rem, 44svh, 26rem); }
   .playground-layout h2 { font-size: 1.375rem; }
   .playground-panels { grid-template-columns: minmax(0, 1fr); }
-  .source-editor, .formatted-code { height: 13rem; }
   .section { padding-block: 2.75rem; }
   .features, .install-layout { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
 }

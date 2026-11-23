@@ -38,7 +38,7 @@ pub struct WrapConfig {
     pub text_commands: Option<Vec<String>>,
     /// Additional plain-text characters after which wrapping may break.
     pub break_chars: Vec<char>,
-    /// Collapse horizontal whitespace in ordinary prose during reflow.
+    /// Collapse repeated spaces in prose, including when preserving line breaks.
     pub collapse_spaces: bool,
     /// Regex matching the beginning of an eligible prose block.
     pub begin_pattern: Option<String>,
@@ -339,6 +339,120 @@ pub(crate) fn is_active(config: &crate::CompiledConfig, stage: Stage) -> bool {
         || config.config.sentences.enabled && config.config.sentences.when == stage
 }
 
+pub(crate) fn collapse_prose_spaces(
+    source: &str,
+    config: &crate::CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, crate::FormatError> {
+    let grammar = &config.config.syntax;
+    if grammar.command_pattern.is_some()
+        || grammar.environment_pattern.is_some()
+        || grammar.condition_pattern.is_some()
+        || grammar.item_pattern.is_some()
+        || grammar.argument_between.is_some()
+        || !grammar.special.is_empty()
+        || !config.config.protect.dynamic_catcodes
+    {
+        return Ok(source.into());
+    }
+
+    let needs_environments = source.contains("\\begin") || source.contains("\\end");
+    let parsed = parsing.snapshot(source, needs_environments, false)?;
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let declared_commands = analysis.declared_commands()?;
+    let declared_environments = analysis.declared_environments()?;
+    let mut opaque = parsed.protected.clone();
+    // A setter stored in a macro, alias or hook can execute after its source
+    // range ends. Only use a setter's existing protection when the scanner
+    // identified it as the operation opening that range.
+    if source.match_indices('\\').any(|(at, _)| {
+        crate::syntax::command_at(source, at).is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+            ) || crate::packages::code::catcode_value(name).is_some()
+        }) && !crate::syntax::is_escaped(source, at)
+            && containing(at, &opaque).is_none_or(|range| {
+                let prefix = source[range.start..at].trim();
+                let standalone_group = matches!(prefix, "{" | "\\begingroup" | "\\bgroup")
+                    && source[..range.start]
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|line| line.trim().is_empty());
+                !prefix.is_empty() && !standalone_group
+            })
+            && {
+                let line_start = source[..at].rfind('\n').map_or(0, |index| index + 1);
+                comment_start(source, line_start..at, &opaque).is_none()
+            }
+    }) {
+        return Ok(source.into());
+    }
+    let mut body = 0..source.len();
+    if needs_environments {
+        let Ok(environments) = crate::syntax::environment_ranges_with_tokens(
+            source,
+            parsed.tokens.as_deref().expect("environment tokens"),
+            &parsed.protected,
+            &config.config,
+        ) else {
+            return Ok(source.into());
+        };
+        for environment in environments {
+            if environment.name == "document" {
+                body = environment.body.clone();
+            }
+            if is_non_prose_environment(&environment.name, config)
+                || crate::package_tables::is_table(&environment.name)
+                || declared_environments.contains(&environment.name)
+                || grammar
+                    .inferred_environment_arguments
+                    .contains_key(&environment.name)
+            {
+                opaque.push(environment.begin.start..environment.end.end);
+            }
+        }
+    }
+    add_inline_atoms(
+        source,
+        &mut opaque,
+        &config.config,
+        &declared_commands,
+        true,
+    );
+
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0;
+    let mut start = body.start;
+    for line in source[body].split_inclusive('\n') {
+        let end = start + line.len();
+        let leading = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let content = &line[leading..];
+        let content = content.trim_end_matches([' ', '\t', '\r', '\n']);
+        let start_content = start + leading;
+        let end_content = start_content + content.len();
+        let end_prose =
+            comment_start(source, start_content..end_content, &opaque).unwrap_or(end_content);
+        if !contains_definition(content) {
+            for spaces in crate::trivia::repeated_spaces(&source[start_content..end_prose]) {
+                let spaces = start_content + spaces.start..start_content + spaces.end;
+                if !intersects(spaces.clone(), &opaque) {
+                    output.push_str(&source[copied..spaces.start + 1]);
+                    copied = spaces.end;
+                }
+            }
+        }
+        start = end;
+    }
+    output.push_str(&source[copied..]);
+    Ok(output)
+}
+
 pub fn format_text(
     source: &str,
     config: &crate::CompiledConfig,
@@ -410,7 +524,13 @@ fn format_text_with_arguments(
         std::rc::Rc::clone(&parsed.metadata),
     );
     let declared_commands = analysis.declared_commands()?;
-    add_inline_atoms(source, &mut opaque, &config.config, &declared_commands);
+    add_inline_atoms(
+        source,
+        &mut opaque,
+        &config.config,
+        &declared_commands,
+        false,
+    );
     for environment in environments {
         if is_non_prose_environment(&environment.name, config) {
             opaque.push(environment.begin.start..environment.end.end);
@@ -1303,7 +1423,7 @@ fn wrap_text_argument(
 ) -> String {
     let original = &source[body.clone()];
     let mut atoms = Vec::new();
-    add_inline_atoms(original, &mut atoms, &config.config, declared);
+    add_inline_atoms(original, &mut atoms, &config.config, declared, false);
     if atoms
         .iter()
         .any(|range| original[range.clone()].contains('\n'))
@@ -2457,6 +2577,7 @@ fn add_inline_atoms(
     ranges: &mut Vec<Range<usize>>,
     config: &crate::Config,
     declared_commands: &std::collections::HashSet<String>,
+    expose_text_arguments: bool,
 ) {
     merge_ranges(ranges);
     let protected = ranges.clone();
@@ -2491,6 +2612,19 @@ fn add_inline_atoms(
             b'\\' => {
                 if let Some((name, end)) = crate::syntax::command_at(source, position) {
                     position = end;
+                    let base = name.trim_end_matches('*');
+                    if expose_text_arguments
+                        && !declared_commands.contains(base)
+                        && !config.syntax.commands.contains_key(base)
+                        && let Some(signature) = text_argument_signature(name)
+                        && let Some((body, _)) =
+                            standard_arguments(source, end, signature, &protected)
+                    {
+                        ranges.push(start..body.start);
+                        position = body.start;
+                        optional_argument = false;
+                        continue;
+                    }
                     if name.chars().next().is_some_and(|symbol| {
                         symbol.is_ascii_alphabetic() || "@_:".contains(symbol)
                     }) {
