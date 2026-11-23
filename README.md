@@ -11,7 +11,7 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 
 ![BibTeX before and after formatting, showing field indentation and aligned equals signs](docs/branding/tift-bibtex-formatting.png)
 
-**[User guide](https://github.com/PrimeX-06/tift/wiki)** · **[Formatting examples](https://github.com/PrimeX-06/tift/wiki/Formatting-Examples)** · **[Report an issue](https://github.com/PrimeX-06/tift/issues)**
+**[Homepage](https://primex-06.github.io/tift/)** · **[User guide](https://github.com/PrimeX-06/tift/wiki)** · **[Formatting examples](https://github.com/PrimeX-06/tift/wiki/Formatting-Examples)** · **[Discussions](https://github.com/PrimeX-06/tift/discussions)** · **[Report an issue](https://github.com/PrimeX-06/tift/issues)**
 
 ## Features
 
