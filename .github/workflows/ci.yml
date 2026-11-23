@@ -42,8 +42,7 @@ jobs:
           files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
           for name in filter(None, files):
               source = name.startswith("src/") and name.endswith(".rs")
-              wiki_page = name.startswith("site/wiki/") and Path(name).suffix.lower() == ".md"
-              if name not in allowed and not source and not wiki_page:
+              if name not in allowed and not source:
                   raise SystemExit("A non-public file is tracked")
               if source:
                   text = Path(name).read_text(encoding="utf-8")

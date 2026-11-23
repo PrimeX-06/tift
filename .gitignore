@@ -27,8 +27,7 @@
 !/site/branding/tift-latex-formatting.png
 !/site/branding/tift-logo.svg
 !/site/branding/tift-logo.tex
-!/site/wiki/
-!/site/wiki/**
+/site/wiki/
 !/examples/
 /examples/*
 !/examples/tift.toml
