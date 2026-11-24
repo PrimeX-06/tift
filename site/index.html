@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="tift formats LaTeX and BibTeX with configurable indentation, math and table alignment, prose wrapping, bibliography cleanup, and project-wide formatting checks.">
-  <meta name="theme-color" content="#fbfaf8">
+  <meta name="theme-color" content="#f8f9fc">
   <title>tift | LaTeX and BibTeX formatter</title>
   <link rel="canonical" href="https://primex-06.github.io/tift/">
   <link rel="icon" href="branding/tift-logo.svg" type="image/svg+xml">
@@ -29,38 +29,16 @@
   </header>
 
   <main id="main">
-    <section class="hero" aria-labelledby="hero-title">
-      <div class="hero-code" aria-hidden="true">
-        <pre><code>\begin{itemize}
-    \item Draft the manuscript
-        \begin{enumerate}
-            \item Outline the methods
-            \item Summarize the results
-        \end{enumerate}
-    \item Review the figures
-\end{itemize}</code></pre>
-        <pre><code>\begin{tikzpicture}
-    \draw[thick, -&gt;]
-        (0,0) node[left] {Input}
-        -- (2,0) node[right] {Output};
-    \foreach \x in {0,1,2} {
-        \fill (\x,0) circle (1pt);
-    }
-\end{tikzpicture}</code></pre>
+    <section class="intro wrap" aria-labelledby="hero-title">
+      <h1 id="hero-title">
+        <img src="branding/tift-logo.svg" width="82" height="82" alt="">
+        tift
+      </h1>
+      <div class="intro-copy">
+        <p class="intro-lead"><strong>LaTeX</strong> and <strong>BibTeX</strong> formatter</p>
+        <p>Align equations, format tables, and tidy bibliographies in your editor, terminal, or browser.</p>
       </div>
-      <div class="wrap">
-        <h1 id="hero-title">
-          <img src="branding/tift-logo.svg" width="82" height="82" alt="">
-          tift
-        </h1>
-        <p class="hero-lead">A formatter for LaTeX and BibTeX</p>
-        <p class="hero-description">Indent LaTeX environments, format math, align equations and tables, and wrap prose while preserving verbatim content. Format, sort, and clean up bibliographies, and share a style across your projects, editor, and CI.</p>
-        <div class="actions">
-          <a class="button button-primary" href="#install"><span aria-hidden="true">&#8595;</span> Get tift</a>
-          <a class="button button-outline" href="https://github.com/PrimeX-06/tift/wiki">Read the docs <span aria-hidden="true">&#8599;</span></a>
-        </div>
-        <p class="platforms">Windows <span aria-hidden="true">&middot;</span> macOS <span aria-hidden="true">&middot;</span> Linux</p>
-      </div>
+      <a class="release-link" href="https://github.com/PrimeX-06/tift/releases/tag/v0.1.8">Release 0.1.8 <span aria-hidden="true">&#8599;</span></a>
     </section>
 
     <section class="playground-band" id="playground" aria-labelledby="playground-title">
@@ -89,26 +67,26 @@
             </div>
             <div class="source-editor">
               <pre aria-hidden="true"><code id="source-highlight"></code></pre>
-              <textarea id="playground-source" aria-describedby="playground-help" wrap="off" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="Paste your code here" dir="ltr">\section{Partial sums}
-Each row  adds one more term.
-
+              <textarea id="playground-source" aria-describedby="playground-help" wrap="off" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="Paste your code here" dir="ltr">% Two equations per row
 \begin{align}
-S_n&amp;=1+2+\cdots+n\\
- &amp;=\frac{n(n+1)}{2},\\
-S_4&amp;=1+2+3+4=10
+x&amp;=1&amp;total&amp;=a+b\label{eq:one}\\
+speed&amp;=c+d&amp;t&amp;=0\label{eq:two}\\
+&amp;=e&amp;&amp;=f
 \end{align}
 
-\begin{table}[ht]
-\centering
-\begin{tabular}{rr}
-$n$&amp;$S_n$\\
-\hline
-2&amp;3\\
- 3&amp;6\\
-4&amp;10
-\end{tabular}
-\caption{Partial sums}
-\end{table}
+% Plot data
+\begin{axis}
+\addplot table {
+x y
+1 9
+100 25
+};
+\end{axis}
+
+% Embedded bibliography
+\begin{filecontents*}{refs.bib}
+@book{knuth1984,title={The {TeXbook}},year={1984}}
+\end{filecontents*}
 </textarea>
             </div>
           </div>
@@ -136,13 +114,13 @@ $n$&amp;$S_n$\\
         <article>
           <span class="feature-symbol" aria-hidden="true">&amp;=</span>
           <h3>LaTeX source</h3>
-          <p>Indent nested environments, align equations and table columns, and format common LaTeX packages and CJK documents.</p>
+          <p>Line up paired equations and their labels, align PGFPlots data, and measure table columns by their Unicode display width.</p>
           <a class="text-link" href="https://github.com/PrimeX-06/tift/wiki/Supported-Syntax">Supported syntax <span aria-hidden="true">&#8599;</span></a>
         </article>
         <article>
           <span class="feature-symbol" aria-hidden="true">@</span>
           <h3>Bibliographies</h3>
-          <p>Align fields in BibTeX and BibLaTeX entries. Enable sorting and cleanup when your bibliography calls for them.</p>
+          <p>Apply the same field layout to standalone <code>.bib</code> files and bibliographies embedded in <code>filecontents</code>. Sorting and cleanup are optional.</p>
           <a class="text-link" href="https://github.com/PrimeX-06/tift/wiki/BibTeX">BibTeX guide <span aria-hidden="true">&#8599;</span></a>
         </article>
         <article>
@@ -157,9 +135,9 @@ $n$&amp;$S_n$\\
     <section class="install-band" id="install" aria-labelledby="install-title">
       <div class="wrap section install-layout">
         <div>
-          <h2 id="install-title">Get started</h2>
-          <p>Download the archive for your platform, extract it, and add the executable's directory to your <code>PATH</code>.</p>
-          <a class="button button-primary" href="https://github.com/PrimeX-06/tift/releases/latest">Download latest release <span aria-hidden="true">&#8599;</span></a>
+          <h2 id="install-title">Install tift</h2>
+          <p>Download the archive for Windows, macOS, or Linux, extract it, and add the executable's directory to your <code>PATH</code>.</p>
+          <a class="button button-primary" href="https://github.com/PrimeX-06/tift/releases/tag/v0.1.8">Download 0.1.8 <span aria-hidden="true">&#8595;</span></a>
           <p class="install-note">For platform-specific setup, see the <a href="https://github.com/PrimeX-06/tift/wiki/Getting-Started">installation guide</a>.</p>
         </div>
         <div class="install-commands">
