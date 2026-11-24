@@ -201,3 +201,38 @@ fn tabu_dimension_end(source: &str, start: usize, limit: usize) -> Option<usize>
         None
     }
 }
+
+/// Direct children only: a marker in a grouped cell or a nested environment
+/// belongs to that scope. Both alignment and indentation use the same boundary.
+pub(crate) fn code_after_markers(
+    blocks: &[crate::syntax::SharedBlock],
+    config: &crate::Config,
+    analysis: &crate::source_analysis::SourceAnalysis<'_>,
+) -> Result<Vec<(usize, usize)>, crate::FormatError> {
+    use crate::syntax::BlockKind;
+    if config.syntax.commands.contains_key("CodeAfter")
+        || analysis.declared_commands()?.contains("CodeAfter")
+    {
+        return Ok(Vec::new());
+    }
+    let declared = analysis.declared_environments()?;
+    Ok(blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let parent = block.parent?;
+            let env = &blocks[parent];
+            (block.kind == BlockKind::Command
+                && block.name == "CodeAfter"
+                && env.kind == BlockKind::Environment
+                && env.name.contains("Nice")
+                && crate::packages::is_alignment_environment(&env.name)
+                && !declared.contains(env.name.as_str())
+                && !config
+                    .syntax
+                    .environment_arguments
+                    .contains_key(env.name.as_str()))
+            .then_some((i, parent))
+        })
+        .collect())
+}

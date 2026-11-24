@@ -5,23 +5,19 @@ on:
     branches: ["**"]
   pull_request:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust / ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  public-tree:
+    name: Public file list
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
       - name: Check public file list
         shell: bash
         run: |
@@ -39,16 +35,35 @@ jobs:
               "site/branding/tift-bibtex-formatting.png", "site/branding/tift-latex-formatting.png",
               "site/branding/tift-logo.svg", "site/branding/tift-logo.tex",
           }
-          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
-          for name in filter(None, files):
+          entries = subprocess.check_output(["git", "ls-files", "--stage", "-z"]).decode().split("\0")
+          for entry in filter(None, entries):
+              metadata, name = entry.split("\t", 1)
+              if metadata.split()[0] not in {"100644", "100755"}:
+                  raise SystemExit(f"Expected a regular public file: {name}")
               source = name.startswith("src/") and name.endswith(".rs")
               if name not in allowed and not source:
-                  raise SystemExit("A non-public file is tracked")
+                  raise SystemExit(f"A non-public file is tracked: {name}")
               if source:
                   text = Path(name).read_text(encoding="utf-8")
                   if re.search(r"#\s*\[\s*(?:test\b|cfg\s*\(\s*test\b)", text):
-                      raise SystemExit("Private test code is present in a public source file")
+                      raise SystemExit(f"Private test code is present in {name}")
           PY
+
+  rust:
+    name: Rust / ${{ matrix.os }}
+    needs: public-tree
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: Formatting
         run: cargo +stable fmt --all -- --check
       - name: Clippy
@@ -74,9 +89,12 @@ jobs:
 
   msrv:
     name: Minimum Rust / 1.99.1
+    needs: public-tree
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy

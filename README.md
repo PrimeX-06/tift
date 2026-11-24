@@ -16,8 +16,8 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 ## Features
 
 - Indent LaTeX environments, lists, and nested structures.
-- Align table columns, equations, and matrices, and format math spacing.
-- Format, sort, and optionally clean up BibTeX and BibLaTeX bibliographies.
+- Align table columns, paired equations, matrices, and inline PGFPlots data tables, and format math spacing.
+- Format standalone and embedded BibTeX and BibLaTeX bibliographies, with optional sorting and cleanup.
 - Wrap long prose and captions to a chosen line width.
 - Support common LaTeX packages and CJK documents.
 - Preserve verbatim content and allow local formatting controls.
@@ -75,6 +75,10 @@ columns = 88
 tift discovers project settings automatically. The [configuration guide](https://github.com/PrimeX-06/tift/wiki/Configuration-Guide) explains setup; the [reference](https://github.com/PrimeX-06/tift/wiki/Configuration) lists all options.
 
 Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
+
+Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.1.8](https://github.com/PrimeX-06/tift/blob/v0.1.8/examples/tift.toml)
+
+By default, tift formats `.bib` contents in `filecontents` and `filecontents*` and aligns literal whitespace-separated rows in `\addplot table`. To preserve either source layout, set `bibtex.format-filecontents = false` or `breaks.pgfplots-tables = false`.
 
 ## Editor
 

@@ -1,5 +1,9 @@
 //! Width-selected layouts for explicitly selected command argument groups.
 
+pub(crate) mod consecutive;
+mod declaration_lists;
+mod declaration_records;
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -20,8 +24,11 @@ pub struct ArgumentLayoutConfig {
     pub split_equals: bool,
     /// Vertically align assignment operators in multiline key-value lists.
     pub align_equals: bool,
+    pub align_consecutive: bool,
     /// Layout of literal pgffor data lists; separate from command options.
     pub foreach_lists: ForeachListMode,
+    pub graphics_paths: ForeachListMode,
+    pub listings_literate: bool,
     pub rules: BTreeMap<String, ArgumentLayoutRule>,
 }
 
@@ -51,8 +58,11 @@ impl Default for ArgumentLayoutConfig {
             .into(),
             split_commas: true,
             split_equals: false,
-            align_equals: false,
+            align_equals: true,
+            align_consecutive: false,
             foreach_lists: ForeachListMode::Preserve,
+            graphics_paths: ForeachListMode::Auto,
+            listings_literate: true,
             rules: BTreeMap::new(),
         }
     }
@@ -131,7 +141,10 @@ fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> 
     let unstarred = name.trim_end_matches('*');
     let rule = base.rules.get(name).or_else(|| base.rules.get(unstarred));
     let default_optional = rule.is_none()
-        && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap")
+        && matches!(
+            config.config.wrap.mode.as_str(),
+            "wrap" | "stable" | "rewrap"
+        )
         && unstarred == "includegraphics";
     if rule.is_none()
         && !default_optional
@@ -147,8 +160,11 @@ fn settings<'a>(name: &str, config: &'a CompiledConfig) -> Option<Settings<'a>> 
         .and_then(|r| r.line_width)
         .or(base.line_width)
         .or_else(|| {
-            (matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap"))
-                .then_some(config.config.wrap.columns)
+            (matches!(
+                config.config.wrap.mode.as_str(),
+                "wrap" | "stable" | "rewrap"
+            ))
+            .then_some(config.config.wrap.columns)
         });
     let align_equals = rule
         .and_then(|r| r.align_equals)
@@ -352,6 +368,8 @@ fn signature_groups(
             return None;
         }
         let end = match slot {
+            b's' if source.as_bytes().get(start) == Some(&b'*') => start + 1,
+            b's' => continue,
             b'o' if source.as_bytes().get(start) == Some(&b'[') => {
                 group_end(source, start, protected)?
             }
@@ -1001,7 +1019,9 @@ fn expand_group(
 }
 
 pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
-    load_arguments_present(source, config) || width_layout_is_active(config)
+    load_arguments_present(source, config)
+        || width_layout_is_active(config)
+        || declaration_lists::is_active(source, config)
 }
 
 fn width_layout_is_active(config: &CompiledConfig) -> bool {
@@ -1049,6 +1069,13 @@ pub(crate) fn format_arguments_with_context(
     let source = if load_arguments_present(source, config) {
         normalized = normalize_load_arguments(source, config, parsing)?;
         &normalized
+    } else {
+        source
+    };
+    let declarations;
+    let source = if declaration_lists::is_active(source, config) {
+        declarations = declaration_lists::format(source, config, parsing)?;
+        &declarations
     } else {
         source
     };

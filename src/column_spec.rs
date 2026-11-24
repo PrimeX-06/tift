@@ -305,7 +305,7 @@ pub(super) struct DeclaredTypes {
 #[derive(Clone, Copy)]
 struct LiteralColumn {
     arguments: usize,
-    justification: Justification,
+    style: CellStyle,
 }
 
 impl DeclaredTypes {
@@ -320,42 +320,54 @@ impl DeclaredTypes {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct CellStyle {
     pub justification: Option<Justification>,
+    pub decimal: Option<&'static [char]>,
     pub colspan: Option<usize>,
     pub rowspan: Option<usize>,
 }
 
 impl CellStyle {
     fn overlay(&mut self, newer: Self) {
+        if newer.justification.is_some() {
+            self.decimal = newer.decimal;
+        }
         self.justification = newer.justification.or(self.justification);
         self.colspan = newer.colspan.or(self.colspan);
         self.rowspan = newer.rowspan.or(self.rowspan);
     }
 }
 
-pub(super) struct TableSpec {
-    columns: Vec<Justification>,
-    ray: Option<tabularray::Spec>,
+pub(super) enum TableSpec {
+    Columns(Vec<CellStyle>),
+    EquationPairs,
+    Tabularray(Box<tabularray::Spec>),
 }
 
 impl TableSpec {
     pub fn is_tabularray(&self) -> bool {
-        self.ray.is_some()
+        matches!(self, Self::Tabularray(_))
     }
 
     pub fn column_count(&self) -> usize {
-        self.ray
-            .as_ref()
-            .map_or(self.columns.len(), |spec| spec.column_count())
+        match self {
+            Self::Columns(columns) => columns.len(),
+            Self::EquationPairs => 2,
+            Self::Tabularray(spec) => spec.column_count(),
+        }
     }
 
     pub fn style(&self, row: usize, column: usize, rows: usize, columns: usize) -> CellStyle {
-        self.ray.as_ref().map_or_else(
-            || CellStyle {
-                justification: self.columns.get(column - 1).copied(),
+        match self {
+            Self::Columns(styles) => styles.get(column - 1).copied().unwrap_or_default(),
+            Self::EquationPairs => CellStyle {
+                justification: Some(if column.is_multiple_of(2) {
+                    Justification::Left
+                } else {
+                    Justification::Right
+                }),
                 ..CellStyle::default()
             },
-            |spec| spec.style(row, column, rows, columns),
-        )
+            Self::Tabularray(spec) => spec.style(row, column, rows, columns),
+        }
     }
 
     pub fn body_styles(
@@ -429,6 +441,23 @@ pub(super) fn for_environment(
     header: &str,
     declared: &DeclaredTypes,
 ) -> Option<TableSpec> {
+    let environment = if name == "empheq" {
+        empheq_environment(header)?
+    } else {
+        name
+    };
+    match environment {
+        "align" | "align*" | "aligned" | "alignat" | "alignat*" | "alignedat" | "flalign"
+        | "flalign*" | "xalignat" | "xalignat*" | "xxalignat" => {
+            return Some(TableSpec::EquationPairs);
+        }
+        "split" => return equation_columns("rl"),
+        "eqnarray" | "eqnarray*" => return equation_columns("rcl"),
+        "IEEEeqnarray" | "IEEEeqnarray*" => {
+            return equation_columns(equation_header_argument(header)?);
+        }
+        _ => {}
+    }
     let selected = header_columns(name, header)?.map(|body| &header[body]);
     if crate::package_tables::is_tabularray(name) {
         if declared.tabularray_defaults {
@@ -443,16 +472,50 @@ pub(super) fn for_environment(
             Justification::Left
         };
         let ray = tabularray::Spec::parse(selected.unwrap_or(""), default, declared).ok()?;
-        Some(TableSpec {
-            columns: Vec::new(),
-            ray: Some(ray),
-        })
+        Some(TableSpec::Tabularray(Box::new(ray)))
     } else {
-        Some(TableSpec {
-            columns: parse(selected?, declared)?,
-            ray: None,
-        })
+        Some(TableSpec::Columns(parse(selected?, declared)?))
     }
+}
+
+pub(super) fn empheq_environment(header: &str) -> Option<&str> {
+    let selector = equation_header_argument(header)?;
+    Some(
+        selector
+            .split_once('=')
+            .map_or(selector, |(name, _)| name)
+            .trim(),
+    )
+}
+
+pub(super) fn equation_header_argument(header: &str) -> Option<&str> {
+    let mut at = skip(header, 0);
+    if header.as_bytes().get(at) == Some(&b'[') {
+        at = skip(header, group(header, at, b'[', b']')?.end + 1);
+    }
+    Some(header[group(header, at, b'{', b'}')?].trim())
+}
+
+fn equation_columns(spec: &str) -> Option<TableSpec> {
+    if spec.is_empty() || spec.len() > MAX_COLUMNS {
+        return None;
+    }
+    let columns = spec
+        .bytes()
+        .map(|byte| {
+            let direction = match byte {
+                b'r' | b'R' => Justification::Right,
+                b'c' | b'C' => Justification::Center,
+                b'l' | b'L' => Justification::Left,
+                _ => return None,
+            };
+            Some(CellStyle {
+                justification: Some(direction),
+                ..Default::default()
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TableSpec::Columns(columns))
 }
 
 pub(super) fn multicolumn(
@@ -473,10 +536,10 @@ pub(super) fn multicolumn(
     cursor = skip(text, span.end + 1);
     let spec = group(text, cursor, b'{', b'}')?;
     let parsed = parse(&text[spec], declared)?;
-    (parsed.len() == 1).then_some((count, parsed[0]))
+    (parsed.len() == 1).then_some((count, parsed[0].justification?))
 }
 
-pub(super) fn parse(source: &str, declared: &DeclaredTypes) -> Option<Vec<Justification>> {
+fn parse(source: &str, declared: &DeclaredTypes) -> Option<Vec<CellStyle>> {
     let mut columns = Vec::new();
     parse_into(source, &mut columns, 0, declared, None)?;
     (!columns.is_empty()).then_some(columns)
@@ -484,7 +547,7 @@ pub(super) fn parse(source: &str, declared: &DeclaredTypes) -> Option<Vec<Justif
 
 fn parse_into(
     source: &str,
-    output: &mut Vec<Justification>,
+    output: &mut Vec<CellStyle>,
     depth: usize,
     declared: &DeclaredTypes,
     mut layout: Option<&mut PreambleLayout>,
@@ -508,7 +571,7 @@ fn parse_into(
             if let Some(layout) = &mut layout {
                 layout.record(byte, start..cursor)?;
             }
-            output.push(column.justification);
+            output.push(column.style);
             if output.len() > MAX_COLUMNS {
                 return None;
             }
@@ -517,6 +580,7 @@ fn parse_into(
         if declared.columns.contains(&byte) {
             return None;
         }
+        let mut decimal = None;
         let align = match byte {
             b'l' => Justification::Left,
             b'c' => Justification::Center,
@@ -557,6 +621,7 @@ fn parse_into(
                 align
             }
             b'S' | b's' => {
+                decimal = (byte == b'S').then_some(&['.', ','][..]);
                 let after = skip(source, cursor);
                 if source.as_bytes().get(after) == Some(&b'[') {
                     cursor = group(source, after, b'[', b']')?.end + 1;
@@ -565,9 +630,17 @@ fn parse_into(
             }
             // dcolumn.sty defines D{input separator}{output separator}{places}.
             b'D' => {
-                for _ in 0..3 {
+                for argument in 0..3 {
                     cursor = skip(source, cursor);
-                    cursor = group(source, cursor, b'{', b'}')?.end + 1;
+                    let body = group(source, cursor, b'{', b'}')?;
+                    if argument == 0 {
+                        decimal = match &source[body.clone()] {
+                            "." => Some(&['.'][..]),
+                            "," => Some(&[','][..]),
+                            _ => None,
+                        };
+                    }
+                    cursor = body.end + 1;
                 }
                 Justification::Right
             }
@@ -639,7 +712,11 @@ fn parse_into(
         if let Some(layout) = &mut layout {
             layout.record(byte, start..cursor)?;
         }
-        output.push(align);
+        output.push(CellStyle {
+            justification: Some(align),
+            decimal,
+            ..CellStyle::default()
+        });
         if output.len() > MAX_COLUMNS {
             return None;
         }
@@ -686,12 +763,19 @@ fn literal_column(source: &str, start: usize) -> Option<LiteralColumn> {
         cursor = skip(body, content.end + 1);
     }
     let columns = parse(&body[cursor..], &DeclaredTypes::default())?;
-    let [justification] = columns.as_slice() else {
+    let [style] = columns.as_slice() else {
         return None;
     };
     Some(LiteralColumn {
         arguments,
-        justification: modifier.unwrap_or(*justification),
+        style: if let Some(align) = modifier {
+            CellStyle {
+                justification: Some(align),
+                ..CellStyle::default()
+            }
+        } else {
+            *style
+        },
     })
 }
 
@@ -725,7 +809,7 @@ fn option_alignment(source: &str) -> Result<Option<Justification>, ()> {
     Ok(result)
 }
 
-fn parts(source: &str) -> Option<Vec<&str>> {
+pub(crate) fn parts(source: &str) -> Option<Vec<&str>> {
     let mut result = Vec::new();
     let mut start = 0;
     let mut cursor = 0;

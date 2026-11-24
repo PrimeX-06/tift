@@ -73,8 +73,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build release binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tift-target
         run: cargo +1.99.1 build --release --locked --target ${{ matrix.target }}
       - name: Verify binary and package archive
+        id: package
         shell: bash
         env:
           RELEASE_TARGET: ${{ matrix.target }}
@@ -91,11 +94,12 @@ jobs:
           target = os.environ["RELEASE_TARGET"]
           windows = target.endswith("windows-msvc")
           binary_name = "tift.exe" if windows else "tift"
-          binary = Path("target") / target / "release" / binary_name
+          temp = Path(os.environ["RUNNER_TEMP"])
+          binary = temp / "tift-target" / target / "release" / binary_name
           result = subprocess.run([str(binary), "--version"], check=True, capture_output=True, text=True)
           if result.stdout.strip() != f"tift {tag[1:]}":
               raise SystemExit("Built binary version does not match the release tag")
-          root = Path("dist")
+          root = temp / "tift-dist"
           package_name = f"tift-{tag}-{target}"
           package = root / package_name
           package.mkdir(parents=True)
@@ -114,14 +118,14 @@ jobs:
                   actual = {entry.name for entry in packed.getmembers() if entry.isfile()}
           if actual != expected:
               raise SystemExit("Unexpected files in release archive")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"archive={archive}", file=output)
           print(f"Verified {result.stdout.strip()}; packaged {Path(archive).name}")
           PY
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: |
-            dist/*.zip
-            dist/*.tar.gz
+          path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
           retention-days: 7
 
@@ -138,7 +142,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
-          path: dist
+          path: ${{ runner.temp }}/tift-dist
           merge-multiple: true
       - name: Generate asset checksums
         shell: bash
@@ -155,13 +159,15 @@ jobs:
               "aarch64-apple-darwin": ".tar.gz",
               "x86_64-apple-darwin": ".tar.gz",
           }
-          root = Path("dist")
+          root = Path(os.environ["RUNNER_TEMP"]) / "tift-dist"
           expected = {f"tift-{tag}-{target}{extension}" for target, extension in targets.items()}
-          actual = {path.name for path in root.iterdir() if path.is_file()}
+          actual = {path.name for path in root.iterdir()}
           if actual != expected:
               raise SystemExit(f"Unexpected release asset set: {sorted(actual)}")
           lines = []
           for name in sorted(expected):
+              if (root / name).is_symlink() or not (root / name).is_file():
+                  raise SystemExit(f"Expected a regular platform archive: {name}")
               digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
               lines.append(f"{digest}  {name}\n")
           (root / "SHA256SUMS").write_text("".join(lines), encoding="utf-8", newline="\n")
@@ -189,9 +195,10 @@ jobs:
               raise SystemExit(f"No changelog entry for {tag}")
           Path(destination).write_text(section[1].strip() + "\n", encoding="utf-8")
           PY
+          assets=("$RUNNER_TEMP"/tift-dist/*)
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
             gh release edit "$tag" --title "$title" --notes-file "$notes" --draft=false --prerelease=false --latest
           else
-            gh release create "$tag" dist/* --verify-tag --title "$title" --notes-file "$notes" --latest
+            gh release create "$tag" "${assets[@]}" --verify-tag --title "$title" --notes-file "$notes" --latest
           fi

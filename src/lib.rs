@@ -6,6 +6,7 @@ pub mod bibtex;
 mod block_storage;
 pub mod code_layout;
 pub mod config;
+mod description;
 mod docstrip;
 mod foreach;
 pub mod layout;
@@ -14,6 +15,7 @@ pub mod math_layout;
 #[path = "packages/package_support_registry.rs"]
 mod packages;
 mod parse_context;
+mod pgfplots_table;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod playground;
 pub mod ranges;

@@ -1027,6 +1027,32 @@ impl SourceModel {
                     origin: RuleOrigin::Builtin,
                     span: Some(start..end),
                 })
+                .or_else(|| {
+                    if !config.arguments.align_consecutive {
+                        return None;
+                    }
+                    let arguments = if let Some(signature) =
+                        crate::package_commands::declaration_signature(&self.source, control, end)
+                    {
+                        EnvironmentArguments {
+                            signature: Some(signature.into()),
+                            ..Default::default()
+                        }
+                    } else {
+                        let rule = crate::package_commands::builtin_command_rule(name)?;
+                        EnvironmentArguments {
+                            arguments: rule.arguments?,
+                            optional_arguments: rule.optional_arguments,
+                            signature: rule.signature.clone(),
+                        }
+                    };
+                    Some(SyntaxRule {
+                        name: name.to_owned(),
+                        meaning: RuleMeaning::Arguments(arguments),
+                        origin: RuleOrigin::Builtin,
+                        span: Some(start..end),
+                    })
+                })
             };
             if let Some(rule) = invocation {
                 if rule.origin == RuleOrigin::Source

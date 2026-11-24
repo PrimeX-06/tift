@@ -97,6 +97,30 @@ fn valid_name(name: &str) -> bool {
 }
 
 pub(super) fn validate(config: &BibtexConfig) -> Result<(), String> {
+    if config
+        .related_columns
+        .is_some_and(|width| !(1..=1_000_000).contains(&width))
+    {
+        return Err("bibtex.related-columns must be between 1 and 1000000".into());
+    }
+    if config
+        .keyword_columns
+        .is_some_and(|width| !(1..=1_000_000).contains(&width))
+    {
+        return Err("bibtex.keyword-columns must be between 1 and 1000000".into());
+    }
+    if config
+        .name_list_columns
+        .is_some_and(|width| !(1..=1_000_000).contains(&width))
+    {
+        return Err("bibtex.name-list-columns must be between 1 and 1000000".into());
+    }
+    if config
+        .concat_columns
+        .is_some_and(|width| !(1..=1_000_000).contains(&width))
+    {
+        return Err("bibtex.concat-columns must be between 1 and 1000000".into());
+    }
     if !matches!(config.name_case.as_str(), "preserve" | "lower" | "upper") {
         return Err("bibtex.name-case must be preserve, lower, or upper".into());
     }
@@ -283,8 +307,13 @@ fn field_order(fields: &mut [Field<'_>], order: &[String]) {
     });
 }
 
-pub(super) fn write_value(output: &mut String, value: &str, field: &str, mode: &str) {
-    if (mode == "preserve" && !value.contains("  "))
+pub(super) fn write_value(output: &mut String, value: &str, field: &str, config: &BibtexConfig) {
+    let mode = config.value_delimiters.as_str();
+    let preserve_spaces = config.concat_columns.is_some()
+        && value.contains('#')
+        && !value.is_empty()
+        && value_token_end(value, 0, value.len()).is_ok_and(|end| end < value.len());
+    if (mode == "preserve" && (preserve_spaces || !value.contains("  ")))
         || matches!(
             field.to_ascii_lowercase().as_str(),
             "url" | "doi" | "eprint" | "file" | "pdf" | "verba" | "verbb" | "verbc" | "execute"
@@ -320,7 +349,11 @@ pub(super) fn write_value(output: &mut String, value: &str, field: &str, mode: &
             };
             output.push_str(&value[copied..cursor]);
             output.push(left);
-            write_literal(output, inner);
+            if preserve_spaces {
+                output.push_str(inner);
+            } else {
+                write_literal(output, inner);
+            }
             output.push(right);
             copied = end;
         }
@@ -385,6 +418,184 @@ fn quote_safe(inner: &str) -> bool {
         }
     }
     !escaped && braces == 0
+}
+
+fn wrap_related(
+    output: &mut String,
+    start: usize,
+    base: &str,
+    indent: &str,
+    newline: &str,
+    columns: usize,
+) {
+    let field = output.rsplit('\n').next().unwrap_or("");
+    let value = &output[start..];
+    if !value.starts_with(['{', '"'])
+        || (!value.contains('\n') && UnicodeWidthStr::width(field) < columns)
+        || value_token_end(value, 0, value.len()).ok() != Some(value.len())
+    {
+        return;
+    }
+    let inner = &value[1..value.len() - 1];
+    if !inner.contains(',') {
+        return;
+    }
+    let keys = inner
+        .split(',')
+        .map(|key| key.trim_matches(|c: char| c.is_ascii_whitespace()));
+    if !keys.clone().all(|key| {
+        !key.is_empty() && valid_citation_key(key, true) && !key.contains(['%', '#', '\\'])
+    }) {
+        return;
+    }
+    let mut formatted = String::from(&value[..1]);
+    let unit = indent.strip_prefix(base).unwrap_or(indent);
+    for (i, key) in keys.enumerate() {
+        if i != 0 {
+            formatted.push(',');
+        }
+        formatted.push_str(newline);
+        formatted.push_str(indent);
+        formatted.push_str(unit);
+        formatted.push_str(key);
+    }
+    formatted.push_str(newline);
+    formatted.push_str(indent);
+    formatted.push_str(&value[value.len() - 1..]);
+    output.replace_range(start.., &formatted);
+}
+
+fn wrap_literal_list(
+    output: &mut String,
+    start: usize,
+    indent: &str,
+    newline: &str,
+    columns: usize,
+    keywords: bool,
+) {
+    let value = &output[start..];
+    if !value.starts_with(['{', '"'])
+        || value.contains('%')
+        || value_token_end(value, 0, value.len()).ok() != Some(value.len())
+    {
+        return;
+    }
+    let prefix = output[..start].rsplit('\n').next().unwrap_or("");
+    if !value.contains('\n')
+        && UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(value) < columns
+    {
+        return;
+    }
+    let inner = &value[1..value.len() - 1];
+    let separators = if keywords {
+        let mut ends = Vec::new();
+        let mut pos = 0;
+        while pos < inner.len() {
+            match inner.as_bytes()[pos] {
+                b'{' => {
+                    let Some(end) = crate::syntax::balanced_end(inner, pos, b'{', b'}') else {
+                        return;
+                    };
+                    pos = end;
+                }
+                b'\\' => {
+                    let Some((_, end)) = crate::syntax::command_at(inner, pos) else {
+                        return;
+                    };
+                    pos = end;
+                }
+                b',' => {
+                    pos += 1;
+                    ends.push(pos);
+                }
+                _ => pos += 1,
+            }
+        }
+        ends
+    } else {
+        super::cleanup::name_separators(inner)
+            .into_iter()
+            .filter(|&at| !crate::syntax::is_escaped(value, at))
+            .map(|at| at + "and".len())
+            .collect()
+    };
+    if separators.is_empty() {
+        return;
+    }
+    let padding = UnicodeWidthStr::width(prefix.strip_prefix(indent).unwrap_or(prefix)) + 1;
+    let continuation = format!("{newline}{indent}{}", " ".repeat(padding));
+    let value = output.split_off(start);
+    let mut copied = 0;
+    for end in separators {
+        let start = 1 + end;
+        let tail = &value[start..];
+        // Preserve explicit TeX spaces and nonbreaking Unicode whitespace.
+        let whitespace = tail.len()
+            - tail
+                .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                .len();
+        if (!keywords && whitespace == 0) || (keywords && start + whitespace == value.len() - 1) {
+            continue;
+        }
+        output.push_str(&value[copied..start]);
+        output.push_str(&continuation);
+        copied = start + whitespace;
+    }
+    output.push_str(&value[copied..]);
+}
+
+pub(super) fn wrap_concat(
+    output: &mut String,
+    start: usize,
+    indent: &str,
+    newline: &str,
+    columns: usize,
+    comma: bool,
+) {
+    let value = &output[start..];
+    if !value.contains('#') {
+        return;
+    }
+    let prefix = output[..start].rsplit('\n').next().unwrap_or("");
+    let mut margin = UnicodeWidthStr::width(prefix);
+    let exceeds = value.split_inclusive('\n').any(|line| {
+        let width = margin + UnicodeWidthStr::width(line.trim_end_matches(['\r', '\n']));
+        margin = 0;
+        width + usize::from(comma && !line.ends_with('\n')) > columns
+    });
+    if !exceeds {
+        return;
+    }
+    let mut gaps = Vec::new();
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let Ok(end) = value_token_end(value, cursor, value.len()) else {
+            return;
+        };
+        if end == value.len() {
+            break;
+        }
+        let operator = skip_whitespace(value, end, value.len());
+        if value.as_bytes().get(operator) != Some(&b'#') {
+            // Preserve comments between operands and their operators.
+            return;
+        }
+        cursor = skip_whitespace(value, operator + 1, value.len());
+        gaps.push(end..cursor);
+    }
+    if gaps.is_empty() {
+        return;
+    }
+    let padding = UnicodeWidthStr::width(prefix.strip_prefix(indent).unwrap_or(prefix));
+    let continuation = format!("{newline}{indent}{}# ", " ".repeat(padding));
+    let value = output.split_off(start);
+    let mut copied = 0;
+    for gap in gaps {
+        output.push_str(&value[copied..gap.start]);
+        output.push_str(&continuation);
+        copied = gap.end;
+    }
+    output.push_str(&value[copied..]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -469,12 +680,26 @@ pub(super) fn format_parsed_fields(
         ));
         output.push_str(" = ");
         let printed_start = output.len();
-        write_value(
-            &mut output,
-            &field.value,
-            field.name,
-            &config.value_delimiters,
-        );
+        write_value(&mut output, &field.value, field.name, config);
+        if let Some(columns) = config.name_list_columns
+            && (field.name.eq_ignore_ascii_case("author")
+                || field.name.eq_ignore_ascii_case("editor"))
+        {
+            wrap_literal_list(&mut output, printed_start, indent, newline, columns, false);
+        }
+        if field.name.eq_ignore_ascii_case("keywords")
+            && let Some(columns) = config.keyword_columns
+        {
+            wrap_literal_list(&mut output, printed_start, indent, newline, columns, true);
+        }
+        if field.name.eq_ignore_ascii_case("related")
+            && let Some(columns) = config.related_columns
+        {
+            wrap_related(&mut output, printed_start, base, indent, newline, columns);
+        }
+        if let Some(columns) = config.concat_columns {
+            wrap_concat(&mut output, printed_start, indent, newline, columns, true);
+        }
         if let Some(origins) = &mut origins {
             origins.push((printed_start..output.len(), field.span.clone()));
         }
@@ -692,13 +917,26 @@ pub(super) fn sort_entries(
                 });
             }
         }
+        // A standalone source comment immediately above a record, or a note
+        // beside its closing delimiter, stays with that record during sorting.
+        let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
+        let attached_comment = config.separate_entries
+            && (line_start > 0
+                && !crate::syntax::is_protected(line_start - 1, &protected)
+                && source[..line_start]
+                    .lines()
+                    .next_back()
+                    .is_some_and(|line| line.trim_start().starts_with('%'))
+                || source[cursor..]
+                    .trim_start_matches([' ', '\t'])
+                    .starts_with('%'));
         entries.push(Entry {
             range: start..cursor,
             key: fields.key.into(),
             kind,
             values,
             indent: entry_indent(source, start),
-            resolvable,
+            resolvable: resolvable && !attached_comment,
         });
     }
     let mut counts = HashMap::new();

@@ -144,6 +144,40 @@ pub(crate) fn context_command_signature(
     scopes.contains(&context.environment()?).then_some(shape)
 }
 
+/// File readers end with a filename. Earlier arguments (including graphics
+/// keys and listings captions) remain available to their own formatters.
+pub(crate) fn is_file_reader(name: &str) -> bool {
+    matches!(
+        name.trim_end_matches('*'),
+        "includegraphics"
+            | "verbatiminput"
+            | "VerbatimInput"
+            | "BVerbatimInput"
+            | "LVerbatimInput"
+            | "lstinputlisting"
+            | "LTXtable"
+    )
+}
+
+pub(crate) fn filename_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if !is_file_reader(name) {
+        return None;
+    }
+    let shape = if name.trim_end_matches('*') == "includegraphics" {
+        "s d<> s o o m"
+    } else {
+        command_signature(name)?
+    };
+    let signature = crate::syntax::xparse::Signature::parse(shape)?;
+    let cursor = signature.invocation_cursor(source, cursor);
+    let file = signature.slot_ranges(source, cursor..source.len())?.pop()?;
+    Some(std::iter::once(file.body).collect())
+}
+
 // One declaration generates both the fast signature match and command registry.
 // New command names therefore cannot be omitted from the argument-rule table.
 macro_rules! command_signatures {
@@ -194,6 +228,10 @@ command_signatures! {
     "frametitle" | "framesubtitle" | "reuseframe" | "footnote" => "dom",
     "section" | "subsection" | "subsubsection" => "dom",
     "includegraphics" => "doom",
+    "verbatiminput" => "sm",
+    "VerbatimInput" | "BVerbatimInput" | "LVerbatimInput" => "som",
+    "lstinputlisting" => "om",
+    "LTXtable" => "mm",
     "label" | "textbf" | "textit" | "textmd" | "textnormal" | "textrm" | "textsc"
         | "textsf" | "textsl" | "texttt" | "textup" | "emph" => "dm",
     "color" | "pagecolor" => "dom",

@@ -159,6 +159,7 @@ fn statement(
     limit: usize,
     protected: &[Range<usize>],
     text: &mut Vec<Range<usize>>,
+    mut operation: impl FnMut(usize),
 ) -> Option<Statement> {
     let mut cursor = start;
     let mut children = Vec::new();
@@ -183,6 +184,17 @@ fn statement(
         }
         match source.as_bytes()[cursor] {
             b'%' => cursor = comment_end(source, cursor, limit),
+            b'-' if source[cursor..limit].starts_with("--") => {
+                operation(cursor);
+                cursor += 2;
+            }
+            b'.' if source[cursor..limit].starts_with("..") => {
+                let next = crate::trivia::skip_until(source, cursor + 2, limit);
+                if keyword(source, next, limit, "controls") {
+                    operation(cursor);
+                }
+                cursor += 2;
+            }
             b'{' | b'[' | b'(' => cursor = group_end(source, cursor, limit, protected)?,
             b'$' => cursor = math_end(source, cursor, limit)?,
             b'\\' => {
@@ -208,6 +220,7 @@ fn statement(
                 });
             }
             b'n' if keyword(source, cursor, limit, "node") => {
+                operation(cursor);
                 if let Some(body) = node_body(source, cursor + 4, limit, protected) {
                     cursor = body.end + 1;
                     text.push(body);
@@ -319,6 +332,7 @@ impl<N: BlockName> Scanner<'_, N> {
                         scope.end,
                         self.protected,
                         &mut text,
+                        |_| {},
                     ) {
                         skip = statement.end;
                         self.push_path("tikz-inline", pos..path_end, statement, text, depth);
@@ -349,6 +363,7 @@ impl<N: BlockName> Scanner<'_, N> {
                     scope.end,
                     self.protected,
                     &mut text,
+                    |_| {},
                 ) {
                     skip = statement.end;
                     self.push_path(name, pos..command_end, statement, text, depth);
@@ -524,10 +539,55 @@ pub(crate) fn add_blocks<N: BlockName>(
     Ok(())
 }
 
+/// Only commit breaks after the entire list is recognized. Error tuples and
+/// point metadata belong to their preceding coordinate. Existing empty lines
+/// can mark scanlines in a surface plot and must survive.
+fn coordinate_breaks(
+    source: &str,
+    header_end: usize,
+    limit: usize,
+    protected: &[Range<usize>],
+) -> Option<Vec<usize>> {
+    let open =
+        crate::packages::circuits_timing::coordinate_list_open(&source[..limit], header_end)?;
+    let close = group_end(source, open, limit, protected)? - 1;
+    if syntax::overlaps(&(open..close + 1), protected) {
+        return None;
+    }
+    let skip = |start| crate::trivia::skip_until(source, start, close);
+    let mut cursor = skip(open + 1);
+    let mut breaks = Vec::new();
+    while cursor < close {
+        if source.as_bytes()[cursor] != b'(' {
+            return None;
+        }
+        breaks.push(cursor);
+        cursor = skip(group_end(source, cursor, close, protected)?);
+        while matches!(
+            source.as_bytes().get(cursor..cursor + 2),
+            Some(b"+-" | b"+=" | b"-=")
+        ) {
+            let error = skip(cursor + 2);
+            if source.as_bytes().get(error) != Some(&b'(') {
+                return None;
+            }
+            cursor = skip(group_end(source, error, close, protected)?);
+        }
+        if source.as_bytes()[cursor] == b'[' {
+            cursor = skip(group_end(source, cursor, close, protected)?);
+        }
+    }
+    if !breaks.is_empty() {
+        breaks.push(close);
+    }
+    Some(breaks)
+}
+
 pub(crate) fn boundaries<N: BlockName>(
     source: &str,
     blocks: &[Block<N>],
     config: &CompiledConfig,
+    protected: &[Range<usize>],
 ) -> Vec<(usize, BreakMode, bool)> {
     let mut result = Vec::new();
     if !config.config.breaks.enabled {
@@ -555,30 +615,74 @@ pub(crate) fn boundaries<N: BlockName>(
             && !block.begin.is_empty()
             && !matches!(
                 block.name.as_str(),
-                "tikz-scope" | "tikz-inline" | "tikz-child" | "tikz-matrix-body"
+                "tikz-scope" | "tikz-child" | "tikz-matrix-body"
             )
             && !config.config.breaks.rules.contains_key(block.name.as_str())
             && !config.config.breaks.categories.contains_key("tikz-path")
             && !syntax::is_protected(block.begin.start, &matrix_regions)
     }) {
-        let before = if block.begin.start > 0
-            && !source.as_bytes()[block.begin.start - 1].is_ascii_whitespace()
-        {
-            BreakMode::CommentLine
+        let inline = block.name == "tikz-inline";
+        if !inline {
+            let before = if block.begin.start > 0
+                && !source.as_bytes()[block.begin.start - 1].is_ascii_whitespace()
+            {
+                BreakMode::CommentLine
+            } else {
+                BreakMode::Line
+            };
+            let after = if source
+                .as_bytes()
+                .get(block.end.end)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+            {
+                BreakMode::CommentLine
+            } else {
+                BreakMode::Line
+            };
+            result.push((block.begin.start, before, true));
+            result.push((block.end.end, after, false));
+        }
+        let name = if inline {
+            source[block.begin.clone()]
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
         } else {
-            BreakMode::Line
+            block.name.as_str()
         };
-        let after = if source
-            .as_bytes()
-            .get(block.end.end)
-            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        if config.config.breaks.pgfplots_coordinates
+            && name == "addplot"
+            && let Some(points) =
+                coordinate_breaks(source, block.begin.end, block.end.start, protected)
         {
-            BreakMode::CommentLine
-        } else {
-            BreakMode::Line
-        };
-        result.push((block.begin.start, before, true));
-        result.push((block.end.end, after, false));
+            result.extend(points.into_iter().map(|pos| (pos, BreakMode::Line, true)));
+        }
+        if let Some(columns) = config.config.breaks.tikz_path_columns
+            && matches!(
+                name,
+                "draw"
+                    | "path"
+                    | "fill"
+                    | "filldraw"
+                    | "shade"
+                    | "shadedraw"
+                    | "clip"
+                    | "useasboundingbox"
+            )
+            && source[block.begin.start..block.end.end]
+                .lines()
+                .any(|line| unicode_width::UnicodeWidthStr::width(line.trim_start()) > columns)
+        {
+            statement(
+                source,
+                name,
+                block.begin.end,
+                block.end.end,
+                protected,
+                &mut Vec::new(),
+                |pos| result.push((pos, BreakMode::Line, true)),
+            );
+        }
     }
     result
 }

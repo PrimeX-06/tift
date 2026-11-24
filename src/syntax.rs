@@ -3021,10 +3021,9 @@ fn format_macro_definitions_parsed(
     options.breaks.enabled = false;
     options.whitespace.remove_trailing = false;
     options.whitespace.before_processing = false;
-    options.whitespace.preserve_blank_lines = true;
-    options.whitespace.max_blank_lines = None;
-    options.whitespace.line_ending = crate::config::LineEnding::Preserve;
-    options.whitespace.final_newline = crate::config::FinalNewline::Preserve;
+    options.whitespace.blank_lines = crate::config::BlankLines::Unlimited;
+    options.output.line_ending = crate::config::LineEnding::Preserve;
+    options.output.final_newline = crate::config::FinalNewline::Preserve;
     options.indent.preamble = true;
     let inner = crate::CompiledConfig::new(options)
         .map_err(|error| FormatError::Syntax(error.to_string()))?;
@@ -5994,24 +5993,36 @@ fn protected_ranges_with_inferred_environments(
                         pos = finish;
                         continue;
                     }
-                    if let Some(range) =
-                        crate::packages::circuits_timing::literal_data_range(source, end, name)
-                            .or_else(|| {
-                                crate::packages::tikz_diagrams::literal_data_range(
-                                    source,
-                                    end,
-                                    name,
-                                    catcode_scopes.last().is_some_and(|scope| scope.1),
-                                )
-                            })
-                            .filter(|_| {
-                                !config
-                                    .protect
-                                    .commands
-                                    .iter()
-                                    .any(|command| command == base || command == name)
-                            })
+                    let plot_table_layout =
+                        name == "addplot" && config.breaks.enabled && config.breaks.pgfplots_tables;
+                    if let Some(range) = (if name == "pgfplotstableread"
+                        && config.breaks.enabled
+                        && config.breaks.pgfplots_named_tables
                     {
+                        crate::packages::circuits_timing::table_arguments(source, end)
+                            .map(|(options, data)| options.start..data.end)
+                    } else if plot_table_layout {
+                        // The row separator in the table options is data too.
+                        crate::packages::circuits_timing::plot_table(source, end)
+                            .map(|(options, data)| options.start..data.end)
+                    } else {
+                        crate::packages::circuits_timing::literal_data_range(source, end, name)
+                    })
+                    .or_else(|| {
+                        crate::packages::tikz_diagrams::literal_data_range(
+                            source,
+                            end,
+                            name,
+                            catcode_scopes.last().is_some_and(|scope| scope.1),
+                        )
+                    })
+                    .filter(|_| {
+                        !config
+                            .protect
+                            .commands
+                            .iter()
+                            .any(|command| command == base || command == name)
+                    }) {
                         pos = range.end;
                         ranges.push(range);
                         continue;

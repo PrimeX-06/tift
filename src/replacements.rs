@@ -18,9 +18,10 @@ pub enum Scope {
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum Engine {
+pub enum MatchMode {
     #[default]
-    Rust,
+    Literal,
+    Regex,
     Enhanced,
 }
 
@@ -29,8 +30,8 @@ pub enum Engine {
 pub struct ReplacementConfig {
     pub find: String,
     pub replace: String,
-    pub regex: bool,
-    pub engine: Engine,
+    #[serde(rename = "match")]
+    pub match_mode: MatchMode,
     #[serde(rename = "stage")]
     pub when: When,
     pub scope: Scope,
@@ -43,8 +44,7 @@ impl Default for ReplacementConfig {
         Self {
             find: String::new(),
             replace: String::new(),
-            regex: false,
-            engine: Engine::Rust,
+            match_mode: MatchMode::Literal,
             when: When::Before,
             scope: Scope::Unprotected,
             enabled: true,
@@ -74,17 +74,17 @@ pub fn compile(rules: &[ReplacementConfig]) -> Result<Vec<CompiledReplacement>, 
             if rule.find.is_empty() {
                 return Err("replacement.find must not be empty".into());
             }
-            let pattern = if !rule.regex {
-                Pattern::Literal(rule.find.clone())
-            } else if rule.engine == Engine::Rust {
-                Pattern::Regex(regex::Regex::new(&rule.find).map_err(|e| e.to_string())?)
-            } else {
-                Pattern::Enhanced(
+            let pattern = match rule.match_mode {
+                MatchMode::Literal => Pattern::Literal(rule.find.clone()),
+                MatchMode::Regex => {
+                    Pattern::Regex(regex::Regex::new(&rule.find).map_err(|e| e.to_string())?)
+                }
+                MatchMode::Enhanced => Pattern::Enhanced(
                     fancy_regex::RegexBuilder::new(&rule.find)
                         .backtrack_limit(rule.backtrack_limit)
                         .build()
                         .map_err(|e| e.to_string())?,
-                )
+                ),
             };
             Ok(CompiledReplacement {
                 config: rule.clone(),

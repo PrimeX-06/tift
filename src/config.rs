@@ -63,14 +63,35 @@ pub struct Config {
     pub wrap: crate::wrap::WrapConfig,
     pub sentences: crate::wrap::SentenceConfig,
     pub whitespace: WhitespaceConfig,
+    pub comments: CommentConfig,
+    pub output: OutputConfig,
     pub breaks: BreakConfig,
     pub syntax: SyntaxConfig,
     pub protect: ProtectConfig,
     pub replacements: Vec<crate::replacements::ReplacementConfig>,
     pub files: FilesConfig,
     pub extend: Option<String>,
+    #[serde(deserialize_with = "deserialize_overrides")]
     pub overrides: Vec<toml::Table>,
     pub replacement_only: bool,
+}
+
+fn deserialize_overrides<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<toml::Table>, D::Error> {
+    let rules = Vec::<toml::Table>::deserialize(deserializer)?;
+    for (index, rule) in rules.iter().enumerate() {
+        let mut settings = rule.clone();
+        settings.remove("files");
+        if settings.contains_key("extend") || settings.contains_key("overrides") {
+            return Err(serde::de::Error::custom(format!(
+                "overrides[{index}] cannot extend configs or define nested overrides"
+            )));
+        }
+        Config::deserialize(toml::Value::Table(settings))
+            .map_err(|e| serde::de::Error::custom(format!("overrides[{index}]: {e}")))?;
+    }
+    Ok(rules)
 }
 
 /// Persistent CLI results reused by later formatter invocations.
@@ -140,6 +161,15 @@ impl CompiledConfig {
             }
         }
         validate_environment_arguments(&config)?;
+        if config
+            .breaks
+            .tikz_path_columns
+            .is_some_and(|width| !(1..=1_000_000).contains(&width))
+        {
+            return Err(ConfigError(
+                "breaks.tikz-path-columns must be between 1 and 1000000".into(),
+            ));
+        }
         crate::bibtex::validate(&config.bibtex).map_err(ConfigError)?;
         crate::argument_layout::validate(&config.arguments).map_err(ConfigError)?;
         crate::math_layout::validate(&config.math).map_err(ConfigError)?;
@@ -264,8 +294,7 @@ impl Config {
     /// settings. Automatically maintained lists stay omitted so later package
     /// support additions continue to apply to generated configurations.
     pub fn default_toml() -> Result<String, ConfigError> {
-        let mut value = toml::Value::try_from(Self::default())
-            .map_err(|error| ConfigError(error.to_string()))?;
+        let mut value = Self::default().document()?;
         let root = value
             .as_table_mut()
             .expect("serialized configuration table");
@@ -300,9 +329,11 @@ impl Config {
         }
         for (name, description) in [
             ("indent", "Indentation"),
-            ("whitespace", "Whitespace and file endings"),
+            ("whitespace", "Whitespace cleanup"),
+            ("output", "File endings"),
             ("breaks", "Structural line breaks"),
             ("wrap", "Paragraph wrapping"),
+            ("comments", "Comment layout"),
             ("sentences", "Sentence boundaries"),
             ("arguments", "Command argument layout"),
             ("alignment", "Table and equation alignment"),
@@ -331,13 +362,14 @@ impl Config {
         Self::from_value(value)
     }
 
+    pub fn document(&self) -> Result<toml::Value, ConfigError> {
+        toml::Value::try_from(self).map_err(|e| ConfigError(e.to_string()))
+    }
+
     pub fn from_value(value: toml::Value) -> Result<Self, ConfigError> {
-        let mut defaults =
-            toml::Value::try_from(Self::default()).map_err(|e| ConfigError(e.to_string()))?;
+        let mut defaults = Self::default().document()?;
         merge_values(&mut defaults, value);
-        defaults
-            .try_into()
-            .map_err(|e: toml::de::Error| ConfigError(e.to_string()))
+        Self::deserialize(defaults).map_err(|e| ConfigError(e.to_string()))
     }
 }
 
@@ -393,6 +425,10 @@ pub struct IndentConfig {
     pub style: IndentStyle,
     pub width: usize,
     pub preamble: bool,
+    pub beamer_columns: bool,
+    pub pgfplots_panels: bool,
+    pub bibliography_items: bool,
+    pub beamer_overprint: bool,
     pub maximum: Option<usize>,
     pub rules: BTreeMap<String, IndentRule>,
     pub categories: BTreeMap<String, IndentRule>,
@@ -422,6 +458,10 @@ impl Default for IndentConfig {
             style: IndentStyle::Spaces,
             width: 4,
             preamble: false,
+            beamer_columns: true,
+            pgfplots_panels: true,
+            bibliography_items: true,
+            beamer_overprint: true,
             maximum: None,
             rules,
             categories,
@@ -494,22 +534,47 @@ impl IndentConfig {
 pub struct WhitespaceConfig {
     pub remove_trailing: bool,
     pub before_processing: bool,
-    pub preserve_blank_lines: bool,
-    pub max_blank_lines: Option<usize>,
-    pub line_ending: LineEnding,
-    pub final_newline: FinalNewline,
+    pub blank_lines: BlankLines,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlankLines {
+    Unlimited,
+    #[serde(untagged)]
+    Limit(usize),
+}
+
+impl BlankLines {
+    pub(crate) fn limit(self) -> Option<usize> {
+        match self {
+            Self::Limit(limit) => Some(limit),
+            Self::Unlimited => None,
+        }
+    }
 }
 impl Default for WhitespaceConfig {
     fn default() -> Self {
         Self {
             remove_trailing: true,
             before_processing: false,
-            preserve_blank_lines: true,
-            max_blank_lines: Some(2),
-            line_ending: LineEnding::Preserve,
-            final_newline: FinalNewline::Preserve,
+            blank_lines: BlankLines::Limit(2),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct OutputConfig {
+    pub line_ending: LineEnding,
+    pub final_newline: FinalNewline,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CommentConfig {
+    pub wrap: bool,
+    pub align_trailing: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -523,8 +588,8 @@ pub enum LineEnding {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FinalNewline {
-    #[default]
     Preserve,
+    #[default]
     Always,
     Never,
 }
@@ -559,6 +624,14 @@ pub struct BoundaryRules {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BreakConfig {
     pub enabled: bool,
+    /// Expand literal drawing operations when a TikZ path exceeds this width.
+    pub tikz_path_columns: Option<usize>,
+    /// Put each PGFPlots coordinate record on a separate source line.
+    pub pgfplots_coordinates: bool,
+    /// Lay out literal inline plot tables in rows and columns.
+    pub pgfplots_tables: bool,
+    pub pgfplots_named_tables: bool,
+    pub split_cmidrules: bool,
     pub categories: BTreeMap<String, BoundaryRules>,
     pub rules: BTreeMap<String, BoundaryRules>,
 }
@@ -566,6 +639,11 @@ impl Default for BreakConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            tikz_path_columns: None,
+            pgfplots_coordinates: false,
+            pgfplots_tables: true,
+            pgfplots_named_tables: true,
+            split_cmidrules: true,
             categories: BTreeMap::new(),
             rules: BTreeMap::new(),
         }

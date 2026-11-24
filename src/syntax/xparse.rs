@@ -88,6 +88,19 @@ fn group(source: &str, cursor: &mut usize) -> Option<Range<usize>> {
 }
 
 impl Signature {
+    /// Whitespace policy for signatures that can form source columns.
+    /// Opaque readers and delimited TeX parameter text require their own layout.
+    pub(crate) fn alignment_slots(&self) -> Option<Vec<bool>> {
+        self.slots
+            .iter()
+            .map(|slot| match &slot.kind {
+                Kind::Mandatory | Kind::Optional { .. } => Some(slot.skip_space),
+                Kind::Token(token) if token == "*" => Some(false),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn boolean_slots(&self) -> u16 {
         self.slots
             .iter()

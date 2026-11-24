@@ -9,7 +9,7 @@ use std::ops::Range;
 
 const MAX_RULES: usize = 256;
 
-pub(super) struct Spec {
+pub(in crate::alignment) struct Spec {
     default: Justification,
     rules: Vec<Rule>,
     columns: usize,
@@ -472,10 +472,7 @@ fn preamble_into(
             if let Some(layout) = &mut layout {
                 layout.record(kind, start..cursor).ok_or(())?;
             }
-            result.push(CellStyle {
-                justification: Some(column.justification),
-                ..CellStyle::default()
-            });
+            result.push(column.style);
             if result.len() > MAX_COLUMNS {
                 return Err(());
             }
@@ -517,6 +514,7 @@ fn preamble_into(
                 let mut style = if matches!(kind, b'S' | b's') {
                     CellStyle {
                         justification: Some(Justification::Center),
+                        decimal: (kind == b'S').then_some(&['.', ','][..]),
                         ..CellStyle::default()
                     }
                 } else {

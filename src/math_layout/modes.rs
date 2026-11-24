@@ -178,6 +178,9 @@ impl MathModes {
                 continue;
             }
             let special = block.kind == BlockKind::Special
+                // Recovery can terminate several open math shifts at the
+                // same protected boundary. Only a paired shift owns a formula.
+                && !block.end.is_empty()
                 && matches!(
                     block.name.as_str(),
                     "inlineMath" | "displayMath" | "displayMathTeX"

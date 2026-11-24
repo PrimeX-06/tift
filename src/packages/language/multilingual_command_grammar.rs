@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, ops::Range};
 
 pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     Some(match name {
+        "IPA" => "",
         "otherlanguage" | "otherlanguage*" => "om",
         _ => return None,
     })
@@ -16,6 +17,7 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 crate::packages::argument_tables::argument_commands! {
     // babel.sty:641,819,1044,1702,2224. Language names, tags and patterns
     // are identifiers; foreign-language text continues through formatting.
+    "textipa" => ("m", "m"),
     "selectlanguage" | "babelprovide" | "babelhyphenation" => ("om", "om"),
     "foreignlanguage" | "textlang" => ("omm", "om"),
     "babeltags" => ("m", "m"),

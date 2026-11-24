@@ -23,13 +23,13 @@ pub enum Stage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct WrapConfig {
+    /// Align the body text and its continuation lines in description lists.
+    pub align_description: bool,
     /// `preserve`, `wrap`, `unwrap`, or `rewrap` (join then wrap).
     pub mode: String,
     pub columns: usize,
     #[serde(rename = "stage")]
     pub when: Stage,
-    /// Reflow consecutive comment-only lines and long trailing comments.
-    pub comments: bool,
     /// Additional control-word names allowed to begin prose lines.
     pub prose_commands: Vec<String>,
     /// Standard commands whose ordinary text argument may wrap at existing
@@ -56,10 +56,10 @@ pub struct WrapConfig {
 impl Default for WrapConfig {
     fn default() -> Self {
         Self {
+            align_description: false,
             mode: "preserve".into(),
             columns: 80,
             when: Stage::Before,
-            comments: false,
             prose_commands: Vec::new(),
             text_commands: None,
             break_chars: Vec::new(),
@@ -170,9 +170,9 @@ pub struct CompiledText {
 pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<CompiledText, String> {
     if !matches!(
         wrap.mode.as_str(),
-        "preserve" | "wrap" | "unwrap" | "rewrap"
+        "preserve" | "wrap" | "stable" | "unwrap" | "rewrap"
     ) {
-        return Err("wrap.mode must be preserve, wrap, unwrap, or rewrap".into());
+        return Err("wrap.mode must be preserve, wrap, stable, unwrap, or rewrap".into());
     }
     if wrap.columns == 0 || wrap.columns > 1_000_000 {
         return Err("wrap.columns must be between 1 and 1000000".into());
@@ -195,7 +195,7 @@ pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<Compiled
     }
     let mut text_commands = HashSet::new();
     let selected = wrap.text_commands.as_deref().unwrap_or_else(|| {
-        if matches!(wrap.mode.as_str(), "wrap" | "rewrap") {
+        if matches!(wrap.mode.as_str(), "wrap" | "stable" | "rewrap") {
             default_text_commands()
         } else {
             &[]
@@ -498,14 +498,18 @@ fn format_text_with_arguments(
             && wrap_here
             && config.config.sentences.when == Stage::Before
             && config.config.sentences.enabled);
-    let preserve_lines = wrap_active && config.config.wrap.mode == "wrap"
+    let preserve_lines = wrap_active
+        && matches!(config.config.wrap.mode.as_str(), "wrap" | "stable")
         || sentences_active
             && config.config.sentences.preserve_line_breaks
             && !(wrap_active && config.config.wrap.mode == "rewrap");
     let needs_environments = config.config.syntax.environment_pattern.is_some()
         || source.contains("\\begin")
         || source.contains("\\end");
-    let parsed = parsing.snapshot(source, needs_environments, false)?;
+    let inline_paths = (config.config.breaks.tikz_path_columns.is_some()
+        || config.config.breaks.pgfplots_coordinates)
+        && source.contains("\\tikz");
+    let parsed = parsing.snapshot(source, needs_environments || inline_paths, inline_paths)?;
     let mut opaque = parsed.protected.clone();
     let environments = if needs_environments {
         crate::syntax::environment_ranges_with_tokens(
@@ -524,6 +528,18 @@ fn format_text_with_arguments(
         std::rc::Rc::clone(&parsed.metadata),
     );
     let declared_commands = analysis.declared_commands()?;
+    if inline_paths && let Some(blocks) = &parsed.blocks {
+        opaque.extend(
+            blocks
+                .iter()
+                .filter(|block| {
+                    block.kind == crate::syntax::BlockKind::TikzPath
+                        && !block.begin.is_empty()
+                        && matches!(block.name.as_str(), "tikz-inline" | "tikz-scope")
+                })
+                .map(|block| block.begin.start..block.end.end),
+        );
+    }
     add_inline_atoms(
         source,
         &mut opaque,
@@ -659,7 +675,7 @@ fn format_text_with_arguments(
             continue;
         }
         if let Some(prefix_len) = comment {
-            if !wrap_active || !config.config.wrap.comments || body[prefix_len..].trim().is_empty()
+            if !wrap_active || !config.config.comments.wrap || body[prefix_len..].trim().is_empty()
             {
                 flush(
                     &mut paragraph,
@@ -710,7 +726,7 @@ fn format_text_with_arguments(
             continue;
         }
         if wrap_active
-            && config.config.wrap.comments
+            && config.config.comments.wrap
             && let Some(comment_start) = comment_start(source, body_start..content_end, &opaque)
         {
             let prefix_len =
@@ -934,7 +950,10 @@ fn format_text_with_arguments(
     )?;
     if arguments
         && wrap_active
-        && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap")
+        && matches!(
+            config.config.wrap.mode.as_str(),
+            "wrap" | "stable" | "rewrap"
+        )
         && !config.text.text_commands.is_empty()
     {
         let (formatted, unblocked) = format_text_arguments(&output, config, parsing)?;
@@ -1035,18 +1054,19 @@ fn paragraph_boundary(text: &str) -> Option<Cow<'static, str>> {
     })
 }
 
-/// Standard signatures whose final argument is ordinary LaTeX text. The
-/// selector is deliberately closed: configuration cannot turn a filename,
-/// replacement body or an unfamiliar command argument into prose.
-fn text_argument_signature(name: &str) -> Option<(usize, usize, Option<usize>)> {
-    match name {
-        "caption" | "caption*" | "footnote" | "footnotetext" => Some((1, 0, Some(0))),
-        "captionof" | "captionof*" => Some((2, 1, Some(1))),
-        "textcolor" => Some((2, 1, Some(0))),
+/// Each segment ends with a printable, braced argument. Previous slots
+/// describe its optional short entry, colour, or float type.
+fn text_argument_signature(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "caption" | "caption*" | "footnote" | "footnotetext" => &["om"],
+        "captionof" | "captionof*" => &["mom"],
+        "textcolor" => &["omm"],
+        "bicaption" | "bisubcaption" | "subbicaption" => &["om", "om"],
+        "bicaption*" | "bisubcaption*" | "subbicaption*" => &["m", "m"],
         "emph" | "textbf" | "textit" | "textsf" | "textrm" | "textsc" | "textnormal" | "textup"
-        | "textsl" | "underline" => Some((1, 0, None)),
-        _ => None,
-    }
+        | "textsl" | "underline" => &["m"],
+        _ => return None,
+    })
 }
 
 fn default_text_commands() -> &'static [String] {
@@ -1057,6 +1077,12 @@ fn default_text_commands() -> &'static [String] {
             "caption*",
             "captionof",
             "captionof*",
+            "bicaption",
+            "bicaption*",
+            "bisubcaption",
+            "bisubcaption*",
+            "subbicaption",
+            "subbicaption*",
             "footnote",
             "footnotetext",
             "emph",
@@ -1079,35 +1105,39 @@ fn default_text_commands() -> &'static [String] {
 fn standard_arguments(
     source: &str,
     mut cursor: usize,
-    signature: (usize, usize, Option<usize>),
+    name: &str,
     protected: &[Range<usize>],
-) -> Option<(Range<usize>, usize)> {
-    let (count, selected, optional_before) = signature;
-    let mut optional = false;
-    let mut body = None;
-    for argument in 0..count {
-        cursor = crate::trivia::skip(source, cursor);
-        while source.as_bytes().get(cursor) == Some(&b'[') {
-            if optional
-                || optional_before != Some(argument)
-                || containing(cursor, protected).is_some()
+) -> Option<Vec<Range<usize>>> {
+    let mut segments = text_argument_signature(name)?;
+    if matches!(segments, ["om", "om"]) {
+        let star = crate::trivia::skip(source, cursor);
+        if source.as_bytes().get(star) == Some(&b'*') {
+            cursor = star + 1;
+            segments = &["m", "m"];
+        }
+    }
+    let mut bodies = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut start = cursor;
+        for slot in segment.bytes() {
+            start = crate::trivia::skip(source, cursor);
+            let (open, close) = if slot == b'o' {
+                (b'[', b']')
+            } else {
+                (b'{', b'}')
+            };
+            if slot == b'o' && source.as_bytes().get(start) != Some(&open) {
+                continue;
+            }
+            if source.as_bytes().get(start) != Some(&open) || containing(start, protected).is_some()
             {
                 return None;
             }
-            cursor = balanced_end(source, cursor, b'[', b']', protected)?;
-            optional = true;
-            cursor = crate::trivia::skip(source, cursor);
+            cursor = balanced_end(source, start, open, close, protected)?;
         }
-        if source.as_bytes().get(cursor) != Some(&b'{') || containing(cursor, protected).is_some() {
-            return None;
-        }
-        let end = balanced_end(source, cursor, b'{', b'}', protected)?;
-        if argument == selected {
-            body = Some(cursor + 1..end - 1);
-        }
-        cursor = end;
+        bodies.push(start + 1..cursor - 1);
     }
-    Some((body?, cursor))
+    Some(bodies)
 }
 
 fn safe_text_body(
@@ -1296,41 +1326,42 @@ fn format_text_arguments(
                 {
                     continue;
                 }
-                let signature = text_argument_signature(name).expect("validated text command");
-                let Some((body, end)) = standard_arguments(source, cursor, signature, &protected)
-                else {
+                let Some(bodies) = standard_arguments(source, cursor, name, &protected) else {
                     continue;
                 };
-                cursor = end;
-                if intersects(body.clone(), &protected)
-                    || !safe_text_body(source, body.clone(), &declared, config)
-                {
-                    continue;
-                }
-                let pending = &source[copied..body.start];
-                let header = if let Some(newline) = pending.rfind('\n') {
-                    Cow::Borrowed(&pending[newline + 1..])
-                } else {
-                    Cow::Owned(format!(
-                        "{}{}",
-                        output.rsplit('\n').next().unwrap_or(""),
-                        pending
-                    ))
-                };
-                let continuation = argument_continuation(source, body.start, blocks, config);
-                let replacement = wrap_text_argument(
-                    source,
-                    body.clone(),
-                    &header,
-                    &continuation,
-                    config,
-                    &declared,
-                );
-                if replacement != source[body.clone()] {
-                    unblocked |= source[body.clone()].contains('\n') && !replacement.contains('\n');
-                    output.push_str(&source[copied..body.start]);
-                    output.push_str(&replacement);
-                    copied = body.end;
+                for body in bodies {
+                    cursor = body.end + 1;
+                    if intersects(body.clone(), &protected)
+                        || !safe_text_body(source, body.clone(), &declared, config)
+                    {
+                        continue;
+                    }
+                    let pending = &source[copied..body.start];
+                    let header = if let Some(newline) = pending.rfind('\n') {
+                        Cow::Borrowed(&pending[newline + 1..])
+                    } else {
+                        Cow::Owned(format!(
+                            "{}{}",
+                            output.rsplit('\n').next().unwrap_or(""),
+                            pending
+                        ))
+                    };
+                    let continuation = argument_continuation(source, body.start, blocks, config);
+                    let replacement = wrap_text_argument(
+                        source,
+                        body.clone(),
+                        &header,
+                        &continuation,
+                        config,
+                        &declared,
+                    );
+                    if replacement != source[body.clone()] {
+                        unblocked |=
+                            source[body.clone()].contains('\n') && !replacement.contains('\n');
+                        output.push_str(&source[copied..body.start]);
+                        output.push_str(&replacement);
+                        copied = body.end;
+                    }
                 }
             }
             b'$' => {
@@ -1656,7 +1687,8 @@ fn flush(
     } else {
         std::iter::once(0..canonical.text.len()).collect()
     };
-    let preserve_lines = wrap_active && config.config.wrap.mode == "wrap"
+    let preserve_lines = wrap_active
+        && matches!(config.config.wrap.mode.as_str(), "wrap" | "stable")
         || sentences_active
             && !paragraph.comment
             && !sentence_excluded
@@ -1708,7 +1740,11 @@ fn flush(
             } else {
                 &config.config.wrap.separator
             },
-            wrap_active && matches!(config.config.wrap.mode.as_str(), "wrap" | "rewrap"),
+            wrap_active
+                && matches!(
+                    config.config.wrap.mode.as_str(),
+                    "wrap" | "stable" | "rewrap"
+                ),
             preserve_lines,
             paragraph.comment,
             config,
@@ -2022,7 +2058,7 @@ fn emit_lines(
             .iter()
             .take_while(|boundary| boundary.after < sentence.end)
         {
-            emit_layout(
+            let carry = emit_layout(
                 text,
                 start..boundary.before,
                 current_prefix,
@@ -2033,6 +2069,17 @@ fn emit_lines(
                 config,
                 output,
             )?;
+            if wrap
+                && config.config.wrap.mode == "stable"
+                && !boundary.newline.contains('%')
+                && let Some((source_start, output_start)) = carry
+            {
+                // Refill only the new continuation with the following source line.
+                output.truncate(output_start);
+                start = source_start;
+                current_prefix = continuation;
+                continue;
+            }
             output.push_str(&boundary.newline);
             start = boundary.after;
             current_prefix = continuation;
@@ -2049,6 +2096,7 @@ fn emit_lines(
         config,
         output,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2062,11 +2110,11 @@ fn emit_layout(
     comment: bool,
     config: &crate::CompiledConfig,
     output: &mut String,
-) -> Result<(), crate::FormatError> {
+) -> Result<Option<(usize, usize)>, crate::FormatError> {
     output.push_str(prefix);
     if !wrap {
         output.push_str(&text.text[sentence]);
-        return Ok(());
+        return Ok(None);
     }
     let columns = config.config.wrap.columns;
     let tab_width = config.config.indent.width;
@@ -2075,6 +2123,7 @@ fn emit_layout(
     let continuation_width = display_width(continuation, 0, tab_width);
     let mut line_has_text = false;
     let mut previous: Option<Atom> = None;
+    let mut carry = None;
     let mut error = None;
     visit_atoms(text, sentence, &config.text.break_chars, |atom| {
         if error.is_some() {
@@ -2130,6 +2179,7 @@ fn emit_layout(
             } else {
                 output.push_str(newline);
             }
+            carry = Some((atom.range.start, output.len()));
             output.push_str(continuation);
             width = continuation_width;
             value_width = display_width(value, width, tab_width);
@@ -2153,6 +2203,7 @@ fn emit_layout(
                         output.push('%');
                     }
                     output.push_str(newline.trim_start_matches('%'));
+                    carry = None;
                     output.push_str(continuation);
                     width = continuation_width;
                     grapheme_width = display_width(grapheme, width, tab_width);
@@ -2168,10 +2219,10 @@ fn emit_layout(
         line_has_text = true;
         previous = Some(atom);
     });
-    error.map_or(Ok(()), Err)
+    error.map_or(Ok(carry), Err)
 }
 
-fn display_width(text: &str, start: usize, tab_width: usize) -> usize {
+pub(crate) fn display_width(text: &str, start: usize, tab_width: usize) -> usize {
     if text.bytes().all(|byte| (32..127).contains(&byte)) {
         return text.len();
     }
@@ -2303,7 +2354,7 @@ fn contains_definition(body: &str) -> bool {
     .any(|command| body.contains(command))
 }
 
-fn allows_prose_start(body: &str, config: &CompiledText) -> Result<bool, String> {
+pub(crate) fn allows_prose_start(body: &str, config: &CompiledText) -> Result<bool, String> {
     if !body.starts_with('\\') {
         return Ok(true);
     }
@@ -2385,6 +2436,7 @@ fn is_non_prose_environment(name: &str, config: &crate::CompiledConfig) -> bool 
             name.trim_end_matches('*'),
             "math"
                 | "displaymath"
+                | "IPA"
                 | "equation"
                 | "align"
                 | "alignat"
@@ -2452,6 +2504,59 @@ fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
 
 fn has_comment(source: &str, range: Range<usize>, opaque: &[Range<usize>]) -> bool {
     comment_start(source, range, opaque).is_some()
+}
+
+pub(crate) fn align_trailing_comments(
+    source: &str,
+    config: &crate::CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+) -> Result<String, crate::FormatError> {
+    if !source.contains('%') {
+        return Ok(source.into());
+    }
+    let parsed = parsing.snapshot(source, true, false)?;
+    let mut groups = Vec::new();
+    for token in parsed.tokens.as_deref().expect("comment tokens") {
+        if token.kind != crate::syntax::TokenKind::Comment {
+            continue;
+        }
+        let marker = token.span.start;
+        let line = source[..marker].rfind('\n').map_or(0, |at| at + 1);
+        let prefix = &source[line..marker];
+        let code = prefix.trim_end_matches([' ', '\t']);
+        let gap = line + code.len()..marker;
+        if code.is_empty()
+            || gap.is_empty()
+            || crate::syntax::is_escaped(source, gap.start)
+            || crate::syntax::overlaps(&gap, &parsed.protected)
+            || source[token.span.clone()]
+                .trim_start_matches('%')
+                .trim()
+                .is_empty()
+        {
+            continue;
+        }
+        let indent = &code[..code.len() - code.trim_start_matches([' ', '\t']).len()];
+        let next_line = source[marker..]
+            .find('\n')
+            .map_or(source.len(), |n| marker + n + 1);
+        let width = display_width(code, 0, config.config.indent.width);
+        groups.push((line, next_line, indent, gap, width));
+    }
+    let mut edits = Vec::new();
+    for group in groups.chunk_by(|a, b| a.1 == b.0 && a.2 == b.2) {
+        if group.len() < 2 {
+            continue;
+        }
+        let target = group.iter().map(|v| v.4).max().unwrap() + 1;
+        for (_, _, _, gap, width) in group {
+            let pad = target - width;
+            if gap.len() != pad || source[gap.clone()].contains('\t') {
+                edits.push((gap.clone(), " ".repeat(pad)));
+            }
+        }
+    }
+    crate::layout::apply_edits(source, edits)
 }
 
 fn ends_control_word(text: &str) -> bool {
@@ -2583,6 +2688,7 @@ fn add_inline_atoms(
     let protected = ranges.clone();
     let mut position = 0;
     let mut optional_argument = false;
+    let mut text_openings = HashSet::new();
     while position < source.len() {
         if let Some(range) = containing(position, &protected) {
             position = range.end;
@@ -2616,12 +2722,17 @@ fn add_inline_atoms(
                     if expose_text_arguments
                         && !declared_commands.contains(base)
                         && !config.syntax.commands.contains_key(base)
-                        && let Some(signature) = text_argument_signature(name)
-                        && let Some((body, _)) =
-                            standard_arguments(source, end, signature, &protected)
+                        && let Some(bodies) = standard_arguments(source, end, name, &protected)
                     {
-                        ranges.push(start..body.start);
-                        position = body.start;
+                        let mut prefix = start;
+                        for body in &bodies {
+                            ranges.push(prefix..body.start);
+                            if prefix != start {
+                                text_openings.insert(body.start - 1);
+                            }
+                            prefix = body.end;
+                        }
+                        position = bodies[0].start;
                         optional_argument = false;
                         continue;
                     }
@@ -2646,6 +2757,10 @@ fn add_inline_atoms(
                     position += 1;
                     optional_argument = false;
                 }
+            }
+            b'{' if text_openings.remove(&position) => {
+                position += 1;
+                optional_argument = false;
             }
             b'{' | b'[' if source.as_bytes()[position] == b'{' || optional_argument => {
                 let open = source.as_bytes()[position];

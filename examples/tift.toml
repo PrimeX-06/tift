@@ -3,6 +3,10 @@
 style = "spaces"
 width = 4
 preamble = false
+beamer-columns = true # Indent the body of a standalone column command in Beamer columns.
+pgfplots-panels = true # Indent each panel after a standalone \nextgroupplot.
+bibliography-items = true # Indent existing text lines after a standalone \bibitem.
+beamer-overprint = true # Indent overlay declarations inside overprint.
 maximum = 40
 
 [indent.rules.document]
@@ -21,10 +25,15 @@ width = 4 # Each recognized \foreach loop contributes one level.
 # Complete headers and column templates stay separate from measured cells.
 [alignment]
 enabled = true
-width = "graphemes" # "display" measures Unicode terminal columns.
+width = "display" # Measure Unicode display columns. "graphemes" counts grapheme clusters.
 spaces-before = 1
 spaces-after = 1
 align-row-breaks = true
+tikzcd-arrows = false # Give multiple outgoing arrows of a diagram node separate source lines.
+align-decimals = true # Align the mantissas in S and D columns, including 1.2(3) and -4.56e-7.
+align-equation-labels = true # Align trailing \label commands in multi-equation displays within wrap.columns.
+align-by-section = false # Measure columns independently across midrule and longtable section markers.
+# row-wrap-columns = 88 # Fold wide table rows at outer cell boundaries. Zero disables it per environment.
 # The default row regex also recognizes \tabularnewline and its modifiers.
 align-last-row-break = true
 align-content-after-row-break = false
@@ -51,16 +60,20 @@ spaces-after = 1
 # enabled = false
 
 [wrap]
+align-description = false # Align description bodies and hanging lines. Long labels get their own line.
 mode = "preserve" # "wrap" folds long lines; "rewrap" joins then folds; "unwrap" joins prose.
+# "stable" carries overflow onto the next prose line, preserving later line breaks.
 columns = 88
 stage = "after"
-comments = false
 collapse-spaces = true
 long-words = "overflow" # "break" allows grapheme-safe splitting of long plain words.
 # prose-commands = ['mytext'] # Permit custom commands at prose line starts.
 # text-commands = ['caption', 'footnote'] # Limit safe standard text parameters; [] disables them.
 # break-chars = ['-'] # Width-triggered tight breaks retain TeX spacing using %.
-# comments = true # Also reflow long trailing comments.
+
+[comments]
+wrap = false # Reflow comments during prose wrapping.
+align-trailing = false # Align spaced end-of-line comments at the same indentation.
 
 # Arguments expand only with an active width, or explicit mode = "expand".
 # "wrap" and "rewrap" supply wrap.columns when columns is omitted.
@@ -68,7 +81,12 @@ long-words = "overflow" # "break" allows grapheme-safe splitting of long plain w
 mode = "auto"
 split-commas = true
 split-equals = false
-align-equals = false # Align assignments in multiline option lists.
+align-consecutive = false # Align argument columns in adjacent standalone calls of the same command.
+align-equals = true # Align assignments in multiline option lists.
+listings-literate = true # Put each literal substitution rule on its own line.
+# Standalone glossary declarations expand at columns (or wrap.columns).
+# Hyphenation lists also expand at four words, font shapes at two font mappings.
+graphics-paths = "auto" # Expand four or more directories, multiline lists or over-width lines. Also accepts "expand" or "preserve".
 foreach-lists = "preserve" # "expand" uses one record per line; "auto" checks columns or wrap.columns.
 # columns = 88
 # [arguments.rules.customkeys]
@@ -87,13 +105,19 @@ indent = ""
 [whitespace]
 remove-trailing = true
 before-processing = false
-preserve-blank-lines = true
-max-blank-lines = 2
+blank-lines = 2 # Maximum consecutive blank lines. Use 0 to remove them or "unlimited" to keep all.
+
+[output]
 line-ending = "preserve"
-final-newline = "preserve"
+final-newline = "always"
 
 [breaks]
 enabled = true # Environment/loop boundaries, table rules and eligible captions receive lines.
+# tikz-path-columns = 88 # Split long drawing paths before line segments, curves and nodes.
+split-cmidrules = true # Put consecutive standalone booktabs cmidrule commands on separate lines.
+pgfplots-coordinates = false # Put each literal coordinate on its own line in addplot and addplot3.
+pgfplots-tables = true # Align whitespace-separated inline addplot table records.
+pgfplots-named-tables = true # Align existing rows in standalone pgfplotstableread declarations.
 
 # Preserve selected boundaries instead of using the environment defaults:
 # [breaks.rules.quote]
@@ -170,9 +194,16 @@ indent = false
 # nested = true
 
 [bibtex]
+separate-entries = true # Leave one blank line between regular bibliography entries.
+compact-strings = false # Group short literal @string assignments within wrap.columns.
+format-filecontents = true # Format .bib payloads in filecontents and filecontents*.
 normalize = true # Normalize field assignments.
 name-case = "preserve" # "lower" or "upper" selects uniform type and field spelling.
 align-fields = true # Applied during normalization.
+# name-list-columns = 88 # Put each author or editor on a separate line in long literal lists.
+# related-columns = 64 # Expand an over-width literal list of related citation keys.
+# keyword-columns = 88 # Wrap literal keywords at outer commas when the field exceeds this width.
+# concat-columns = 88 # Wrap long BibTeX expressions before each top-level #.
 value-delimiters = "preserve" # "preserve", "braces", or "quotes".
 field-order = [] # Keep source order; ["canonical"], ["alphabetical"], or field names.
 sort = false # Enable to order movable entry groups by citation key.
@@ -205,6 +236,7 @@ wrap = "break" # break, preserve, or single-line; applies to single-formula disp
 [trees]
 mode = "preserve" # "expand" indents subtrees; "auto" expands trees exceeding the width.
 forest = true
+dirtree = true # Indent existing directory records by their explicit numeric level.
 qtree = true
 # columns = 80 # Omit to inherit wrap.columns.
 
@@ -220,7 +252,7 @@ inactive-branches = true
 [[replacements]]
 find = 'TODO'
 replace = 'TODO'
-regex = false
+match = "literal"
 stage = "before"
 scope = "unprotected"
 enabled = false
@@ -228,8 +260,7 @@ enabled = false
 [[replacements]]
 find = '(?<=\b)colour\b'
 replace = 'color'
-regex = true
-engine = "enhanced"
+match = "enhanced" # Use "regex" for Rust regular expressions.
 stage = "after"
 scope = "unprotected"
 count = 1

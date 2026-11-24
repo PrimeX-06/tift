@@ -205,6 +205,47 @@ fn keyword_end(source: &str, cursor: usize, keyword: &str) -> Option<usize> {
     .then_some(end)
 }
 
+/// Start of a literal data source after an addplot or addplot3 header.
+fn plot_data_start(source: &str, command_end: usize) -> Option<usize> {
+    let mut cursor = skip(source, command_end);
+    for suffix in b"3+" {
+        if source.as_bytes().get(cursor) == Some(suffix) {
+            cursor = skip(source, cursor + 1);
+        }
+    }
+    cursor = skip(source, option_end(source, cursor)?);
+    if let Some(end) = keyword_end(source, cursor, "plot") {
+        cursor = skip(source, option_end(source, end)?);
+    }
+    Some(cursor)
+}
+
+pub(crate) fn coordinate_list_open(source: &str, command_end: usize) -> Option<usize> {
+    let start = plot_data_start(source, command_end)?;
+    let open = skip(source, keyword_end(source, start, "coordinates")?);
+    (source.as_bytes().get(open) == Some(&b'{')).then_some(open)
+}
+
+/// The local table options and the literal data group following them.
+pub(crate) fn plot_table(source: &str, command_end: usize) -> Option<(Range<usize>, Range<usize>)> {
+    let keyword = plot_data_start(source, command_end)?;
+    let start = skip(source, keyword_end(source, keyword, "table")?);
+    table_arguments(source, start)
+}
+
+pub(crate) fn table_arguments(
+    source: &str,
+    command_end: usize,
+) -> Option<(Range<usize>, Range<usize>)> {
+    let start = skip(source, command_end);
+    let end = option_end(source, start)?;
+    let open = skip(source, end);
+    Some((
+        start..end,
+        open..syntax::balanced_end(source, open, b'{', b'}')?,
+    ))
+}
+
 /// Physical-line table records and compact timing DSL belong to their reader.
 /// Only literal, balanced invocations are recognized. The caller checks source
 /// bindings and configuration before applying package grammar.
@@ -220,19 +261,7 @@ pub(crate) fn literal_data_range(
     match name {
         "texttiming" | "pgfplotstableread" => cursor = option_end(source, cursor)?,
         "addplot" => {
-            // The digit is a token suffix, since TeX control words use letters.
-            if source.as_bytes().get(cursor) == Some(&b'3') {
-                cursor = skip(source, cursor + 1);
-            }
-            if source.as_bytes().get(cursor) == Some(&b'+') {
-                cursor = skip(source, cursor + 1);
-            }
-            cursor = skip(source, option_end(source, cursor)?);
-            if let Some(end) = keyword_end(source, cursor, "plot") {
-                cursor = skip(source, option_end(source, end)?);
-            }
-            cursor = keyword_end(source, cursor, "table")?;
-            cursor = option_end(source, cursor)?;
+            return plot_table(source, command_end).map(|(_, data)| data);
         }
         _ => return None,
     }

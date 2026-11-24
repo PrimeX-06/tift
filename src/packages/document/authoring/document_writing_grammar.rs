@@ -52,6 +52,16 @@ commands! {
     "etocsetnexttocdepth" => ("m", "m"),
     "etocsetstyle" => ("mmmmm", "mmmmm"),
     "localtableofcontents" | "locallistoffigures" | "locallistoftables" => ("", ""),
+    // minitoc stores per-list titles, font declarations, and layout settings.
+    "minitoc" | "dominitoc" => ("o", "o"),
+    "mtcsettitle" | "mtcsettitlefont" | "mtcsetpagenumbers" | "mtcsetrules"
+        | "mtcsetdepth" | "mtcsetoffset" => ("mm", "mm"),
+    "mtcsetfont" | "mtcsetformat" | "mtcsetfeature" => ("mmm", "mmm"),
+    "immediateaddtocontents" => ("mm", "mm"),
+    // Graphics driver options and the conversion command are stored data.
+    "bmpsizesetup" | "epstopdfsetup" => ("m", "m"),
+    "epstopdfDeclareGraphicsRule" => ("mmmm", "mmmm"),
+    "bicaptionsetup" => ("somm", "somm"),
     // tocloft.sty entry names and dimension values are layout metadata.
     "cftsetindents" => ("mmm", "mmm"),
     "cftsetpnumwidth" | "cftsetrmarg" => ("m", "m"),

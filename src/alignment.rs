@@ -17,6 +17,7 @@ use crate::{CompiledConfig, FormatError};
 
 #[path = "column_spec.rs"]
 mod column_spec;
+mod equation_labels;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -28,6 +29,7 @@ pub enum ColumnSpecLayout {
 }
 
 pub(crate) use column_spec::format_preambles;
+pub(crate) use column_spec::parts as comma_parts;
 
 const DEFAULT_ENVIRONMENTS: &[&str] = &[
     "tabu",
@@ -99,8 +101,8 @@ const DEFAULT_ROW_BREAK: &str = r"\\\\\*?|\\tabularnewline\*?";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Width {
-    #[default]
     Graphemes,
+    #[default]
     Display,
 }
 
@@ -154,6 +156,13 @@ pub struct AlignmentConfig {
     pub spaces_after_row_break: usize,
     pub format_children: bool,
     pub multicolumn: bool,
+    pub align_decimals: bool,
+    pub align_equation_labels: bool,
+    pub align_by_section: bool,
+    /// Expand multiple arrows attached to one tikz-cd node.
+    pub tikzcd_arrows: bool,
+    /// Fold table rows wider than this many source columns. Zero disables folding.
+    pub row_wrap_columns: Option<usize>,
     pub column_spec: ColumnSpecLayout,
     pub short_rows: ShortRows,
     pub justification: Justification,
@@ -171,7 +180,7 @@ impl Default for AlignmentConfig {
         let mut seen = std::collections::HashSet::new();
         Self {
             enabled: true,
-            width: Width::Graphemes,
+            width: Width::Display,
             environments: DEFAULT_ENVIRONMENTS
                 .iter()
                 .copied()
@@ -189,11 +198,16 @@ impl Default for AlignmentConfig {
             spaces_after: 1,
             spaces_before_row_break: 1,
             align_double_backslash: true,
-            align_final_double_backslash: false,
+            align_final_double_backslash: true,
             align_content_after_row_break: false,
             spaces_after_row_break: 1,
             format_children: true,
-            multicolumn: false,
+            multicolumn: true,
+            align_decimals: true,
+            align_equation_labels: true,
+            align_by_section: false,
+            tikzcd_arrows: false,
+            row_wrap_columns: None,
             column_spec: ColumnSpecLayout::Preserve,
             short_rows: ShortRows::Align,
             justification: Justification::Columns,
@@ -230,6 +244,11 @@ pub struct AlignmentRule {
     pub spaces_after_row_break: Option<usize>,
     pub format_children: Option<bool>,
     pub multicolumn: Option<bool>,
+    pub align_decimals: Option<bool>,
+    pub align_equation_labels: Option<bool>,
+    pub align_by_section: Option<bool>,
+    pub tikzcd_arrows: Option<bool>,
+    pub row_wrap_columns: Option<usize>,
     pub column_spec: Option<ColumnSpecLayout>,
     pub short_rows: Option<ShortRows>,
     pub justification: Option<Justification>,
@@ -272,6 +291,14 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
             rules.insert(name.clone(), Arc::clone(&default));
         }
     }
+    // These displays normally have no source-column layout of their own.
+    if config.align_equation_labels
+        && config.environments == AlignmentConfig::default().environments
+    {
+        for name in equation_labels::ADDITIONAL_ENVIRONMENTS {
+            rules.insert((*name).into(), Arc::clone(&default));
+        }
+    }
     for (name, rule) in &config.rules {
         let mut settings = rules
             .get(name)
@@ -295,6 +322,10 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
             spaces_after_row_break,
             format_children,
             multicolumn,
+            align_decimals,
+            align_equation_labels,
+            align_by_section,
+            tikzcd_arrows,
             column_spec,
             short_rows,
             justification,
@@ -307,6 +338,9 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
         if let Some(group) = rule.delimiter_group {
             settings.delimiter_group = Some(group);
         }
+        if rule.row_wrap_columns.is_some() {
+            settings.row_wrap_columns = rule.row_wrap_columns;
+        }
         if let Some(group) = rule.row_break_group {
             settings.row_break_group = Some(group);
         }
@@ -316,6 +350,11 @@ pub fn compile(config: &AlignmentConfig) -> Result<CompiledAlignment, String> {
 }
 
 fn compile_rule(settings: AlignmentConfig, name: &str) -> Result<CompiledRule, String> {
+    if settings.row_wrap_columns.is_some_and(|n| n > 1_000_000) {
+        return Err(format!(
+            "alignment {name:?}: row-wrap-columns exceeds 1000000"
+        ));
+    }
     if settings.delimiter_justification == Justification::Columns {
         return Err(format!(
             "alignment {name:?}: delimiter-justification must be left, right, or center"
@@ -556,7 +595,9 @@ fn format_alignment_with_context(
     {
         return Ok(source.into());
     }
-    let structure_needed = advanced || matrix_command || tikz_matrix || source.contains('[');
+    let has_code_after = source.contains(r"\CodeAfter");
+    let structure_needed =
+        advanced || matrix_command || tikz_matrix || source.contains('[') || has_code_after;
     let parsed = parsing.snapshot(source, true, structure_needed)?;
     let protected = &parsed.protected;
     let analysis = crate::source_analysis::SourceAnalysis::with_memo(
@@ -565,6 +606,24 @@ fn format_alignment_with_context(
         protected,
         std::rc::Rc::clone(&parsed.metadata),
     );
+    let mut data_ends = std::collections::HashMap::new();
+    if has_code_after {
+        let structure = parsed.blocks.as_deref().expect("parsed structure");
+        for (marker, parent) in
+            crate::package_tables::code_after_markers(structure, &config.config, &analysis)?
+        {
+            let pos = structure[marker].begin.start;
+            let line = source[..pos].rfind('\n').map_or(0, |i| i + 1);
+            let end = if source[line..pos].trim_matches([' ', '\t']).is_empty() {
+                line
+            } else {
+                pos
+            };
+            data_ends
+                .entry(structure[parent].begin.start)
+                .or_insert(end);
+        }
+    }
     let cached_tokens = parsed.tokens.as_deref().expect("parsed tokens");
     let declared_column_types = if config
         .alignment
@@ -583,10 +642,15 @@ fn format_alignment_with_context(
         &config.config,
     )?;
     let known_package_environment = crate::packages::is_alignment_environment;
-    let declared_defaults = if environments
-        .iter()
-        .any(|environment| known_package_environment(&environment.name))
-    {
+    let declared_defaults = if environments.iter().any(|environment| {
+        known_package_environment(&environment.name)
+            || equation_labels::environment(&environment.name)
+                && config
+                    .alignment
+                    .rules
+                    .get(&environment.name)
+                    .is_some_and(|r| r.settings.align_equation_labels)
+    }) {
         analysis.declared_environments()?
     } else {
         Default::default()
@@ -814,6 +878,7 @@ fn format_alignment_with_context(
         stack.push(index);
     }
     let mut rendered = vec![String::new(); blocks.len()];
+    let fold_newline = std::cell::OnceCell::new();
     for index in (0..blocks.len()).rev() {
         let block = &blocks[index];
         let rule = &config.alignment.rules[&block.name];
@@ -880,13 +945,32 @@ fn format_alignment_with_context(
             None
         };
         let rule = diagram_rule.as_ref().unwrap_or(rule);
-        let rows = split_rows(
-            source,
-            content_start..block.body.end,
-            rule,
-            &opaque,
-            &block.name,
-        )?;
+        let label_layout = (rule.settings.align_equation_labels
+            && block.environment
+            && equation_labels::supports_header(
+                &block.name,
+                &source[block.body.start..content_start],
+            )
+            && !declared_defaults.contains(&block.name)
+            && !config
+                .config
+                .syntax
+                .environment_arguments
+                .contains_key(&block.name)
+            && source[content_start..block.body.end].contains(r"\label")
+            && !config.config.syntax.commands.contains_key("label")
+            && !analysis.declared_commands()?.contains("label"))
+        .then_some(equation_labels::Layout {
+            limit: config.config.wrap.columns,
+            opaque: &opaque,
+        });
+        let labels_only = equation_labels::ADDITIONAL_ENVIRONMENTS.contains(&block.name.as_str())
+            && !config.config.alignment.environments.contains(&block.name)
+            && !config.config.alignment.rules.contains_key(&block.name);
+        if labels_only && label_layout.is_none() {
+            rendered[index] = apply_edits(source, block.body.clone(), &children);
+            continue;
+        }
         let columns = if rule.settings.justification == Justification::Columns
             && block.environment
             && !declared_defaults.contains(&block.name)
@@ -905,7 +989,71 @@ fn format_alignment_with_context(
         } else {
             None
         };
-        let formatted = format_rows(
+        let diagram_arrows = block.name == "tikzcd"
+            && rule.settings.tikzcd_arrows
+            && !declared_defaults.contains(&block.name)
+            && !config
+                .config
+                .syntax
+                .environment_arguments
+                .contains_key(&block.name)
+            && !["arrow", "ar"]
+                .iter()
+                .any(|n| config.config.syntax.commands.contains_key(*n));
+        let fold = rule
+            .settings
+            .row_wrap_columns
+            .filter(|&n| n > 0)
+            .filter(|_| {
+                block.environment
+                    && !declared_defaults.contains(&block.name)
+                    && (crate::package_tables::is_table(&block.name)
+                        || (block.name.contains("NiceArray")
+                            && crate::package_environments::column_spec_slot(&block.name)
+                                .is_some())
+                        || block.name == "spreadtab"
+                        || config
+                            .config
+                            .alignment
+                            .rules
+                            .get(&block.name)
+                            .is_some_and(|rule| rule.row_wrap_columns.is_some()))
+            })
+            .or_else(|| diagram_arrows.then_some(usize::MAX))
+            .map(|limit| RowFold {
+                diagram_arrows,
+                limit,
+                environment_indent: source[..block.begin]
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| matches!(c, ' ' | '\t'))
+                    .collect(),
+                unit: config.config.indent.unit("environment", &block.name),
+                newline: fold_newline.get_or_init(|| {
+                    if source.contains("\r\n") {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    }
+                }),
+            });
+        let data_end = data_ends
+            .get(&block.begin)
+            .copied()
+            .unwrap_or(block.body.end)
+            .clamp(content_start, block.body.end);
+        let rows = split_rows(
+            source,
+            content_start..data_end,
+            rule,
+            &opaque,
+            &block.name,
+            fold.is_some(),
+            label_layout.is_some(),
+        )?;
+        let mut formatted = format_rows(
             source,
             rows,
             rule,
@@ -916,9 +1064,15 @@ fn format_alignment_with_context(
                 tab_width: config.config.indent.width,
                 column_spec: columns.as_ref(),
                 column_environment: block.environment.then_some(block.name.as_str()),
+                label_layout,
                 declared_column_types: &declared_column_types,
+                fold: fold.as_ref(),
+                protected,
             },
         )?;
+        if data_end < block.body.end {
+            formatted.push_str(&edited_source(source, data_end..block.body.end, &children));
+        }
         let formatted = if let Some(indent) = &block.markup_indent {
             indent_markup_body(&formatted, indent, config)?
         } else {
@@ -1245,6 +1399,8 @@ fn split_rows(
     rule: &CompiledRule,
     opaque: &[Range<usize>],
     environment: &str,
+    fold_rows: bool,
+    equation_labels: bool,
 ) -> Result<Vec<Row>, FormatError> {
     let mut candidates = Vec::new();
     let mut delimiter_matches = rule
@@ -1323,6 +1479,7 @@ fn split_rows(
                 && cells.is_empty()
                 && source[row_start..protected.start].trim().is_empty()
                 && let Some(end) = standalone_end
+                && !(fold_rows && delimiters_follow(source, end, range.end, &candidates))
             {
                 rows.push(Row {
                     cells: std::iter::once(row_start..end).collect(),
@@ -1347,8 +1504,17 @@ fn split_rows(
         if depth == 0
             && cells.is_empty()
             && bytes[cursor] == b'\\'
-            && source[row_start..cursor].trim().is_empty()
-            && let Some(end) = standalone_rule_end(source, cursor, range.end, environment)
+            && let Some(end) =
+                standalone_rule_end(source, cursor, range.end, environment).or_else(|| {
+                    equation_labels
+                        .then(|| equation_labels::intertext_end(source, cursor, range.end))
+                        .flatten()
+                })
+            && (source[row_start..cursor].trim().is_empty()
+                || (rule.settings.align_by_section
+                    || crate::package_tables::is_table(environment)
+                        && source[cursor..].starts_with(r"\cmidrule"))
+                    && crate::trivia::skip_until(source, row_start, cursor) == cursor)
         {
             rows.push(Row {
                 cells: std::iter::once(row_start..end).collect(),
@@ -1368,7 +1534,7 @@ fn split_rows(
             && bytes[cursor] == b'\\'
             && let Some(newline) = source[cell_start..cursor].rfind('\n')
             && source[cell_start + newline + 1..cursor].trim().is_empty()
-            && trailing_diagram_arrows(source, cursor, range.end)
+            && trailing_diagram_arrows(source, cursor, range.end, rule.settings.tikzcd_arrows)
         {
             let end = cell_start + newline + 1;
             cells.push(cell_start..end);
@@ -1496,7 +1662,107 @@ fn split_rows(
     Ok(rows)
 }
 
-fn trailing_diagram_arrows(source: &str, mut cursor: usize, end: usize) -> bool {
+fn delimiters_follow(
+    source: &str,
+    start: usize,
+    end: usize,
+    candidates: &[(usize, usize, bool)],
+) -> bool {
+    let next = crate::trivia::skip_until(source, start, end);
+    candidates
+        .get(candidates.partition_point(|c| c.0 < next))
+        .is_some_and(|c| c.0 == next && !c.2)
+}
+
+/// A run of arrows belongs to a node when every remaining outer token is
+/// part of an arrow invocation. Braced labels can themselves contain commands.
+fn diagram_arrows(cell: &str, base: &str, index: usize, layout: &RowFold) -> Option<String> {
+    if !cell.contains(r"\ar") || cell.contains('%') {
+        return None;
+    }
+    let mut cursor = 0;
+    let mut arrows = Vec::new();
+    while cursor < cell.len() {
+        match cell.as_bytes()[cursor] {
+            b'{' if arrows.is_empty() => {
+                cursor = crate::syntax::balanced_end(cell, cursor, b'{', b'}')?
+            }
+            b'\\' => {
+                let (name, end) = crate::syntax::command_at(cell, cursor)?;
+                if !matches!(name, "ar" | "arrow") {
+                    if !arrows.is_empty() || matches!(name, "verb" | "verb*" | "begin") {
+                        return None;
+                    }
+                    cursor = end;
+                    continue;
+                }
+                let start = cursor;
+                cursor = crate::trivia::skip(cell, end);
+                let args = cursor;
+                // New brackets and legacy [options]{direction}[options]{label}.
+                while let Some(open @ (b'[' | b'{')) = cell.as_bytes().get(cursor).copied() {
+                    let open_at = cursor;
+                    cursor = crate::syntax::balanced_end(
+                        cell,
+                        cursor,
+                        open,
+                        if open == b'[' { b']' } else { b'}' },
+                    )?;
+                    if open == b'[' && explicit_arrow_source(&cell[open_at + 1..cursor - 1]) {
+                        return None;
+                    }
+                    let next = crate::trivia::skip(cell, cursor);
+                    if !matches!(cell.as_bytes().get(next), Some(b'[' | b'{')) {
+                        break;
+                    }
+                    cursor = next;
+                }
+                if args == cursor {
+                    return None;
+                }
+                arrows.push(start..cursor);
+            }
+            byte if arrows.is_empty() || byte.is_ascii_whitespace() => cursor += 1,
+            _ => return None,
+        }
+    }
+    if arrows.len() < 2 {
+        return None;
+    }
+    let first = arrows[0].start;
+    let node = cell[..first].trim_end_matches([' ', '\t', '\r', '\n']);
+    let mut out = node.to_owned();
+    for (i, arrow) in arrows.into_iter().enumerate() {
+        // A tight first arrow in a text-mode node must not acquire a space.
+        if i > 0 || first > node.len() {
+            out.push_str(layout.newline);
+            out.push_str(base);
+            if index > 0 {
+                out.push_str(&layout.unit);
+            }
+            out.push_str(&layout.unit);
+        }
+        out.push_str(&cell[arrow]);
+    }
+    Some(out)
+}
+
+fn explicit_arrow_source(options: &str) -> bool {
+    crate::packages::keys::definition_entries(options)
+        .iter()
+        .any(|range| {
+            options[range.clone()]
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "from")
+        })
+}
+
+fn trailing_diagram_arrows(
+    source: &str,
+    mut cursor: usize,
+    end: usize,
+    explicit_only: bool,
+) -> bool {
     while let Some((name, after)) = crate::syntax::command_at(source, cursor) {
         if !matches!(name, "arrow" | "ar") {
             return false;
@@ -1506,6 +1772,9 @@ fn trailing_diagram_arrows(source: &str, mut cursor: usize, end: usize) -> bool 
         let Some(argument) = arguments.last() else {
             return false;
         };
+        if explicit_only && !explicit_arrow_source(&source[argument.start + 1..argument.end - 1]) {
+            return false;
+        }
         let next = crate::trivia::skip_until(source, argument.end, end);
         if next == end {
             return true;
@@ -1525,23 +1794,21 @@ fn standalone_rule_end(source: &str, start: usize, end: usize, environment: &str
         environment,
         "longtable" | "xltabular" | "tabularx" | "longtabu"
     ) && let Some((name, after)) = crate::syntax::command_at(source, start)
-        && matches!(
-            name.trim_end_matches('*'),
-            "caption" | "captionabove" | "captionbelow"
-        )
-        && let Some(argument) =
-            crate::layout::signature_argument_ranges(source, after..end, b"om".iter().copied())
-                .into_iter()
-                .last()
-                .filter(|argument| source.as_bytes()[argument.start] == b'{')
+        && let Some(shape) = match name.trim_end_matches('*') {
+            "caption" | "captionabove" | "captionbelow" => Some("om"),
+            "bicaption" => crate::packages::equation_floats::command_signature(source, name, after),
+            _ => None,
+        }
+        && let Some(caption_end) =
+            crate::syntax::arguments::signature_end(&source[..end], after, shape)
     {
-        let label = crate::trivia::skip_until(source, argument.end, end);
+        let label = crate::trivia::skip_until(source, caption_end, end);
         let after = if let Some(("label", after)) = crate::syntax::command_at(source, label) {
             crate::layout::signature_argument_ranges(source, after..end, b"m".iter().copied())
                 .last()
-                .map_or(argument.end, |argument| argument.end)
+                .map_or(caption_end, |argument| argument.end)
         } else {
-            argument.end
+            caption_end
         };
         let row_break = crate::trivia::skip_until(source, after, end);
         if let Some((r"\" | "tabularnewline", after)) = crate::syntax::command_at(source, row_break)
@@ -1587,10 +1854,14 @@ struct MeasuredCell<'a> {
     span: usize,
     width: usize,
     measure: bool,
+    decimal_at: Option<usize>,
     justification: Option<Justification>,
 }
 
 struct MeasuredRow<'a> {
+    equation_label: Option<&'a str>,
+    folded: bool,
+    ends_section: bool,
     original: Range<usize>,
     prefix: Cow<'a, str>,
     starts_physical_line: bool,
@@ -1605,11 +1876,22 @@ struct MeasuredRow<'a> {
 }
 
 struct RowLayoutContext<'a> {
+    label_layout: Option<equation_labels::Layout<'a>>,
+    protected: &'a [Range<usize>],
+    fold: Option<&'a RowFold>,
     freshly_indented: bool,
     tab_width: usize,
     column_spec: Option<&'a column_spec::TableSpec>,
     column_environment: Option<&'a str>,
     declared_column_types: &'a column_spec::DeclaredTypes,
+}
+
+struct RowFold {
+    diagram_arrows: bool,
+    limit: usize,
+    environment_indent: String,
+    unit: String,
+    newline: &'static str,
 }
 
 fn apply_column_spec(
@@ -1687,11 +1969,24 @@ fn apply_column_spec(
             let mut style = spec.style(logical_row, column, row_count, column_count);
             if let Some(styles) = &body_styles {
                 let local = styles.style(logical_row, column);
+                if local.justification.is_some() {
+                    style.decimal = local.decimal;
+                }
                 style.justification = local.justification.or(style.justification);
                 style.colspan = local.colspan.or(style.colspan);
                 style.rowspan = local.rowspan.or(style.rowspan);
             }
-            row.cells[index].justification = row.cells[index].justification.or(style.justification);
+            let cell = &mut row.cells[index];
+            if settings.align_decimals
+                && cell.justification.is_none()
+                && cell.span == 1
+                && style.colspan.unwrap_or(1) == 1
+            {
+                cell.decimal_at = style
+                    .decimal
+                    .and_then(|marker| decimal_anchor(&cell.text, marker));
+            }
+            cell.justification = cell.justification.or(style.justification);
             let span = if spec.is_tabularray() {
                 style.colspan.unwrap_or(1)
             } else {
@@ -1743,6 +2038,9 @@ fn format_rows(
     context: RowLayoutContext<'_>,
 ) -> Result<String, FormatError> {
     let RowLayoutContext {
+        label_layout,
+        protected,
+        fold,
         freshly_indented,
         tab_width,
         column_spec,
@@ -1829,6 +2127,7 @@ fn format_rows(
                             .any(|literal| literal == text.as_ref())
                         && !any_match(&rule.dont_measure, &text)?;
                     Ok::<_, FormatError>(MeasuredCell {
+                        decimal_at: None,
                         source: body_source,
                         text,
                         span,
@@ -1860,6 +2159,14 @@ fn format_rows(
                     || cells.iter().any(|cell| !cell.text.is_empty()));
             let eligible = data_row && !unsafe_comment;
             Ok::<_, FormatError>(MeasuredRow {
+                equation_label: None,
+                folded: false,
+                ends_section: label_layout.is_some() && row.standalone
+                    || settings.align_by_section
+                        && row.standalone
+                        && column_environment.is_some_and(|env| {
+                            section_boundary(source, row.full.clone(), opaque, env)
+                        }),
                 original: row.full,
                 prefix: prefix.into(),
                 starts_physical_line,
@@ -1879,6 +2186,76 @@ fn format_rows(
     {
         apply_column_spec(source, opaque, &mut measured, spec, settings);
     }
+    if let Some(layout) = fold.filter(|f| f.diagram_arrows) {
+        for row in measured
+            .iter_mut()
+            .filter(|r| r.eligible && r.starts_physical_line)
+        {
+            let base = &row.prefix[row.prefix.trim_end_matches([' ', '\t']).len()..];
+            for (index, cell) in row.cells.iter_mut().enumerate() {
+                if !crate::syntax::overlaps(&cell.source, protected)
+                    && let Some(text) = diagram_arrows(&cell.text, base, index, layout)
+                {
+                    cell.text = text.into();
+                    row.folded = true;
+                }
+            }
+        }
+    }
+    let last_data = measured
+        .iter()
+        .rfind(|row| row.eligible)
+        .map(|row| row.original.start);
+    let mut output = String::with_capacity(measured.iter().map(|r| r.original.len()).sum());
+    for section in measured.split_inclusive_mut(|row| row.ends_section) {
+        write_section(
+            source,
+            section,
+            settings,
+            children,
+            freshly_indented,
+            tab_width,
+            last_data,
+            fold,
+            label_layout,
+            &mut output,
+        );
+    }
+    Ok(output)
+}
+
+fn section_boundary(source: &str, range: Range<usize>, opaque: &[Range<usize>], env: &str) -> bool {
+    let mut at = crate::trivia::skip_until(source, range.start, range.end);
+    while at < range.end && !crate::syntax::is_protected(at, opaque) {
+        let Some(end) = crate::table_rules::rule_end(source, at, range.end, env) else {
+            break;
+        };
+        if crate::syntax::command_at(source, at).is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "midrule" | "endfirsthead" | "endhead" | "endfoot" | "endlastfoot"
+            )
+        }) {
+            return true;
+        }
+        at = crate::trivia::skip_until(source, end, range.end);
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_section(
+    source: &str,
+    measured: &mut [MeasuredRow<'_>],
+    settings: &AlignmentConfig,
+    children: &[(Range<usize>, &str)],
+    freshly_indented: bool,
+    tab_width: usize,
+    last_data: Option<usize>,
+    fold: Option<&RowFold>,
+    label_layout: Option<equation_labels::Layout<'_>>,
+    output: &mut String,
+) {
     let columns = measured
         .iter()
         .filter(|r| r.eligible)
@@ -1886,15 +2263,38 @@ fn format_rows(
         .max()
         .unwrap_or(0);
     if columns == 0 {
-        return Ok(measured
-            .into_iter()
-            .map(|r| apply_edits(source, r.original, children))
-            .collect());
+        for row in measured {
+            output.push_str(&apply_edits(source, row.original.clone(), children));
+        }
+        return;
     }
+    let contains_last_row = measured
+        .last()
+        .is_some_and(|row| last_data.is_some_and(|pos| pos < row.original.end));
     if settings.short_rows == ShortRows::Preserve {
-        for row in &mut measured {
+        for row in measured.iter_mut() {
             if row.columns < columns {
                 row.eligible = false;
+            }
+        }
+    }
+    if let Some(fold) = fold
+        && measured
+            .iter()
+            .any(|r| r.eligible && !r.starts_physical_line)
+    {
+        let indent = format!("{}{}", fold.environment_indent, fold.unit);
+        let width = trailing_indent_width(&indent, tab_width);
+        if measured.iter().any(|row| {
+            row.eligible
+                && !row.starts_physical_line
+                && row.natural_width(settings, width) > fold.limit
+        }) {
+            for row in measured.iter_mut().filter(|row| {
+                row.eligible && !row.starts_physical_line && row.prefix.trim().is_empty()
+            }) {
+                row.prefix = format!("{}{indent}", fold.newline).into();
+                row.starts_physical_line = true;
             }
         }
     }
@@ -1905,6 +2305,10 @@ fn format_rows(
             settings.justification
         }
     };
+    let last_data = contains_last_row
+        .then(|| measured.iter().rfind(|row| row.eligible))
+        .flatten()
+        .map(|row| row.original.start);
     let first_column_has_leading_padding = measured
         .iter()
         .filter(|row| row.eligible)
@@ -2019,15 +2423,38 @@ fn format_rows(
             }
         }
     }
+    if let Some(fold) = fold {
+        for row in measured
+            .iter_mut()
+            .filter(|row| row.eligible && row.starts_physical_line)
+        {
+            let indent = trailing_indent_width(&row.prefix, tab_width);
+            row.folded |= row.natural_width(settings, indent) > fold.limit;
+        }
+    }
+    let mut labels =
+        label_layout.and_then(|layout| layout.extract(measured, source, settings.width));
+    let ordinary = |row: &&MeasuredRow<'_>| row.eligible && !row.folded;
+    let columns = if fold.is_some() {
+        measured
+            .iter()
+            .filter(ordinary)
+            .map(|row| row.columns)
+            .max()
+            .unwrap_or(0)
+    } else {
+        columns
+    };
     let mut widths = vec![0usize; columns];
     let delimiter_width = measured
         .iter()
+        .filter(|row| !row.folded)
         .flat_map(|r| &r.delimiters)
         .map(|d| measure_width(d, settings.width))
         .max()
         .unwrap_or(1);
     let gap = settings.spaces_before + delimiter_width + settings.spaces_after;
-    for row in measured.iter().filter(|r| r.eligible) {
+    for row in measured.iter().filter(ordinary) {
         let mut column = 0;
         for cell in &row.cells {
             if cell.span == 1 && cell.measure {
@@ -2039,7 +2466,7 @@ fn format_rows(
     if settings.dont_measure_largest {
         let maxima = widths.clone();
         widths.fill(0);
-        for row in measured.iter().filter(|r| r.eligible) {
+        for row in measured.iter().filter(ordinary) {
             let mut column = 0;
             for cell in &row.cells {
                 if cell.span == 1 && cell.measure && cell.width < maxima[column] {
@@ -2049,7 +2476,28 @@ fn format_rows(
             }
         }
     }
-    for row in measured.iter().filter(|r| r.eligible) {
+    let mut decimal_widths = Vec::new();
+    if settings.align_decimals {
+        decimal_widths.resize(columns, (0, 0));
+        for row in measured.iter().filter(ordinary) {
+            let mut column = 0;
+            for cell in &row.cells {
+                if let Some(left) = cell.decimal_at
+                    && cell.measure
+                    && (!settings.dont_measure_largest || cell.width <= widths[column])
+                {
+                    let (before, after) = &mut decimal_widths[column];
+                    *before = (*before).max(left);
+                    *after = (*after).max(cell.width - left);
+                }
+                column += cell.span;
+            }
+        }
+        for (width, (left, right)) in widths.iter_mut().zip(&decimal_widths) {
+            *width = (*width).max(left + right);
+        }
+    }
+    for row in measured.iter().filter(ordinary) {
         let mut column = 0;
         for cell in &row.cells {
             let span = cell.span;
@@ -2063,78 +2511,118 @@ fn format_rows(
             column += span;
         }
     }
-    let last_data = measured.iter().rposition(|row| row.eligible);
-    let mut output = String::with_capacity(measured.iter().map(|r| r.original.len()).sum());
-    for (row_index, row) in measured.iter().enumerate() {
+    let aligns_break = |row: &MeasuredRow<'_>| {
+        row.has_row_break
+            && (settings.align_content_after_row_break
+                || settings.align_double_backslash
+                    && (Some(row.original.start) != last_data
+                        || settings.align_final_double_backslash))
+    };
+    let break_target = fold.and_then(|_| {
+        measured
+            .iter()
+            .filter(ordinary)
+            .find(|row| aligns_break(row) && row.starts_physical_line)
+            .map(|row| {
+                trailing_indent_width(&row.prefix, tab_width)
+                    + widths.iter().sum::<usize>()
+                    + gap * columns.saturating_sub(1)
+                    + settings.spaces_before_row_break
+            })
+    });
+    for row in measured.iter() {
         if !row.eligible {
             output.push_str(&apply_edits(source, row.original.clone(), children));
             continue;
         }
         output.push_str(&row.prefix);
-        let mut column = 0;
-        for (i, cell) in row.cells.iter().enumerate() {
-            let span = cell.span;
-            // Without a nonempty physical first cell, its indentation cannot
-            // be separated from existing column padding. Keep that prefix and
-            // avoid generating more first-column padding on each pass.
-            let preserve_empty_prefix =
-                i == 0 && row.starts_physical_line && cell.text.is_empty() && base_indent.is_none();
-            let mut target = widths[column..column + span].iter().sum::<usize>() + gap * (span - 1);
-            let align_last = row.has_row_break
-                && (settings.align_double_backslash || settings.align_content_after_row_break)
-                && (Some(row_index) != last_data
-                    || settings.align_final_double_backslash
-                    || settings.align_content_after_row_break);
-            let cell_justification = justification(column, cell);
-            let pad_cell = !preserve_empty_prefix
-                && (i < row.delimiters.len()
-                    || align_last
-                    || settings.justification == Justification::Columns
-                        && cell_justification != Justification::Left);
-            if align_last && i + 1 == row.cells.len() && row.columns < columns {
-                target +=
-                    widths[row.columns..].iter().sum::<usize>() + gap * (columns - row.columns);
-            }
-            let pad = target.saturating_sub(cell.width);
-            let (before_pad, after_pad) = match cell_justification {
-                Justification::Right => (pad, 0),
-                Justification::Center => (pad / 2, pad - pad / 2),
-                _ => (0, pad),
-            };
-            if pad_cell {
-                output.extend(std::iter::repeat_n(' ', before_pad));
-            }
-            output.push_str(&cell.text);
-            // A final cell without an aligned row terminator has no following
-            // delimiter to position. Preserve its existing suffix without
-            // adding center padding that would grow again on the next pass.
-            if pad_cell && (i < row.delimiters.len() || align_last) {
-                output.extend(std::iter::repeat_n(' ', after_pad));
-            }
-            if let Some(delimiter) = row.delimiters.get(i) {
-                let before = if preserve_empty_prefix {
-                    settings
-                        .spaces_before
-                        .saturating_sub(trailing_indent_width(&row.prefix, tab_width))
+        let align_row_break = aligns_break(row);
+        let mut formula_end = None;
+        if let Some(fold) = fold.filter(|_| row.folded) {
+            fold.write(
+                row,
+                settings,
+                tab_width,
+                break_target.filter(|_| align_row_break),
+                output,
+            );
+        } else {
+            let mut column = 0;
+            for (i, cell) in row.cells.iter().enumerate() {
+                let span = cell.span;
+                // Without a nonempty physical first cell, its indentation cannot
+                // be separated from existing column padding. Keep that prefix and
+                // avoid generating more first-column padding on each pass.
+                let preserve_empty_prefix = i == 0
+                    && row.starts_physical_line
+                    && cell.text.is_empty()
+                    && base_indent.is_none();
+                let target = widths[column..column + span].iter().sum::<usize>() + gap * (span - 1);
+                let cell_justification = justification(column, cell);
+                let pad_cell = !preserve_empty_prefix
+                    && (i < row.delimiters.len()
+                        || align_row_break
+                        || settings.justification == Justification::Columns
+                            && cell_justification != Justification::Left);
+                let pad = target.saturating_sub(cell.width);
+                let (before_pad, after_pad) = if let Some(left) = cell.decimal_at {
+                    let before = decimal_widths[column].0.saturating_sub(left).min(pad);
+                    (before, pad - before)
                 } else {
-                    settings.spaces_before
+                    match cell_justification {
+                        Justification::Right => (pad, 0),
+                        Justification::Center => (pad / 2, pad - pad / 2),
+                        _ => (0, pad),
+                    }
                 };
-                output.extend(std::iter::repeat_n(' ', before));
-                let delimiter_pad =
-                    delimiter_width.saturating_sub(measure_width(delimiter, settings.width));
-                let (before_pad, after_pad) = match settings.delimiter_justification {
-                    Justification::Right => (delimiter_pad, 0),
-                    Justification::Center => (delimiter_pad / 2, delimiter_pad - delimiter_pad / 2),
-                    _ => (0, delimiter_pad),
-                };
-                output.extend(std::iter::repeat_n(' ', before_pad));
-                output.push_str(delimiter);
-                output.extend(std::iter::repeat_n(' ', after_pad));
-                output.extend(std::iter::repeat_n(' ', settings.spaces_after));
-            } else if row.has_row_break {
-                output.extend(std::iter::repeat_n(' ', settings.spaces_before_row_break));
+                if pad_cell {
+                    output.extend(std::iter::repeat_n(' ', before_pad));
+                }
+                output.push_str(&cell.text);
+                if labels.is_some() && i + 1 == row.cells.len() {
+                    formula_end = Some(output.len());
+                }
+                // A final cell without an aligned row terminator has no following
+                // delimiter to position. Preserve its existing suffix without
+                // adding center padding that would grow again on the next pass.
+                if pad_cell && (i < row.delimiters.len() || align_row_break) {
+                    output.extend(std::iter::repeat_n(' ', after_pad));
+                }
+                if let Some(delimiter) = row.delimiters.get(i) {
+                    let before = if preserve_empty_prefix {
+                        settings
+                            .spaces_before
+                            .saturating_sub(trailing_indent_width(&row.prefix, tab_width))
+                    } else {
+                        settings.spaces_before
+                    };
+                    output.extend(std::iter::repeat_n(' ', before));
+                    let delimiter_pad =
+                        delimiter_width.saturating_sub(measure_width(delimiter, settings.width));
+                    let (before_pad, after_pad) = match settings.delimiter_justification {
+                        Justification::Right => (delimiter_pad, 0),
+                        Justification::Center => {
+                            (delimiter_pad / 2, delimiter_pad - delimiter_pad / 2)
+                        }
+                        _ => (0, delimiter_pad),
+                    };
+                    output.extend(std::iter::repeat_n(' ', before_pad));
+                    output.push_str(delimiter);
+                    output.extend(std::iter::repeat_n(' ', after_pad));
+                    output.extend(std::iter::repeat_n(' ', settings.spaces_after));
+                } else if row.has_row_break {
+                    if align_row_break && row.columns < columns {
+                        let missing_width = widths[row.columns..].iter().sum::<usize>()
+                            + gap * (columns - row.columns);
+                        output.extend(std::iter::repeat_n(' ', missing_width));
+                    }
+                    output.extend(std::iter::repeat_n(' ', settings.spaces_before_row_break));
+                }
+                column += span;
             }
-            column += span;
+        }
+        if let (Some(labels), Some(end)) = (&mut labels, formula_end) {
+            labels.record(output, end, row, align_row_break, settings, tab_width);
         }
         if settings.align_content_after_row_break && row.has_row_break {
             let (terminator, tail) = row.suffix.split_at(row.terminator_length);
@@ -2150,7 +2638,102 @@ fn format_rows(
             output.push_str(row.suffix);
         }
     }
-    Ok(output)
+    if let Some(labels) = labels {
+        labels.write(output, settings);
+    }
+}
+
+impl MeasuredRow<'_> {
+    fn natural_width(&self, settings: &AlignmentConfig, indent: usize) -> usize {
+        let mut col = indent;
+        let mut widest = 0;
+        for (i, cell) in self.cells.iter().enumerate() {
+            if let Some((first, rest)) = cell.text.split_once('\n') {
+                widest = widest.max(col + measure_width(first, settings.width));
+                for line in rest.split('\n') {
+                    col = measure_width(line, settings.width);
+                    widest = widest.max(col);
+                }
+            } else {
+                col += cell.width;
+            }
+            if let Some(delimiter) = self.delimiters.get(i) {
+                col += settings.spaces_before
+                    + measure_width(delimiter, settings.width)
+                    + settings.spaces_after;
+            }
+        }
+        if self.has_row_break {
+            col += settings.spaces_before_row_break
+                + measure_width(&self.suffix[..self.terminator_length], settings.width);
+        }
+        widest.max(col)
+    }
+}
+
+impl RowFold {
+    fn write(
+        &self,
+        row: &MeasuredRow<'_>,
+        settings: &AlignmentConfig,
+        tab_width: usize,
+        target: Option<usize>,
+        output: &mut String,
+    ) {
+        let indent = &row.prefix[row.prefix.trim_end_matches([' ', '\t']).len()..];
+        output.push_str(&row.cells[0].text);
+        for (i, (delimiter, cell)) in row.delimiters.iter().zip(&row.cells[1..]).enumerate() {
+            if i != 0 || !row.cells[0].text.is_empty() {
+                output.push_str(self.newline);
+                output.push_str(indent);
+                output.push_str(&self.unit);
+            }
+            output.push_str(delimiter);
+            if !cell.text.is_empty() {
+                output.extend(std::iter::repeat_n(' ', settings.spaces_after));
+                output.push_str(&cell.text);
+            }
+        }
+        if row.has_row_break {
+            let line = output.rsplit('\n').next().unwrap_or("");
+            let current = measure_width(line, settings.width)
+                + line.bytes().filter(|&b| b == b'\t').count() * tab_width.saturating_sub(1);
+            let suffix = row.suffix.lines().next().unwrap_or("");
+            let pad = target
+                .filter(|t| t + measure_width(suffix, settings.width) <= self.limit)
+                .map_or(0, |t| t.saturating_sub(current))
+                .max(settings.spaces_before_row_break);
+            output.extend(std::iter::repeat_n(' ', pad));
+        }
+    }
+}
+
+fn decimal_anchor(text: &str, marker: &[char]) -> Option<usize> {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let mut mantissa = unsigned;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some((base, exponent)) = mantissa.split_once(['e', 'E']) {
+        if !digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent)) {
+            return None;
+        }
+        mantissa = base;
+    }
+    if let Some((base, uncertainty)) = mantissa.split_once('(') {
+        if !digits(uncertainty.strip_suffix(')')?) {
+            return None;
+        }
+        mantissa = base;
+    }
+    let (whole, fraction) = mantissa.split_once(marker).unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(text.len() - unsigned.len() + whole.len())
 }
 
 fn measure_width(cell: &str, width: Width) -> usize {

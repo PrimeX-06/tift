@@ -72,6 +72,8 @@ macro_rules! providers {
             Documents {
                 headers: (3, documents::header_signature),
                 commands: (1, document_command),
+                data: (0, documents::filename_ranges),
+                metadata: (0, documents::is_file_reader),
                 context_command: (1, documents::context_command_signature),
             }
             Documents {

@@ -21,6 +21,7 @@ pub struct TreeConfig {
     pub columns: Option<usize>,
     pub forest: bool,
     pub qtree: bool,
+    pub dirtree: bool,
 }
 
 impl Default for TreeConfig {
@@ -30,6 +31,7 @@ impl Default for TreeConfig {
             columns: None,
             forest: true,
             qtree: true,
+            dirtree: true,
         }
     }
 }
@@ -50,9 +52,11 @@ pub(crate) fn format_with_context(
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
     let settings = &config.config.trees;
-    let forest = settings.forest && source.contains("forest");
-    let qtree = settings.qtree && source.contains("\\Tree");
-    if settings.mode == TreeMode::Preserve || !(forest || qtree) {
+    let bracket_trees = settings.mode != TreeMode::Preserve;
+    let forest = bracket_trees && settings.forest && source.contains("forest");
+    let qtree = bracket_trees && settings.qtree && source.contains("\\Tree");
+    let directory = settings.dirtree && source.contains(r"\dirtree");
+    if !(forest || qtree || directory) {
         return Ok(source.into());
     }
     let parsed = parsing.snapshot(source, true, false)?;
@@ -133,6 +137,20 @@ pub(crate) fn format_with_context(
     }
     roots.sort_by_key(|(range, _)| range.start);
     let mut edits = Vec::new();
+    if directory
+        && !config.config.syntax.commands.contains_key("dirtree")
+        && !analysis.declared_commands()?.contains("dirtree")
+    {
+        for token in tokens {
+            if token.kind == syntax::TokenKind::Command
+                && &source[token.span.clone()] == r"\dirtree"
+                && let Some(edit) =
+                    directory_tree(source, token.span.clone(), &parsed.protected, config)
+            {
+                edits.push(edit);
+            }
+        }
+    }
     let mut last_end = 0;
     for (root, qtree) in roots {
         if root.start < last_end {
@@ -158,6 +176,107 @@ pub(crate) fn format_with_context(
         }
     }
     crate::layout::apply_edits(source, edits)
+}
+
+fn directory_tree(
+    source: &str,
+    command: Range<usize>,
+    protected: &[Range<usize>],
+    config: &CompiledConfig,
+) -> Option<(Range<usize>, String)> {
+    let base = source[..command.start].rsplit('\n').next()?;
+    if !base.trim_matches([' ', '\t']).is_empty() {
+        return None;
+    }
+    let open = crate::trivia::skip(source, command.end);
+    let end = syntax::balanced_end(source, open, b'{', b'}')?;
+    let tail = source[end..].split('\n').next()?.trim();
+    if (!tail.is_empty() && !tail.starts_with('%'))
+        || syntax::overlaps(&(command.start..end), protected)
+    {
+        return None;
+    }
+    let body = open + 1..end - 1;
+    let (header, nodes) = source[body.clone()].split_once('\n')?;
+    if !header.trim().is_empty() && !header.trim_start().starts_with('%') {
+        return None;
+    }
+    let unit = config.config.indent.unit("environment", "dirtree");
+    let mut output = String::from(header);
+    output.push('\n');
+    let mut previous = 0usize;
+    for line in nodes.split_inclusive('\n') {
+        let text = line.trim_start_matches([' ', '\t']);
+        if text.trim().is_empty() || text.starts_with('%') {
+            output.push_str(line);
+            continue;
+        }
+        let mut code = text;
+        if let Some((comment, _)) = text
+            .match_indices('%')
+            .find(|(at, _)| !syntax::is_escaped(text, *at))
+        {
+            code = &text[..comment];
+            if !code.ends_with([' ', '\t']) {
+                return None;
+            }
+        }
+        let record = code
+            .trim_end_matches(['\r', '\n', ' ', '\t'])
+            .strip_prefix('.')?;
+        let (digits, name) = record.split_once([' ', '\t'])?;
+        if !digits.bytes().all(|b| b.is_ascii_digit()) || !literal_directory_name(name) {
+            return None;
+        }
+        let depth = digits.parse::<usize>().ok()?;
+        if depth == 0 || depth > previous + 1 {
+            return None;
+        }
+        previous = depth;
+        output.push_str(base);
+        let levels = if let Some(max) = config.config.indent.maximum {
+            let width = |s| crate::wrap::display_width(s, 0, config.config.indent.width.max(1));
+            depth.min(max.saturating_sub(width(base)) / width(&unit).max(1))
+        } else {
+            depth
+        };
+        output.push_str(&unit.repeat(levels));
+        output.push_str(text);
+    }
+    (previous > 0 && output != source[body.clone()]).then_some((body, output))
+}
+
+fn literal_directory_name(name: &str) -> bool {
+    let Some(label) = name.strip_suffix('.') else {
+        return false;
+    };
+    let mut pos = 0;
+    while pos < label.len() {
+        match label.as_bytes()[pos] {
+            b'{' => {
+                let Some(end) = syntax::balanced_end(label, pos, b'{', b'}') else {
+                    return false;
+                };
+                pos = end;
+            }
+            b'\\' => {
+                let Some((_, end)) = syntax::command_at(label, pos) else {
+                    return false;
+                };
+                pos = end;
+            }
+            b'%' | b'}' => return false,
+            b'.' if label
+                .as_bytes()
+                .get(pos + 1)
+                .is_some_and(u8::is_ascii_whitespace) =>
+            {
+                return false;
+            }
+            _ => pos += label[pos..].chars().next().unwrap().len_utf8(),
+        }
+    }
+    true
 }
 
 fn forest_root(source: &str, range: Range<usize>) -> Option<usize> {

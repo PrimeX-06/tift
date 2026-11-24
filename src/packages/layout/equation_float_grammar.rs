@@ -27,7 +27,28 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn command_signature(_source: &str, name: &str, _cursor: usize) -> Option<&'static str> {
+/// bicaption reads a short entry for each language. Its starred form
+/// takes just the two printed titles.
+pub(crate) fn bilingual_caption_signature(name: &str) -> Option<&'static str> {
+    matches!(
+        name.trim_end_matches('*'),
+        "bicaption" | "bisubcaption" | "subbicaption"
+    )
+    .then_some(if name.ends_with('*') { "mm" } else { "omom" })
+}
+
+pub(crate) fn command_signature(source: &str, name: &str, cursor: usize) -> Option<&'static str> {
+    if let Some(shape) = bilingual_caption_signature(name) {
+        return Some(
+            if !name.ends_with('*')
+                && source.as_bytes().get(crate::trivia::skip(source, cursor)) == Some(&b'*')
+            {
+                "mmm"
+            } else {
+                shape
+            },
+        );
+    }
     Some(match name.trim_end_matches('*') {
         // float.sty and newfloat.sty keep the extension/placement metadata
         // separate from the printable caption and body.
@@ -68,6 +89,9 @@ pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
             ("DeclareLeftDelimiter", 1, true),
             ("DeclareRightDelimiter", 1, true),
             // threeparttable.sty:288; threeparttablex.sty:29,43,80--82.
+            ("bicaption", 2, true),
+            ("bisubcaption", 2, true),
+            ("subbicaption", 2, true),
             ("tnote", 1, false),
             ("tnotex", 1, false),
             ("setTableNoteFont", 1, false),

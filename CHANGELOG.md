@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.8
+
+- Align each equation pair in `align`, `alignat`, `aligned`, and related environments with a right-aligned left side and a left-aligned right side. Use the three native column directions in `eqnarray`.
+
+- Align trailing equation labels in supported multi-equation displays by default, within the configured column budget.
+
+- Measure table cells in Unicode display columns and align equals signs in selected multiline command options by default.
+
+- Account for `\multicolumn` spans by default when aligning table source, including tables with uniform justification.
+- Finish nonempty, editable files with a newline by default. Set `output.final-newline = "preserve"` to retain the original end of file.
+- Configure comment wrapping and alignment with `comments.wrap` and `comments.align-trailing`. Set file endings in `[output]`, the blank-line limit with `whitespace.blank-lines`, and replacement matching with `replacements[].match`.
+- Format embedded bibliographies in `filecontents` and `filecontents*` using the same settings as standalone BibTeX files. Set `bibtex.format-filecontents = false` to preserve the embedded source.
+- Align literal whitespace-separated PGFPlots tables by default. Set `breaks.pgfplots-tables = false` to preserve inline data or `breaks.pgfplots-named-tables = false` for named tables.
+- Add source layout options for bibliography lists and concatenations, repeated command arguments, TikZ paths, and plotting coordinates.
+
+Download a binary from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.8) or install with `cargo install tift --version 0.1.8 --locked --registry crates-io`. See the [configuration reference](https://github.com/PrimeX-06/tift/wiki/Configuration) for the current keys.
+
 ## 0.1.7
 
 - Collapse repeated spaces in ordinary LaTeX prose while preserving existing line breaks. Set `wrap.collapse-spaces = false` to keep repeated spaces. Comments, verbatim content, and literal command arguments retain their spacing.

@@ -798,7 +798,7 @@ fn escape_special(text: &str) -> Cow<'_, str> {
 }
 
 /// Split only top-level BibTeX `and` separators, preserving corporate authors.
-fn split_authors(text: &str) -> Vec<&str> {
+pub(super) fn name_separators(text: &str) -> Vec<usize> {
     let mut depth = 0usize;
     let mut escaped = false;
     let mut starts = Vec::new();
@@ -830,9 +830,13 @@ fn split_authors(text: &str) -> Vec<&str> {
             _ => (),
         }
     }
+    starts
+}
+
+fn split_authors(text: &str) -> Vec<&str> {
     let mut authors = Vec::new();
     let mut cursor = 0;
-    for at in starts {
+    for at in name_separators(text) {
         authors.push(text[cursor..at].trim());
         cursor = at + 3;
     }

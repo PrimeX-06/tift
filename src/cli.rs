@@ -119,6 +119,9 @@ struct Args {
     /// Join existing prose lines and wrap paragraphs to the configured width.
     #[arg(long, conflicts_with_all = ["wrap", "no_wrap"], help_heading = "Layout overrides")]
     rewrap: bool,
+    /// Carry overflowing prose onto the next line while retaining later line breaks.
+    #[arg(long, conflicts_with_all = ["wrap", "rewrap", "no_wrap"], help_heading = "Layout overrides")]
+    stable_wrap: bool,
     /// Preserve prose line breaks.
     #[arg(long, conflicts_with = "rewrap", help_heading = "Layout overrides")]
     no_wrap: bool,
@@ -204,6 +207,9 @@ impl Args {
         }
         if self.rewrap {
             wrap.insert("mode".into(), toml::Value::String("rewrap".into()));
+        }
+        if self.stable_wrap {
+            wrap.insert("mode".into(), toml::Value::String("stable".into()));
         }
         if self.no_wrap {
             wrap.insert("mode".into(), toml::Value::String("preserve".into()));
@@ -934,8 +940,12 @@ fn show_configuration(args: &Args, loader: &mut config_io::Loader) -> Result<i32
     };
     let effective = loader.for_path(&path)?;
     let config = effective.config;
-    let text = toml::to_string_pretty(&config.config)
-        .map_err(|error| format!("configuration: {error}"))?;
+    let document = config
+        .config
+        .document()
+        .map_err(|e| format!("configuration: {e}"))?;
+    let text =
+        toml::to_string_pretty(&document).map_err(|error| format!("configuration: {error}"))?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     writeln!(

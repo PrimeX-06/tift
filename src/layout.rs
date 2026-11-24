@@ -218,6 +218,45 @@ fn format_document_stages(
     }
     let bom = source.starts_with('\u{feff}');
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut diagnostics = model
+        .as_ref()
+        .map_or_else(Vec::new, |model| model.diagnostics().to_vec());
+    let mut parsing = ParseContext::with_model(config, model);
+    let embedded;
+    let source = if config.config.bibtex.format_filecontents
+        && !config.config.replacement_only
+        && matches!(
+            kind,
+            FileKind::Tex | FileKind::Tikz | FileKind::Class | FileKind::Style
+        )
+        && source.contains("filecontents")
+    {
+        embedded = stage(
+            "embedded-bibtex",
+            source,
+            &mut trace,
+            &mut details,
+            config,
+            || {
+                crate::bibtex::format_embedded(
+                    source,
+                    config,
+                    &mut parsing,
+                    usize::from(bom) * 3,
+                    &mut diagnostics,
+                )
+            },
+        )?;
+        if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+            return Ok(FormatOutput {
+                text: original_source.into(),
+                diagnostics,
+            });
+        }
+        embedded.as_str()
+    } else {
+        source
+    };
     let mut text = stage(
         "replacements-before",
         source,
@@ -233,10 +272,6 @@ fn format_document_stages(
             )
         },
     )?;
-    let mut diagnostics = model
-        .as_ref()
-        .map_or_else(Vec::new, |model| model.diagnostics().to_vec());
-    let mut parsing = ParseContext::with_model(config, model);
     if !config.config.replacement_only {
         if kind == FileKind::Bibtex {
             text = stage("bibtex", &text, &mut trace, &mut details, config, || {
@@ -365,6 +400,15 @@ fn format_document_stages(
                 |text| crate::wrap::collapse_prose_spaces(text, config, &mut parsing),
             )?;
             // Resolve structure first so wrapping always measures final indentation.
+            optional_stage(
+                "description",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.wrap.align_description,
+                |text| crate::description::format(text, config, &mut parsing),
+            )?;
             needs_cleanup |= optional_stage(
                 "text-before",
                 &mut text,
@@ -482,14 +526,29 @@ fn format_document_stages(
                         .any(|rule| rule.column_spec.is_some()),
                 |text| crate::alignment::format_preambles(text, config, &mut parsing),
             )?;
+            let tree_layout = config.config.trees.mode != crate::tree_layout::TreeMode::Preserve
+                || config.config.trees.dirtree && text.contains(r"\dirtree");
             optional_stage(
                 "trees",
                 &mut text,
                 &mut trace,
                 &mut details,
                 config,
-                config.config.trees.mode != crate::tree_layout::TreeMode::Preserve,
+                tree_layout,
                 |text| crate::tree_layout::format_with_context(text, config, &mut parsing),
+            )?;
+            let plot_tables = config.config.breaks.enabled
+                && (config.config.breaks.pgfplots_tables && text.contains(r"\addplot")
+                    || config.config.breaks.pgfplots_named_tables
+                        && text.contains(r"\pgfplotstableread"));
+            optional_stage(
+                "pgfplots-tables",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                plot_tables,
+                |text| crate::pgfplots_table::format(text, config, &mut parsing),
             )?;
             optional_stage(
                 "foreach-lists",
@@ -500,6 +559,24 @@ fn format_document_stages(
                 config.config.arguments.foreach_lists
                     != crate::argument_layout::ForeachListMode::Preserve,
                 |text| crate::foreach::format_lists(text, config, &mut parsing),
+            )?;
+            optional_stage(
+                "consecutive-arguments",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.arguments.align_consecutive,
+                |text| crate::argument_layout::consecutive::format(text, config, &mut parsing),
+            )?;
+            optional_stage(
+                "trailing-comments",
+                &mut text,
+                &mut trace,
+                &mut details,
+                config,
+                config.config.comments.align_trailing,
+                |text| crate::wrap::align_trailing_comments(text, config, &mut parsing),
             )?;
         }
     }
@@ -522,32 +599,26 @@ fn format_document_stages(
     let final_started = trace.is_some().then(Instant::now);
     let before_final = trace.is_some().then(|| text.clone());
     let ending = preferred_ending(source, config);
-    let protected = if kind == FileKind::Bibtex {
-        crate::bibtex::protected_ranges(&text)?
-    } else if config.config.whitespace.line_ending != LineEnding::Preserve
-        || config.config.whitespace.final_newline != FinalNewline::Preserve
-    {
-        parsing.snapshot(&text, false, false)?.protected.clone()
-    } else {
-        Vec::new()
+    let mut boundary_protection = |text: &str| -> Result<Vec<Range<usize>>, FormatError> {
+        if kind == FileKind::Bibtex {
+            crate::bibtex::protected_ranges(text)
+        } else {
+            Ok(parsing.snapshot(text, false, false)?.protected.clone())
+        }
     };
-    if config.config.whitespace.line_ending != LineEnding::Preserve {
-        text = convert_endings(&text, ending, &protected);
+    if config.config.output.line_ending != LineEnding::Preserve {
+        text = convert_endings(&text, ending, &boundary_protection(&text)?);
     }
-    match config.config.whitespace.final_newline {
+    match config.config.output.final_newline {
         FinalNewline::Always
             if !text.is_empty()
                 && !text.ends_with('\n')
-                && !syntax::is_protected(text.len() - 1, &protected) =>
+                && !syntax::is_protected(text.len() - 1, &boundary_protection(&text)?) =>
         {
             text.push_str(ending)
         }
-        FinalNewline::Never => {
-            let protected = if kind != FileKind::Bibtex {
-                parsing.snapshot(&text, false, false)?.protected.clone()
-            } else {
-                crate::bibtex::protected_ranges(&text)?
-            };
+        FinalNewline::Never if text.ends_with('\n') => {
+            let protected = boundary_protection(&text)?;
             while text.ends_with('\n') && !syntax::is_protected(text.len() - 1, &protected) {
                 text.pop();
                 if text.ends_with('\r') {
@@ -582,7 +653,7 @@ fn format_document_stages(
 }
 
 fn preferred_ending<'a>(source: &str, config: &CompiledConfig) -> &'a str {
-    match config.config.whitespace.line_ending {
+    match config.config.output.line_ending {
         LineEnding::Lf => "\n",
         LineEnding::Crlf => "\r\n",
         LineEnding::Preserve => {
@@ -629,11 +700,7 @@ pub(crate) fn clean_whitespace(
 
 fn whitespace_cleanup_needed(source: &str, config: &CompiledConfig) -> bool {
     let options = &config.config.whitespace;
-    let maximum = if options.preserve_blank_lines {
-        options.max_blank_lines
-    } else {
-        Some(0)
-    };
+    let maximum = options.blank_lines.limit();
     if !options.remove_trailing && maximum.is_none() {
         return false;
     }
@@ -677,11 +744,7 @@ fn clean_whitespace_parsed(
         let protected_line = syntax::overlaps(&(offset..offset + line.len()), protected);
         if body.trim_matches([' ', '\t']).is_empty() && !protected_line {
             blanks += 1;
-            let maximum = if config.config.whitespace.preserve_blank_lines {
-                config.config.whitespace.max_blank_lines
-            } else {
-                Some(0)
-            };
+            let maximum = config.config.whitespace.blank_lines.limit();
             if maximum.is_some_and(|maximum| blanks > maximum) {
                 offset += line.len();
                 continue;
@@ -720,6 +783,114 @@ struct Event<'a> {
     block: usize,
     start: bool,
     unit: &'a str,
+}
+
+struct IndentMarker {
+    command: &'static str,
+    environment: &'static str,
+    signature: &'static [u8],
+    unit_category: &'static str,
+}
+
+fn marker_indent_events<'a>(
+    source: &str,
+    blocks: &[Block],
+    marker: &IndentMarker,
+    unit: &'a str,
+    events: &mut Vec<Event<'a>>,
+) {
+    let mut active = BTreeMap::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if block.name != marker.command
+            || !(block.kind == BlockKind::Command
+                || marker.command == "column" && block.kind == BlockKind::Environment)
+        {
+            continue;
+        }
+        let Some(parent) = block.parent.filter(|&p| {
+            blocks[p].kind == BlockKind::Environment && blocks[p].name == marker.environment
+        }) else {
+            continue;
+        };
+        let limit = blocks[parent].body.end;
+        let mut after = block.begin.end;
+        if marker.command == "onslide" {
+            after += usize::from(source.as_bytes().get(after) == Some(&b'+'));
+            let Some(spec) = environment_argument_range(source, after, limit, b'd') else {
+                continue;
+            };
+            after = spec.end;
+            // A braced onslide, even on the following line, owns only its argument.
+            if source
+                .as_bytes()
+                .get(crate::trivia::skip_until(source, after, limit))
+                == Some(&b'{')
+            {
+                continue;
+            }
+        }
+        if let Some(previous) = active.remove(&parent) {
+            events.push(Event {
+                pos: block.begin.start,
+                block: previous,
+                start: false,
+                unit: "",
+            });
+        }
+        if block.kind != BlockKind::Command
+            || !source[..block.begin.start]
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .trim_matches([' ', '\t'])
+                .is_empty()
+        {
+            continue;
+        }
+        // A Beamer column header is recognized on one physical line. Plot
+        // options and bibliography labels may themselves span several lines.
+        let header_limit = if marker.command == "column" {
+            source[block.begin.end..limit]
+                .find('\n')
+                .map_or(limit, |n| block.begin.end + n)
+        } else {
+            limit
+        };
+        let args = signature_argument_ranges(
+            source,
+            after..header_limit,
+            marker.signature.iter().copied(),
+        );
+        if marker.signature.ends_with(b"g")
+            && args
+                .last()
+                .is_none_or(|a| source.as_bytes()[a.start] != b'{')
+        {
+            continue;
+        }
+        let header_end = args.last().map_or(after, |a| a.end);
+        let Some(end) = source[header_end..limit].find('\n').map(|n| header_end + n) else {
+            continue;
+        };
+        let rest = source[header_end..end].trim_start_matches([' ', '\t', '\r']);
+        if rest.is_empty() || rest.starts_with('%') {
+            events.push(Event {
+                pos: end,
+                block: i,
+                start: true,
+                unit,
+            });
+            active.insert(parent, i);
+        }
+    }
+    for (parent, last) in active {
+        events.push(Event {
+            pos: blocks[parent].body.end,
+            block: last,
+            start: false,
+            unit: "",
+        });
+    }
 }
 
 fn indentation_unit<'a>(
@@ -848,6 +1019,107 @@ fn indent_with_argument_ranges(
     let spaces = " ".repeat(256);
     let mut branches = BTreeMap::new();
     let newlines: Vec<usize> = memchr::memchr_iter(b'\n', source.as_bytes()).collect();
+    let indent = &config.config.indent;
+    let markers = [
+        (
+            indent.beamer_columns && source.contains(r"\column"),
+            IndentMarker {
+                command: "column",
+                environment: "columns",
+                signature: b"dog",
+                unit_category: "environment",
+            },
+        ),
+        (
+            indent.pgfplots_panels && source.contains(r"\nextgroupplot"),
+            IndentMarker {
+                command: "nextgroupplot",
+                environment: "groupplot",
+                signature: b"o",
+                unit_category: "environment",
+            },
+        ),
+        (
+            indent.bibliography_items && source.contains(r"\bibitem"),
+            IndentMarker {
+                command: "bibitem",
+                environment: "thebibliography",
+                signature: b"og",
+                unit_category: "item",
+            },
+        ),
+        (
+            indent.beamer_overprint && source.contains(r"\onslide"),
+            IndentMarker {
+                command: "onslide",
+                environment: "overprint",
+                signature: b"",
+                unit_category: "environment",
+            },
+        ),
+    ];
+    let mut markers = markers
+        .iter()
+        .filter(|(enabled, marker)| {
+            *enabled
+                && !config.config.syntax.commands.contains_key(marker.command)
+                && !config
+                    .config
+                    .syntax
+                    .environment_arguments
+                    .contains_key(marker.environment)
+        })
+        .peekable();
+    if markers.peek().is_some() {
+        let analysis = SourceAnalysis::with_memo(
+            source,
+            &config.config,
+            protected,
+            std::rc::Rc::clone(&parsed.metadata),
+        );
+        let commands = analysis.declared_commands()?;
+        let environments = analysis.declared_environments()?;
+        for (_, marker) in markers {
+            if !commands.contains(marker.command) && !environments.contains(marker.environment) {
+                marker_indent_events(
+                    source,
+                    blocks,
+                    marker,
+                    indent.unit_with_spaces(marker.unit_category, marker.command, &spaces),
+                    &mut events,
+                );
+            }
+        }
+    }
+    if source.contains(r"\CodeAfter") {
+        let analysis = SourceAnalysis::with_memo(
+            source,
+            &config.config,
+            protected,
+            std::rc::Rc::clone(&parsed.metadata),
+        );
+        for (marker, parent) in
+            crate::package_tables::code_after_markers(blocks, &config.config, &analysis)?
+        {
+            let block = &blocks[marker];
+            let environment = &blocks[parent];
+            let after =
+                environment_argument_range(source, block.begin.end, environment.body.end, b'o')
+                    .map_or(block.begin.end, |range| range.end);
+            events.push(Event {
+                pos: after,
+                block: marker,
+                start: true,
+                unit: indent.unit_with_spaces("environment", &environment.name, &spaces),
+            });
+            events.push(Event {
+                pos: environment.body.end,
+                block: marker,
+                start: false,
+                unit: "",
+            });
+        }
+    }
     for (i, block) in blocks.iter().enumerate() {
         if i < original_blocks.len()
             && configuration_ranges
@@ -992,11 +1264,7 @@ fn indent_with_argument_ranges(
         };
         if body.trim_matches([' ', '\t']).is_empty() {
             blanks += 1;
-            let maximum = if config.config.whitespace.preserve_blank_lines {
-                config.config.whitespace.max_blank_lines
-            } else {
-                Some(0)
-            };
+            let maximum = config.config.whitespace.blank_lines.limit();
             if maximum.is_none_or(|maximum| blanks <= maximum) {
                 output.push_str(&body[..content_end]);
                 output.push_str(ending);
@@ -1116,6 +1384,7 @@ pub(crate) fn environment_signature(name: &str) -> Option<&'static str> {
         "minipage" => "ooom",
         "alignat" | "alignat*" | "thebibliography" => "m",
         "alignedat" => "om",
+        "IEEEeqnarray" | "IEEEeqnarray*" => "om",
         "list" => "mm",
         "picture" => "pp",
         "align" | "align*" | "gather" | "gather*" | "multline" | "multline*" | "flalign"
@@ -1338,7 +1607,7 @@ fn automatic_environment_after(
         return BreakMode::Preserve;
     };
     let name = name.trim_end_matches('*');
-    if !matches!(name, "caption" | "captionof" | "subcaption") {
+    if !is_paragraph_caption(name) {
         return BreakMode::Preserve;
     }
     // Standard caption commands end the paragraph and discard trailing glue.
@@ -1353,34 +1622,22 @@ fn automatic_environment_after(
     }
 }
 
+fn is_paragraph_caption(name: &str) -> bool {
+    matches!(name, "caption" | "subcaption" | "captionof")
+        || crate::packages::equation_floats::bilingual_caption_signature(name).is_some()
+}
+
 fn paragraph_command_end(source: &str, block: &Block) -> Option<usize> {
     let signature = match block.name.trim_end_matches('*') {
         "caption" | "subcaption" => "om",
         "captionof" => "mom",
-        _ => return None,
+        _ => crate::packages::equation_floats::command_signature(
+            source,
+            &block.name,
+            block.begin.end,
+        )?,
     };
-    let mut cursor = block.begin.end;
-    for slot in signature.bytes() {
-        let start = crate::trivia::skip(source, cursor);
-        let end = match slot {
-            b'o' => syntax::balanced_end(source, start, b'[', b']'),
-            b'm' if source.as_bytes().get(start) == Some(&b'{') => {
-                syntax::balanced_end(source, start, b'{', b'}')
-            }
-            b'm' if source.as_bytes().get(start) == Some(&b'\\') => {
-                syntax::command_at(source, start)
-                    .map(|(name, end)| end - usize::from(name.len() > 1 && name.ends_with('*')))
-            }
-            b'm' => source[start..].chars().next().map(|c| start + c.len_utf8()),
-            _ => None,
-        };
-        match end {
-            Some(end) => cursor = end,
-            None if slot == b'o' => (),
-            None => return None,
-        }
-    }
-    Some(cursor)
+    syntax::arguments::signature_end(source, block.begin.end, signature)
 }
 
 fn environment_argument_range(
@@ -1919,7 +2176,7 @@ fn table_rule_boundaries(
                 {
                     continue;
                 }
-                let Some(end) = crate::table_rules::rule_end(
+                let Some(mut end) = crate::table_rules::rule_end(
                     source,
                     token.span.start,
                     block.body.end,
@@ -1927,6 +2184,29 @@ fn table_rule_boundaries(
                 ) else {
                     continue;
                 };
+                // When ranges share a physical line, give the group a single
+                // pair of boundaries. A named break rule takes precedence.
+                if name == "cmidrule"
+                    && named.is_none()
+                    && !config.config.breaks.split_cmidrules
+                    && !crate::package_tables::is_tabularray(&block.name)
+                {
+                    loop {
+                        let rest = source[end..block.body.end].trim_start_matches([' ', '\t']);
+                        let next = block.body.end - rest.len();
+                        if !rest.starts_with(r"\cmidrule")
+                            || !syntax::command_at(source, next).is_some_and(|(n, _)| n == name)
+                        {
+                            break;
+                        }
+                        let Some(close) =
+                            crate::table_rules::rule_end(source, next, block.body.end, &block.name)
+                        else {
+                            break;
+                        };
+                        end = close;
+                    }
+                }
                 let (before, after) = if let Some(rule) = named {
                     (rule.begin, rule.after)
                 } else {
@@ -1983,10 +2263,7 @@ fn apply_breaks(
         .iter()
         .filter(|block| {
             matches!(block.kind, BlockKind::Command | BlockKind::Heading)
-                && matches!(
-                    block.name.trim_end_matches('*'),
-                    "caption" | "captionof" | "subcaption"
-                )
+                && is_paragraph_caption(block.name.trim_end_matches('*'))
                 && !declared_commands.contains(block.name.trim_end_matches('*'))
                 && !config
                     .config
@@ -1999,7 +2276,7 @@ fn apply_breaks(
     let ending = preferred_ending(source, config);
     // New boundaries on a mixed-ending line inherit that line's ending. This
     // also keeps rewrap stable when it rejoins a command split in this stage.
-    let local_newlines = (config.config.whitespace.line_ending == LineEnding::Preserve
+    let local_newlines = (config.config.output.line_ending == LineEnding::Preserve
         && source.contains("\r\n"))
     .then(|| memchr::memchr_iter(b'\n', source.as_bytes()).collect::<Vec<_>>());
     let mut boundaries: BTreeMap<usize, Boundary> = BTreeMap::new();
@@ -2204,7 +2481,7 @@ fn apply_breaks(
     ) {
         record(pos, mode, before);
     }
-    for (pos, mode, before) in crate::tikz::boundaries(source, &blocks, config) {
+    for (pos, mode, before) in crate::tikz::boundaries(source, &blocks, config, protected) {
         // Only automatic path boundaries yield to an explicit environment
         // body preserve rule. Explicit path rules are recorded above.
         if before && preserved_path_begins.contains(&pos) {

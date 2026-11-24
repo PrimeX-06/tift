@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 mod cleanup;
+mod compact_strings;
 mod normalization;
 pub use cleanup::CleanupConfig;
 
@@ -17,12 +18,24 @@ pub use cleanup::CleanupConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BibtexConfig {
+    /// Apply bibliography settings inside literal filecontents bibliography files.
+    pub format_filecontents: bool,
     /// Normalize assignment layout. Field alignment also requires `align_fields`.
     pub normalize: bool,
     /// `preserve`, `lower`, or `upper` for entry types and regular field names.
     pub name_case: String,
     /// Align regular field assignments while normalizing.
     pub align_fields: bool,
+    pub separate_entries: bool,
+    pub compact_strings: bool,
+    /// Wrap literal author and editor lists at top-level name separators.
+    pub name_list_columns: Option<usize>,
+    /// Wrap long literal keyword lists after their outer commas.
+    pub keyword_columns: Option<usize>,
+    /// Width at which a literal list of related citation keys expands.
+    pub related_columns: Option<usize>,
+    /// Wrap long value expressions before each top-level concatenation operator.
+    pub concat_columns: Option<usize>,
     /// `preserve`, `braces`, or `quotes`; applies only to safe literal value pieces.
     pub value_delimiters: String,
     /// Empty preserves order; `canonical`, `alphabetical`, or a list of field names.
@@ -40,9 +53,16 @@ pub struct BibtexConfig {
 impl Default for BibtexConfig {
     fn default() -> Self {
         Self {
+            format_filecontents: true,
             normalize: true,
             name_case: "preserve".into(),
             align_fields: true,
+            separate_entries: true,
+            compact_strings: false,
+            name_list_columns: None,
+            keyword_columns: None,
+            related_columns: None,
+            concat_columns: None,
             value_delimiters: "preserve".into(),
             field_order: Vec::new(),
             sort: false,
@@ -66,6 +86,84 @@ impl BibtexConfig {
 pub fn validate(config: &BibtexConfig) -> Result<(), String> {
     normalization::validate(config)?;
     cleanup::validate(&config.cleanup)
+}
+
+/// A filecontents payload starts after the opening line and ends before the
+/// closing line, including when the environment itself is indented.
+fn embedded_body(region: &str, name: &str, header: usize) -> Option<Range<usize>> {
+    let mut open = crate::trivia::skip(region, header);
+    if region.as_bytes().get(open) == Some(&b'[') {
+        open = crate::trivia::skip(region, syntax::balanced_end(region, open, b'[', b']')?);
+    }
+    let end = syntax::balanced_end(region, open, b'{', b'}')?;
+    let file = region[open + 1..end - 1].trim();
+    let literal = file
+        .strip_prefix(r"\jobname")
+        .filter(|tail| !tail.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+        .unwrap_or(file);
+    if literal.contains(['\\', '{', '}', '%', '#', '~', '^'])
+        || !literal
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("bib"))
+    {
+        return None;
+    }
+    let first = end + region[end..].find('\n')? + 1;
+    let close = region.strip_suffix(&format!("\\end{{{name}}}"))?;
+    let last = close.rfind('\n')? + 1;
+    (first <= last && close[last..].trim_matches([' ', '\t']).is_empty()).then_some(first..last)
+}
+
+pub(crate) fn format_embedded(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut crate::parse_context::ParseContext<'_>,
+    bom_bytes: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<String, FormatError> {
+    let parsed = parsing.snapshot(source, false, false)?;
+    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
+        source,
+        &config.config,
+        &parsed.protected,
+        std::rc::Rc::clone(&parsed.metadata),
+    );
+    let declared = analysis.declared_environments()?;
+    let mut edits = Vec::new();
+    for span in &parsed.protected {
+        let region = &source[span.clone()];
+        let Some(("begin", command_end)) = syntax::command_at(region, 0) else {
+            continue;
+        };
+        let Some((name @ ("filecontents" | "filecontents*"), true, header)) =
+            syntax::env_after_command(region, "begin", command_end)
+        else {
+            continue;
+        };
+        if declared.contains(name)
+            || config
+                .config
+                .syntax
+                .environment_arguments
+                .contains_key(name)
+        {
+            continue;
+        }
+        let Some(body) = embedded_body(region, name, header) else {
+            continue;
+        };
+        let body = span.start + body.start..span.start + body.end;
+        let result = format_bibtex_detailed(&source[body.clone()], config)?;
+        for mut diagnostic in result.diagnostics {
+            diagnostic.span.start += body.start + bom_bytes;
+            diagnostic.span.end += body.start + bom_bytes;
+            diagnostics.push(diagnostic);
+        }
+        if result.text != source[body.clone()] {
+            edits.push((body, result.text));
+        }
+    }
+    crate::layout::apply_edits(source, edits)
 }
 
 pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {
@@ -156,12 +254,10 @@ fn format_bibtex_prepared(
     };
     let mut output = String::with_capacity(source.len());
     let mut outside_blanks = 0;
+    let mut previous_entry_end = None;
     let mut source_map = Vec::new();
-    let maximum_blank_lines = if config.config.whitespace.preserve_blank_lines {
-        config.config.whitespace.max_blank_lines
-    } else {
-        Some(0)
-    };
+    let mut strings = Vec::new();
+    let maximum_blank_lines = config.config.whitespace.blank_lines.limit();
     let newline = if source.contains("\r\n") {
         "\r\n"
     } else {
@@ -173,6 +269,7 @@ fn format_bibtex_prepared(
     while cursor < source.len() {
         let index = protected.partition_point(|range| range.end <= cursor);
         if let Some(range) = protected.get(index).filter(|range| range.start <= cursor) {
+            previous_entry_end = None;
             cursor = range.end;
             continue;
         }
@@ -195,6 +292,7 @@ fn format_bibtex_prepared(
         let open = skip_whitespace(source, cursor, source.len());
         if !matches!(bytes.get(open), Some(b'{' | b'(')) {
             if kind.eq_ignore_ascii_case("comment") {
+                previous_entry_end = None;
                 cursor = line_end(source, cursor, source.len());
                 write_outside_protected(
                     &mut output,
@@ -233,6 +331,7 @@ fn format_bibtex_prepared(
         };
         cursor = close + 1;
         if kind.eq_ignore_ascii_case("comment") {
+            previous_entry_end = None;
             write_outside_protected(
                 &mut output,
                 source,
@@ -260,6 +359,15 @@ fn format_bibtex_prepared(
             copy_start = cursor;
             continue;
         }
+        let regular =
+            !kind.eq_ignore_ascii_case("string") && !kind.eq_ignore_ascii_case("preamble");
+        if regular
+            && config.config.bibtex.separate_entries
+            && maximum_blank_lines != Some(0)
+            && let Some(start) = previous_entry_end
+        {
+            separate_entries(&mut output, start, newline);
+        }
         let base = entry_indent(source, entry_start);
         let indent = format!("{base}{}", config.config.indent.unit("bibtex", kind));
         let body_start = open + 1;
@@ -281,7 +389,15 @@ fn format_bibtex_prepared(
             ));
         } else if kind.eq_ignore_ascii_case("preamble") {
             output.push_str(&format_preamble(
-                source, body_start, close, &opening, closing, &base, &indent, newline,
+                source,
+                body_start,
+                close,
+                &opening,
+                closing,
+                &base,
+                &indent,
+                newline,
+                config.config.bibtex.concat_columns,
             )?);
         } else {
             output.push_str(&format_fields(
@@ -306,7 +422,29 @@ fn format_bibtex_prepared(
                 )
             }));
         }
+        if config.config.bibtex.compact_strings
+            && kind.eq_ignore_ascii_case("string")
+            && source[close + 1..]
+                .split('\n')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && source[physical_line_start(source, entry_start)..entry_start]
+                .trim_matches([' ', '\t'])
+                .is_empty()
+            && let Some(candidate) = compact_strings::Candidate::parse(
+                &output,
+                printed_start..output.len(),
+                opening.len(),
+                &base,
+                config,
+            )
+        {
+            strings.push(candidate);
+        }
         outside_blanks = 0;
+        previous_entry_end = regular.then_some(output.len());
         copy_start = cursor;
     }
     write_outside_protected(
@@ -333,7 +471,42 @@ fn format_bibtex_prepared(
     } else {
         output
     };
-    Ok(text)
+    // Sorting only permutes runs of regular entries; every string declaration
+    // still occupies its measured range. Resolve diagnostics before shrinking it.
+    compact_strings::render(text, &strings, config.config.wrap.columns)
+}
+
+fn separate_entries(output: &mut String, start: usize, newline: &str) {
+    let gap = &output[start..];
+    if !gap.lines().all(|line| {
+        let line = line.trim_matches([' ', '\t', '\r']);
+        line.is_empty() || line.starts_with('%')
+    }) {
+        return;
+    }
+    // A comment on the closing brace belongs to the preceding record.
+    let first = gap.split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let prefix = if first.trim_start().starts_with('%') {
+        first.len()
+    } else {
+        0
+    };
+    let rest = &gap[prefix..];
+    let indent = rest.rsplit('\n').next().unwrap_or("");
+    let leading = if let Some(percent) = rest.find('%') {
+        rest[..percent].rfind('\n').map_or(0, |i| i + 1)
+    } else {
+        rest.len() - indent.len()
+    };
+    let split = start + prefix;
+    let separator = if newline == "\r\n" {
+        "\r\n\r\n"
+    } else {
+        "\n\n"
+    };
+    if &output[split..split + leading] != separator {
+        output.replace_range(split..split + leading, separator);
+    }
 }
 
 fn write_outside_protected(
@@ -718,6 +891,9 @@ fn format_fields(
 ) -> Result<String, FormatError> {
     if !string_definition
         && (config.normalize
+            || config.name_list_columns.is_some()
+            || config.keyword_columns.is_some()
+            || config.related_columns.is_some()
             || config.name_case != "preserve"
             || !config.field_order.is_empty()
             || config.value_delimiters != "preserve")
@@ -800,14 +976,18 @@ fn format_fields(
         if string_definition {
             output.push_str(&source[value.clone()]);
         } else {
-            normalization::write_value(&mut output, &source[value.clone()], name, "preserve");
+            normalization::write_value(&mut output, &source[value.clone()], name, config);
+        }
+        let comma = !string_definition || source.as_bytes().get(next) == Some(&b',');
+        if let Some(columns) = config.concat_columns {
+            normalization::wrap_concat(&mut output, printed_start, indent, newline, columns, comma);
         }
         if let Some(origins) = &mut origins {
             origins.push((printed_start..output.len(), value));
         }
         // BibTeX string commands accept no automatically added trailing comma.
         // Preserve an authored comma, including separators between assignments.
-        if !string_definition || source.as_bytes().get(next) == Some(&b',') {
+        if comma {
             output.push(',');
         }
         output.push_str(newline);
@@ -843,6 +1023,7 @@ fn format_preamble(
     base: &str,
     indent: &str,
     newline: &str,
+    concat_columns: Option<usize>,
 ) -> Result<String, FormatError> {
     let (cursor, comments) = skip_trivia(source, start, end);
     let (value, next) = read_expression(source, cursor, end)?;
@@ -862,7 +1043,11 @@ fn format_preamble(
     output.push_str(newline);
     write_comments(&mut output, &comments, indent, newline);
     output.push_str(indent);
+    let printed_start = output.len();
     output.push_str(&source[value]);
+    if let Some(columns) = concat_columns {
+        normalization::wrap_concat(&mut output, printed_start, indent, newline, columns, comma);
+    }
     if comma {
         output.push(',');
     }

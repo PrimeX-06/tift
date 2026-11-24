@@ -281,6 +281,27 @@ fn separated_star(source: &str, name: &str, end: usize) -> bool {
     !name.ends_with('*') && source.as_bytes().get(trivia(source, end)) == Some(&b'*')
 }
 
+/// Complete call shapes used when measuring standalone kernel declarations.
+pub(crate) fn declaration_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    match name {
+        "setlength" | "addtolength" => Some("mm"),
+        "DeclareMathOperator" | "DeclareMathOperator*" => Some("smm"),
+        "put" => Some("r()m"),
+        "newtheorem" => {
+            let after_name = syntax::arguments::signature_end(source, end, "m")?;
+            Some(
+                if source.as_bytes().get(trivia(source, after_name)) == Some(&b'[') {
+                    "mom"
+                } else {
+                    "mmo"
+                },
+            )
+        }
+        "newtheorem*" => Some("smm"),
+        _ => None,
+    }
+}
+
 /// Ordered citation notes and delayed macro-patching arguments.
 pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
     if name == "setbeamertemplate" {
