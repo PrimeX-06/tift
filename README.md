@@ -15,14 +15,10 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 
 ## Features
 
-- Indent LaTeX environments, lists, and nested structures.
-- Align table columns, paired equations, matrices, and inline PGFPlots data tables, and format math spacing.
-- Format standalone and embedded BibTeX and BibLaTeX bibliographies, with optional sorting and cleanup.
-- Format the `.bst` files that tell BibTeX how to display bibliography entries.
-- Wrap prose at nearby sentence endings and keep references such as `Figure \ref{fig:setup}` and quantities such as `250 ms` together.
-- Support common LaTeX packages and CJK documents.
-- Preserve verbatim content and allow local formatting controls.
-- Format whole projects, preview changes, and check formatting in CI.
+- Indent nested LaTeX environments and lists, and align equations and table columns.
+- Tidy entries in `.bib` bibliographies and format the `.bst` files that tell BibTeX how to display them.
+- Keep existing prose line breaks or wrap paragraphs to a chosen width. Chinese, Japanese, and Korean text is supported.
+- Format a whole project, limit edits to lines changed in Git, or check formatting in CI.
 
 ## Install
 
@@ -44,29 +40,17 @@ See the [installation guide](https://github.com/PrimeX-06/tift/wiki/Getting-Star
 ## Quick start
 
 ```sh
-tift --diff main.tex                # preview changes
-tift --diff --changed-since HEAD    # preview edits on changed working-tree lines
-tift --diff journal.bst             # preview a bibliography style
-tift main.tex                       # format a file in place
-tift .                              # format a project recursively
-tift --check .                      # check formatting in CI
-tift --wrap --wrap-width 88 main.tex # wrap long prose
-tift --dump-config > tift.toml      # create a project configuration
+tift --diff main.tex              # preview formatting
+tift main.tex                     # apply it to this file
+tift .                            # format the whole project
+tift --check .                    # check formatting in CI
 ```
 
-Formatting preserves prose line breaks by default. Add `--backup` to keep a copy of each file before formatting.
-
-Use `tift --changed-since HEAD chapters/` to format lines added or edited since the last commit. This includes staged and unstaged edits and formats new, non-ignored input files in full. Supply another commit or tag to choose a different baseline.
-
-Concurrent tift processes serialize writes to the same output path, including backup rotation. Hidden `.tift-lock-*` files next to outputs provide a stable lock across atomic replacements.
-
-Files use UTF-8 by default. Declare another encoding in a header comment, such as `% !TeX encoding = windows-1252` or `% Encoding: latin1` in a bibliography. Formatting preserves the declared encoding.
-
-Use `tift --help` or the [command-line guide](https://github.com/PrimeX-06/tift/wiki/CLI) for more options.
+In a Git project, run `tift --diff --changed-since HEAD` to preview formatting on lines edited since your last commit. To preview a bibliography or its style file, use `tift --diff references.bib` or `tift --diff journal.bst`. [Command-line guide](https://github.com/PrimeX-06/tift/wiki/CLI)
 
 ## Performance
 
-**33.4 ms to check a single TeX file** (median, including CLI startup). Across all 7,720 files, 87.8% finished within 50 ms.
+**33.4 ms to check a single TeX file** with tift 0.1.9 on Windows 11 (median, including CLI startup). Across all 7,720 files, 87.8% finished within 50 ms.
 
 ```mermaid
 xychart-beta
@@ -76,7 +60,10 @@ xychart-beta
     bar [505, 6275, 371, 569]
 ```
 
-tift 0.1.9 checked every `.tex` file in 721 [OpenAI Math papers](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a). The benchmark excludes nine files from the paper missing `astra-plain.bst`.
+<details>
+<summary>Benchmark setup and reproduction</summary>
+
+tift 0.1.9 checked the TeX sources of 721 papers. Nine files from a paper missing `astra-plain.bst` were excluded. [Benchmark corpus](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a)
 
 Each file’s time is the median of three separate CLI runs with one worker, default settings, and the tift cache disabled on Windows 11 (Core i9-14900HX). The chart includes all 429 files that reported errors.
 
@@ -84,9 +71,11 @@ Each file’s time is the median of three separate CLI runs with one worker, def
 python performance/openai_math.py --tift path/to/tift --all-files --runs 3
 ```
 
+</details>
+
 ## Configuration
 
-To customize formatting, create **`tift.toml`** beside your project's `main.tex`:
+To indent by four spaces and wrap prose at 88 columns, save this as `tift.toml` beside your project's `main.tex`.
 
 ```toml
 [indent]
@@ -97,13 +86,7 @@ mode = "wrap"
 columns = 88
 ```
 
-tift discovers project settings automatically. The [configuration guide](https://github.com/PrimeX-06/tift/wiki/Configuration-Guide) explains setup; the [reference](https://github.com/PrimeX-06/tift/wiki/Configuration) lists all options.
-
-Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
-
-Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
-
-By default, tift formats `filecontents` and `filecontents*` payloads with supported filename extensions: `.tex`, `.ltx`, `.drv`, `.tikz`, `.sty`, `.def`, `.cfg`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.dbx`, `.cls`, `.clo`, `.bib`, `.bst`, `.dtx`, `.fdd`, and `.ins`. Each payload uses its standalone formatter. Set `bibtex.format-filecontents = false` to preserve embedded contents. Literal whitespace-separated rows in `\addplot table` are also aligned by default, controlled by `breaks.pgfplots-tables`.
+tift loads the file automatically when you format the project. [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
 
 ## Editor
 
