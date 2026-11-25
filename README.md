@@ -7,7 +7,7 @@ tift keeps the source of a shared paper easy to review. Equations and table colu
 
 **[Try the Playground](https://primex-06.github.io/tift/#playground)** — Paste your own LaTeX or BibTeX snippet and see the formatted source as you type.
 
-[Install](#install) · [Quick start](#quick-start) · [Format on save](#format-on-save-in-vs-code) · [User guide](https://github.com/PrimeX-06/tift/wiki)
+[Install](#install) · [Quick start](#quick-start) · [Editor](#editor) · [User guide](https://github.com/PrimeX-06/tift/wiki)
 
 ![LaTeX before and after formatting, showing environment indentation, math spacing, and alignment of equations and table columns](site/branding/tift-latex-formatting.png)
 
@@ -79,9 +79,9 @@ columns = 88
 
 tift loads the file automatically when you format the project. [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
 
-## Format on save in VS Code
+## Editor
 
-To format on save in VS Code, install [LaTeX Workshop](https://marketplace.visualstudio.com/items?itemName=James-Yu.latex-workshop) and add this to `.vscode/settings.json`:
+To use tift as the LaTeX formatter in VS Code, install [LaTeX Workshop](https://marketplace.visualstudio.com/items?itemName=James-Yu.latex-workshop) and make sure `tift` is on your `PATH`. Add these settings to `.vscode/settings.json` so the extension runs tift through its `latexindent` backend.
 
 ```json
 {
@@ -89,13 +89,12 @@ To format on save in VS Code, install [LaTeX Workshop](https://marketplace.visua
     "latex-workshop.formatting.latexindent.path": "tift",
     "latex-workshop.formatting.latexindent.args": ["--print", "%TMPFILE%"],
     "[latex]": {
-        "editor.defaultFormatter": "James-Yu.latex-workshop",
-        "editor.formatOnSave": true
+        "editor.defaultFormatter": "James-Yu.latex-workshop"
     }
 }
 ```
 
-See the [editor guide](https://github.com/PrimeX-06/tift/wiki/VS-Code) for setup details and troubleshooting.
+Open a `.tex` file and run **Format Document** from the Command Palette. To also format on save, add `"editor.formatOnSave": true` inside the `[latex]` block. [Editor guide](https://github.com/PrimeX-06/tift/wiki/VS-Code)
 
 ## Documentation
 
