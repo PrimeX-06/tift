@@ -92,9 +92,9 @@ def prepare(checkout, work):
     )
 
 
-def check(binary, papers, workers, expected):
+def check(binary, papers, workers, expected, target="."):
     process = subprocess.run([binary, "--check", "--no-cache", "--no-config", "--threads",
-                              str(workers), "."], cwd=papers, capture_output=True)
+                              str(workers), str(target)], cwd=papers, capture_output=True)
     messages = process.stderr.decode("utf-8", "replace")
     summary = re.search(r"(?m)^(\d+) file\(s\) would change; (\d+) checked\.\r?$", messages)
     diagnostics = re.findall(r"(?m)^(.+?): error: ", messages)
@@ -112,12 +112,29 @@ def positive(value):
     return number
 
 
+def time_individual_files(binary, papers, count, runs):
+    paths = [path.relative_to(papers) for path in papers.rglob("*.tex")]
+    if count > len(paths):
+        raise ValueError(f"Requested {count} files from a corpus of {len(paths)}")
+    # Ranking the relative paths by hash keeps the sample stable across platforms.
+    paths.sort(key=lambda path: hashlib.sha256(path.as_posix().encode()).digest())
+    timings = {path: [] for path in paths[:count]}
+    for i in range(runs):
+        for path, samples in timings.items():
+            start = time.perf_counter()
+            check(binary, papers, 1, 1, path)
+            samples.append((time.perf_counter() - start) * 1000)
+        print(f"Single-file pass {i + 1}: {count} checks", file=sys.stderr, flush=True)
+    return {path.as_posix(): statistics.median(samples) for path, samples in timings.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tift", required=True, help="release executable")
     parser.add_argument("--checkout", type=Path, help="reuse local openai/math Git objects")
     parser.add_argument("--temp-dir", type=Path, help="parent directory for temporary corpus")
-    parser.add_argument("--workers", type=positive, default=8, help="concurrent manuscripts")
+    parser.add_argument("--workers", type=positive, default=8, help="worker threads for the whole-corpus check")
+    parser.add_argument("--sample-files", type=positive, help="time a fixed sample of files individually, one thread per invocation")
     parser.add_argument("--runs", type=positive, default=3)
     args = parser.parse_args()
     binary = Path(shutil.which(args.tift) or args.tift).resolve(strict=True)
@@ -126,7 +143,7 @@ def main():
     result = {"revision": REVISION, "version": subprocess.check_output([binary, "--version"], text=True).strip(),
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "platform": platform.platform(), "processor": platform.processor(),
-              "workers": args.workers, "runs": []}
+              "workers": 1 if args.sample_files else args.workers}
     with tempfile.TemporaryDirectory(dir=args.temp_dir, prefix="tift-math-") as work:
         papers, paper_count, file_count, size, excluded_files, excluded_bytes = prepare(
             args.checkout, Path(work)
@@ -139,14 +156,19 @@ def main():
             excluded_files=excluded_files,
             excluded_bytes=excluded_bytes,
         )
-        for i in range(args.runs):
-            start = time.perf_counter()
-            outcome = check(binary, papers, args.workers, result["files"])
-            elapsed = time.perf_counter() - start
-            result["runs"].append({"seconds": elapsed, "files_with_errors": outcome[0],
-                                   "diagnostics": outcome[1], "would_change": outcome[2]})
-            print(f"Run {i + 1}: {elapsed:.3f}s, {outcome[0]} files with errors", file=sys.stderr, flush=True)
-    result["median_seconds"] = statistics.median(r["seconds"] for r in result["runs"])
+        if args.sample_files:
+            result["runs_per_file"] = args.runs
+            result["median_ms_by_file"] = time_individual_files(binary, papers, args.sample_files, args.runs)
+        else:
+            result["runs"] = []
+            for i in range(args.runs):
+                start = time.perf_counter()
+                outcome = check(binary, papers, args.workers, result["files"])
+                elapsed = time.perf_counter() - start
+                result["runs"].append({"seconds": elapsed, "files_with_errors": outcome[0],
+                                       "diagnostics": outcome[1], "would_change": outcome[2]})
+                print(f"Run {i + 1}: {elapsed:.3f}s, {outcome[0]} files with errors", file=sys.stderr, flush=True)
+            result["median_seconds"] = statistics.median(r["seconds"] for r in result["runs"])
     print(json.dumps(result, indent=2))
     return 0
 

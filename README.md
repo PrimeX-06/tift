@@ -63,13 +63,21 @@ Use `tift --help` or the [command-line guide](https://github.com/PrimeX-06/tift/
 
 ## Performance
 
-| Corpus | Sample | Median check time | Throughput |
-|---|---:|---:|---:|
-| [OpenAI Math](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a) | 721 papers · 7,720 `.tex` files · 121.9 MiB | 241.0 s | 32.0 files/s |
+**19.1 ms to check a single TeX file** (median, including CLI startup). Three quarters of the sampled files finished within 25 ms.
 
-Measured with `tift 0.1.8 --check --no-cache --no-config`, 8 workers, and 3 runs on Windows 11 with an Intel Core i9-14900HX. Every run checked 7,720 files, reported 429 diagnostic-bearing files, and marked 7,052 files for formatting. The sample pins OpenAI Math revision `adc7f1241b42e322a6451854ab7e4b4c146bf78a`. `latexmk` checked the 188 papers containing tift diagnostics. It compiled 187 roots. One paper requiring the unavailable `astra-plain.bst` style was excluded. Papers without tift diagnostics were not run through `latexmk`.
+```mermaid
+xychart-beta
+    title "Single-file check times"
+    x-axis ["≤25 ms", ">25–50 ms", ">50–100 ms", ">100 ms"]
+    y-axis "Files" 0 --> 200
+    bar [192, 35, 9, 20]
+```
 
-Run the same benchmark with `python performance/openai_math.py --tift path/to/tift --workers 8 --runs 3`.
+tift 0.1.9 checked 256 files sampled from 7,720 `.tex` files across 721 [OpenAI Math papers](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a). Each file’s time is the median of three separate CLI runs with one worker, default settings, and no tift cache on Windows 11 (Core i9-14900HX). One paper was excluded because its `astra-plain.bst` style was unavailable.
+
+```sh
+python performance/openai_math.py --tift path/to/tift --sample-files 256 --runs 3
+```
 
 ## Configuration
 

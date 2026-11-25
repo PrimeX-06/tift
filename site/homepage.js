@@ -59,29 +59,92 @@ function setupPlayground() {
   const status = document.querySelector("#playground-status");
   const copy = document.querySelector("#copy-output");
   const languages = document.querySelector(".language-switch");
-  const drafts = {
-    latex: source.value,
-    bibtex: `% TeX and LaTeX references
-@string{aw="Addison-Wesley"}
-
-@book{knuth1984,
-title={The {TeXbook}}, year=1984,
-   author={Donald E. Knuth},
-publisher=aw,
-volume={A}
-}
-
-@book{lamport1994,
-author="Leslie Lamport",year=1994,
-  title={{LaTeX}: A
-    Document  Preparation System},
-edition={2},
-publisher=aw,
-keywords={latex, writing}
-}
+  const examples = {
+    latex: [
+      String.raw`% Align equations and their labels
+\begin{align}
+v&=v_0+at\label{eq:velocity}\\
+x(t)&=x_0+v_0t+\frac12 at^2\label{eq:position}
+\end{align}
 `,
+      String.raw`% Line up table columns
+\begin{tabular}{lrr}
+Method&Trials&Accuracy\\
+\hline
+Baseline&20&0.81\\
+Fine-tuned&120&0.94\\
+\end{tabular}
+`,
+      String.raw`% Indent a nested list
+\begin{enumerate}
+\item Prepare the data.
+\begin{itemize}
+\item Remove duplicates.
+\item Split the training and test sets.
+\end{itemize}
+\item Fit the model.
+\end{enumerate}
+`,
+      String.raw`% Lay out a figure and its caption
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=.8\linewidth]{results}
+\caption{Accuracy by training epoch.}
+\label{fig:accuracy}
+\end{figure}
+`,
+      String.raw`% Align a matrix
+\[
+A=\begin{pmatrix}
+1&-12&0\\
+100&3&24\\
+0&7&-1
+\end{pmatrix}
+\]
+`,
+    ],
+    bibtex: [
+      `% Align journal article fields
+@article{shannon1948,author={Claude E. Shannon},
+title={A Mathematical Theory of Communication},
+journal={Bell System Technical Journal},volume={27},year={1948}}
+`,
+      `% Reuse a publisher across book entries
+@string{aw="Addison-Wesley"}
+@book{knuth1984,title={The {TeXbook}},author={Donald E. Knuth},
+publisher=aw,year={1984}}
+@book{lamport1994,title={{LaTeX}: A Document Preparation System},
+author={Leslie Lamport},publisher=aw,year={1994}}
+`,
+      `% Keep capitalization in a conference reference
+@inproceedings{attention2017,
+author={Vaswani, Ashish and others}, title={Attention Is All You Need},
+booktitle={Advances in Neural Information Processing Systems ({NeurIPS})},
+pages={5998--6008},year={2017}}
+`,
+    ],
   };
-  let language = languages.querySelector(":checked").value;
+  const snippets = [...examples.latex, ...examples.bibtex];
+  let previous;
+  try {
+    previous = sessionStorage.getItem("tift-playground-example");
+  } catch {
+    // Storage can be disabled in a private browsing session.
+  }
+  const choices = snippets.filter(snippet => snippet !== previous);
+  const pick = items => items[Math.floor(Math.random() * items.length)];
+  const initial = pick(choices);
+  let language = examples.latex.includes(initial) ? "latex" : "bibtex";
+  try {
+    sessionStorage.setItem("tift-playground-example", initial);
+  } catch {
+    // Random selection also works without storage.
+  }
+  const drafts = {
+    latex: language === "latex" ? initial : pick(examples.latex),
+    bibtex: language === "bibtex" ? initial : pick(examples.bibtex),
+  };
+  languages.querySelector(`input[value="${language}"]`).checked = true;
   let revision = 0;
   let timer;
   let worker;
