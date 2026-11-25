@@ -14,6 +14,9 @@ use tift::{CompiledConfig, Diagnostic, FileKind, FormatOutput, Severity};
 #[path = "config_io.rs"]
 mod config_io;
 
+#[path = "git_changes.rs"]
+mod git_changes;
+
 #[path = "project_context.rs"]
 mod project_context;
 
@@ -65,6 +68,9 @@ struct Args {
         help_heading = "Input and output"
     )]
     lines: Option<tift::LineRanges>,
+    /// Format added or modified worktree lines since a Git revision, including new non-ignored files.
+    #[arg(long, value_name = "REV", conflicts_with_all = ["lines", "show_config"], help_heading = "Input and output")]
+    changed_since: Option<String>,
     /// Print the built-in configuration as editable TOML.
     #[arg(long, exclusive = true, help_heading = "Configuration")]
     dump_config: bool,
@@ -247,6 +253,7 @@ impl Args {
 
 struct Job {
     path: PathBuf,
+    ranges: Option<tift::LineRanges>,
     source: Arc<String>,
     input: Arc<source_encoding::SourceFile>,
     kind: FileKind,
@@ -378,6 +385,9 @@ fn execute(args: &Args) -> Result<i32, String> {
         return Err("--backup requires an input file".into());
     }
     if stdin_count == 1 {
+        if args.changed_since.is_some() {
+            return Err("--changed-since requires worktree files, use --lines for stdin".into());
+        }
         return stdin(args, &mut loader);
     }
     let target = if let Some(path) = &args.output {
@@ -416,12 +426,30 @@ fn execute(args: &Args) -> Result<i32, String> {
         args.paths.clone()
     };
     let preparation_started = (args.trace || args.trace_detail).then(std::time::Instant::now);
+    let changes = args
+        .changed_since
+        .as_ref()
+        .map(|revision| git_changes::Changes::load(revision, &paths))
+        .transpose()?;
     let files = collect_files(&paths)?;
     let mut context = project_context::ProjectContext::default();
     let mut jobs = Vec::with_capacity(files.len());
     let mut preparation_errors = Vec::new();
-    for input in files {
+    for mut input in files {
         let path = input.path;
+        let changed_path = if let Some(changes) = &changes {
+            if input.identity.is_none() {
+                input.identity =
+                    Some(fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+            }
+            let canonical = input.identity.as_deref().unwrap();
+            if !changes.contains(canonical) && !args.print && args.output.is_none() {
+                continue;
+            }
+            Some((changes, canonical.to_owned()))
+        } else {
+            None
+        };
         let effective = match loader.for_path(&path) {
             Ok(effective) => effective,
             Err(error) => {
@@ -440,6 +468,10 @@ fn execute(args: &Args) -> Result<i32, String> {
             }
         };
         let source = Arc::clone(&input.text);
+        let ranges = match changed_path {
+            Some((changes, canonical)) => changes.ranges(&canonical, &source)?,
+            None => args.lines.clone(),
+        };
         let prepared = match recover_panic(|| {
             context.for_source(&path, Arc::clone(&source), effective.config)
         }) {
@@ -456,6 +488,7 @@ fn execute(args: &Args) -> Result<i32, String> {
             }
         };
         jobs.push(Job {
+            ranges,
             kind: FileKind::from_path(&path).expect("selected file has a supported extension"),
             path,
             source,
@@ -483,7 +516,7 @@ fn execute(args: &Args) -> Result<i32, String> {
     drop(context);
     drop(loader);
     let mut cache = persistent_cache::PersistentCache::default();
-    if !args.trace && !args.trace_detail && args.lines.is_none() {
+    if !args.trace && !args.trace_detail && args.lines.is_none() && changes.is_none() {
         for job in &mut jobs {
             job.cache = cache.request(
                 &job.path,
@@ -687,9 +720,15 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
         } else {
             None
         };
-        let (output, trace, details, _) =
-            format_cached_source(source, kind, &prepared.config, args, request.as_ref())
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+        let (output, trace, details, _) = format_cached_source(
+            source,
+            kind,
+            &prepared.config,
+            args,
+            args.lines.as_ref(),
+            request.as_ref(),
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
         cache.flush();
         (output, trace, details)
     };
@@ -807,9 +846,15 @@ fn format_job_inner(job: &Job, args: &Args) -> Result<Work, String> {
         ));
     }
     let original = Arc::clone(&job.source);
-    let (mut formatted, trace, details, cache_status) =
-        format_cached_source(&original, job.kind, &job.config, args, job.cache.as_ref())
-            .map_err(|e| format!("{}: {e}", job.path.display()))?;
+    let (mut formatted, trace, details, cache_status) = format_cached_source(
+        &original,
+        job.kind,
+        &job.config,
+        args,
+        job.ranges.as_ref(),
+        job.cache.as_ref(),
+    )
+    .map_err(|e| format!("{}: {e}", job.path.display()))?;
     let differs = original.as_str() != formatted.text;
     let encoded = job
         .input
@@ -852,6 +897,7 @@ fn format_cached_source(
     kind: FileKind,
     config: &CompiledConfig,
     args: &Args,
+    ranges: Option<&tift::LineRanges>,
     cache: Option<&persistent_cache::Request>,
 ) -> Result<CachedFormat, tift::FormatError> {
     if let Some(output) = cache.and_then(|cache| cache.load(source)) {
@@ -862,7 +908,7 @@ fn format_cached_source(
             persistent_cache::Status::Hit,
         ));
     }
-    let (output, trace, details) = format_source(source, kind, config, args)?;
+    let (output, trace, details) = format_source(source, kind, config, args, ranges)?;
     if let Some(cache) = cache {
         cache.store(&output);
     }
@@ -879,9 +925,10 @@ fn format_source(
     kind: FileKind,
     config: &CompiledConfig,
     args: &Args,
+    ranges: Option<&tift::LineRanges>,
 ) -> Result<(FormatOutput, Vec<StageTrace>, Vec<tift::trace::DetailTrace>), tift::FormatError> {
     let format = |text: &str| {
-        if let Some(ranges) = &args.lines {
+        if let Some(ranges) = ranges {
             let (output, stages) = if args.trace || args.trace_detail {
                 tift::ranges::format_ranges_traced(text, kind, config, ranges)?
             } else {

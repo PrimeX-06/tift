@@ -363,28 +363,33 @@ pub(super) fn write_value(output: &mut String, value: &str, field: &str, config:
 }
 
 fn write_literal(output: &mut String, literal: &str) {
+    let protected = literal_code_and_comments(literal);
+    let mut spans = protected.iter().peekable();
     let mut copied = 0;
     let mut offset = 0;
     for (index, line) in literal.split_inclusive('\n').enumerate() {
-        let end = line
-            .match_indices('%')
-            .find(|&(at, _)| !crate::syntax::is_escaped(line, at))
-            .map_or(line.len(), |(at, _)| at);
-        let text = &line[..end];
+        let text = line.trim_end_matches(['\r', '\n']);
         // Preserve physical line margins and any explicit TeX control space.
         let start = if index == 0 {
             0
         } else {
             text.len() - text.trim_start_matches([' ', '\t']).len()
         };
-        let end = if line.ends_with('\n') && end == line.len() {
-            text.trim_end_matches([' ', '\t', '\r', '\n']).len()
+        let end = if line.ends_with('\n') {
+            text.trim_end_matches([' ', '\t']).len()
         } else {
             text.len()
         };
         if start < end {
             for spaces in crate::trivia::repeated_spaces(&text[start..end]) {
                 let at = start + spaces.start;
+                while spans.next_if(|r| r.end <= offset + at).is_some() {}
+                if spans
+                    .peek()
+                    .is_some_and(|r| r.start < offset + start + spaces.end)
+                {
+                    continue;
+                }
                 if !crate::syntax::is_escaped(line, at) {
                     output.push_str(&literal[copied..offset + at + 1]);
                     copied = offset + start + spaces.end;
@@ -394,6 +399,41 @@ fn write_literal(output: &mut String, literal: &str) {
         offset += line.len();
     }
     output.push_str(&literal[copied..]);
+}
+
+fn literal_code_and_comments(literal: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(delta) = memchr::memchr2(b'\\', b'%', &literal.as_bytes()[cursor..]) {
+        let start = cursor + delta;
+        if literal.as_bytes()[start] == b'%' {
+            cursor = literal[start..]
+                .find('\n')
+                .map_or(literal.len(), |n| start + n);
+            ranges.push(start..cursor);
+            continue;
+        }
+        let Some((name, end)) = crate::syntax::command_at(literal, start) else {
+            break;
+        };
+        cursor = end;
+        // Ordinary LaTeX allows _, : and @ as verb delimiters.
+        let word = name.split(['_', ':', '@']).next().unwrap_or(name);
+        let base = word.trim_end_matches('*');
+        if matches!(base, "verb" | "lstinline" | "mintinline")
+            || crate::code_package_syntax::INLINE_CODE_COMMANDS.contains(&base)
+            || crate::code_environments::INLINE_VERBATIM_COMMANDS.contains(&base)
+        {
+            let after = start + 1 + word.len();
+            cursor = crate::syntax::inline_end(literal, word, after).unwrap_or_else(|| {
+                literal[after..]
+                    .find('\n')
+                    .map_or(literal.len(), |n| after + n)
+            });
+            ranges.push(start..cursor);
+        }
+    }
+    ranges
 }
 
 fn quote_safe(inner: &str) -> bool {

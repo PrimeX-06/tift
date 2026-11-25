@@ -688,7 +688,11 @@ fn format_text_with_arguments(
             continue;
         }
         if let Some(prefix_len) = comment {
-            if !wrap_active || !config.config.comments.wrap || body[prefix_len..].trim().is_empty()
+            let comment_text = &body[prefix_len..];
+            if !wrap_active
+                || !config.config.comments.wrap
+                || comment_text.trim().is_empty()
+                || comment_text.starts_with("arara:")
             {
                 flush(
                     &mut paragraph,
@@ -766,6 +770,7 @@ fn format_text_with_arguments(
             let next_body = next_content.trim_start_matches([' ', '\t']);
             let continues = comment_prefix(next_body).is_some_and(|prefix_len| {
                 !next_body[prefix_len..].trim().is_empty()
+                    && !next_body[prefix_len..].starts_with("arara:")
                     && next_content[..next_content.len() - next_body.len()] == content[..indent_len]
                     && next_body[..prefix_len].trim_end_matches([' ', '\t']) == marker
             });
@@ -1217,6 +1222,7 @@ fn safe_text_body(
                         | "textbackslash"
                         | "ref"
                         | "eqref"
+                        | "pageref"
                         | "autoref"
                         | "cref"
                         | "Cref"
@@ -1823,16 +1829,24 @@ fn keep_prose_pairs(text: &mut Canonical, continuation: &str, config: &crate::Co
     if wrap.keep_number_units {
         text.quantities = quantity_ranges(text);
     }
-    if wrap.keep_reference_names && text.text.contains("\\ref") {
+    if wrap.keep_reference_names && text.text.contains("ref") {
         static REFERENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(
-                r"\b(?i:figures?|figs?\.|tables?|tabs?\.)[ \t]+\\ref\*?\{[^{}\\%\s]+\}",
-            )
+            regex::Regex::new(concat!(
+                r"\b(?:",
+                r"(?i:figures?|figs?\.|tables?|tabs?\.|sections?|secs?\.|chapters?|chaps?\.|ch\.|",
+                r"appendix|appendices|apps?\.|theorems?|thms?\.|lemmas?|lem\.|propositions?|props?\.|",
+                r"corollary|corollaries|cor\.|algorithms?|algs?\.|listings?|definitions?|defs?\.|examples?)[ \t]+\\ref|",
+                r"(?i:equations?|eqs?\.)[ \t]+\\(?:eqref|ref)|(?i:pages?|pp?\.)[ \t]+\\pageref",
+                r")\*?\{[^{}\\%\s]+\}",
+            ))
             .unwrap()
         });
+        let tab_width = config.config.indent.width;
+        let indent = display_width(continuation, 0, tab_width);
         for reference in REFERENCE.find_iter(&text.text) {
             if containing(reference.start(), &text.opaque).is_none()
                 && !text.text[..reference.start()].ends_with('\\')
+                && indent + display_width(reference.as_str(), indent, tab_width) <= wrap.columns
             {
                 pairs.push(reference.range());
             }
@@ -2634,6 +2648,7 @@ fn builtin_prose_command(name: &str) -> bool {
             | "label"
             | "ref"
             | "eqref"
+            | "pageref"
             | "autoref"
             | "cref"
             | "Cref"

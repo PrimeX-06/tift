@@ -2634,8 +2634,27 @@ fn definition(
     } else {
         cursor
     };
-    let (name, name_end) = syntax::command_at(source, tokens.get(name_at)?.span.start)?;
-    if target_group {
+    let (mut name, mut name_end) = syntax::command_at(source, tokens.get(name_at)?.span.start)?;
+    if !target_group
+        && name == "csname"
+        && syntax::expansion_precedes(source, tokens[at].span.start)
+    {
+        // The expanded name is the definition target. Registering the
+        // primitive itself would shadow every subsequent name construction.
+        let finish = syntax::csname_end(source, name_end, syntax::command_at)?;
+        let literal = source[name_end..finish]
+            .strip_suffix("\\endcsname")?
+            .trim_start();
+        if literal.is_empty()
+            || literal.contains(['\\', '%'])
+            || literal.contains(char::is_whitespace)
+        {
+            return None;
+        }
+        name = literal;
+        name_end = finish;
+        cursor = next(tokens, tokens.partition_point(|t| t.span.start < finish));
+    } else if target_group {
         let finish = closing_group(cursor)?;
         if next(tokens, name_at + 1) != finish {
             return None;

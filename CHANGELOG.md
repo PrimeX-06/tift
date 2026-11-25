@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Format lines added or edited since a Git revision with `--changed-since <REV>`. Run `tift --diff --changed-since HEAD` to preview formatting across staged and unstaged edits. New, non-ignored input files are formatted in full.
+- When wrapping display math, prefer line breaks between complete equations or inequalities. Preserve constructed control sequences and sized `\hbox` expressions during math layout.
+- Keep references such as `Section \ref{sec:intro}`, `Eq. \eqref{eq:main}`, and `page \pageref{app:data}` together when they fit on a line. Preserve arara directive lines when wrapping comments.
+- Preserve spaces in inline verbatim code inside BibTeX field values.
+- Try different indentation widths or tabs in the browser Playground and see the formatted output update as you edit.
+
+[Download tift 0.2.0](https://github.com/PrimeX-06/tift/releases/tag/v0.2.0) or install with `cargo install tift --version 0.2.0 --locked --registry crates-io`.
+
 ## 0.1.9
 
 - Format classic BibTeX `.bst` styles with indented function bodies, compact field lists, and optional trailing-comment alignment.

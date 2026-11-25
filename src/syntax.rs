@@ -829,20 +829,28 @@ fn literal_csname(source: &str, start: usize) -> Option<(String, usize)> {
 }
 
 fn constructed_operand_end(source: &str, start: usize) -> Option<usize> {
-    let ("csname", mut cursor) = command_at(source, start)? else {
+    let ("csname", cursor) = command_at(source, start)? else {
         return None;
     };
+    csname_end(source, cursor, command_at)
+}
+
+pub(crate) fn csname_end(
+    source: &str,
+    mut cursor: usize,
+    read_control: fn(&str, usize) -> Option<(&str, usize)>,
+) -> Option<usize> {
     let mut depth = 1usize;
     while cursor < source.len() {
         cursor = skip_trivia(source, cursor);
-        if let Some((name, end)) = command_at(source, cursor) {
-            if name == "csname" {
+        if let Some((name, end)) = read_control(source, cursor) {
+            if matches!(name.trim_end_matches('*'), "csname" | "ifcsname") {
                 depth += 1;
             }
-            if name == "endcsname" {
+            if name.trim_end_matches('*') == "endcsname" {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(end);
+                    return Some(end - usize::from(name.ends_with('*')));
                 }
             }
             cursor = end;
@@ -1195,7 +1203,7 @@ impl FormatDirectiveState {
     }
 }
 
-fn inline_end(source: &str, name: &str, mut pos: usize) -> Option<usize> {
+pub(crate) fn inline_end(source: &str, name: &str, mut pos: usize) -> Option<usize> {
     if crate::code_package_syntax::INLINE_CODE_COMMANDS.contains(&name.trim_end_matches('*')) {
         return crate::code_package_syntax::inline_code_end(source, name, pos);
     }

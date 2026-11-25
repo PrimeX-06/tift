@@ -23,7 +23,7 @@ struct Interval {
 /// Endpoints past the input's final line are harmless. Adjacent ranges merge;
 /// reversed endpoints are normalized. Inserted output lines belong to the
 /// preceding source line, or to the first source line at the start of a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineRanges {
     included: Vec<Interval>,
     excluded: Vec<Interval>,
@@ -38,10 +38,40 @@ impl LineRanges {
         value.parse()
     }
 
+    /// Select new or replaced physical lines, ignoring checkout LF/CRLF conversion.
+    /// Deletion-only edits select no line in the current document.
+    pub fn changed_since(original: &str, current: &str) -> Self {
+        fn lines(text: &str) -> Vec<(&str, bool)> {
+            text.split_inclusive('\n')
+                .map(|line| match line.strip_suffix('\n') {
+                    Some(body) => (body.strip_suffix('\r').unwrap_or(body), true),
+                    None => (line, false),
+                })
+                .collect()
+        }
+        let old = lines(original);
+        let new = lines(current);
+        let included = capture_diff_slices(Algorithm::Myers, &old, &new)
+            .into_iter()
+            .filter_map(|op| {
+                let (tag, _, range) = op.as_tag_tuple();
+                (tag != DiffTag::Equal && !range.is_empty()).then(|| Interval {
+                    start: range.start + 1,
+                    end: range.end,
+                })
+            })
+            .collect();
+        Self {
+            included,
+            excluded: Vec::new(),
+        }
+    }
+
     /// Returns whether this one-based line is selected.
     pub fn contains(&self, line: usize) -> bool {
         line != 0
-            && (self.included.is_empty() || includes(&self.included, line))
+            && (self.included.is_empty() && !self.excluded.is_empty()
+                || includes(&self.included, line))
             && !includes(&self.excluded, line)
     }
 

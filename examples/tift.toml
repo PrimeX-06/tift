@@ -66,7 +66,7 @@ mode = "preserve" # "wrap" folds long lines; "rewrap" joins then folds; "unwrap"
 # "stable" carries overflow onto the next prose line, preserving later line breaks.
 columns = 88
 prefer-sentence-ends = true # On overflow, prefer a nearby sentence end, then a Chinese comma, semicolon, or colon.
-keep-reference-names = true # Keep Figure, Fig., Table, etc. with a following literal \ref.
+keep-reference-names = true # Keep references such as Section \ref, Eq. \eqref and page \pageref together when they fit.
 keep-number-units = true # Keep plain quantities such as 250 ms, 37 °C, and 10 km together.
 avoid-lone-last-word = false # Keep a final English word with its predecessor when both fit.
 stage = "after"
@@ -77,7 +77,7 @@ long-words = "overflow" # "break" allows grapheme-safe splitting of long plain w
 # break-chars = ['-'] # Width-triggered tight breaks retain TeX spacing using %.
 
 [comments]
-wrap = false # Reflow comments during prose wrapping. Bulleted and numbered items use hanging indents.
+wrap = false # Reflow comments during prose wrapping. Lists use hanging indents and arara directives retain their lines.
 align-trailing = false # Align spaced end-of-line comments at the same indentation.
 
 # Arguments expand only with an active width, or explicit mode = "expand".

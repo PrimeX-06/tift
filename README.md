@@ -28,7 +28,7 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 
 ### Download a prebuilt binary (recommended)
 
-Download an archive for Windows, Linux, or macOS from the [latest GitHub Release](https://github.com/PrimeX-06/tift/releases/latest), extract the executable, and add its directory to `PATH`.
+Download a Windows, Linux, or macOS archive from the [tift 0.2.0 release](https://github.com/PrimeX-06/tift/releases/tag/v0.2.0), extract the executable, and add its directory to `PATH`.
 
 ### Install with Cargo
 
@@ -45,6 +45,7 @@ See the [installation guide](https://github.com/PrimeX-06/tift/wiki/Getting-Star
 
 ```sh
 tift --diff main.tex                # preview changes
+tift --diff --changed-since HEAD    # preview edits on changed working-tree lines
 tift --diff journal.bst             # preview a bibliography style
 tift main.tex                       # format a file in place
 tift .                              # format a project recursively
@@ -54,6 +55,8 @@ tift --dump-config > tift.toml      # create a project configuration
 ```
 
 Formatting preserves prose line breaks by default. Add `--backup` to keep a copy of each file before formatting.
+
+Use `tift --changed-since HEAD chapters/` to format lines added or edited since the last commit. This includes staged and unstaged edits and formats new, non-ignored input files in full. Supply another commit or tag to choose a different baseline.
 
 Concurrent tift processes serialize writes to the same output path, including backup rotation. Hidden `.tift-lock-*` files next to outputs provide a stable lock across atomic replacements.
 
@@ -98,7 +101,7 @@ tift discovers project settings automatically. The [configuration guide](https:/
 
 Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
 
-Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.1.9](https://github.com/PrimeX-06/tift/blob/v0.1.9/examples/tift.toml)
+Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
 
 By default, tift formats `filecontents` and `filecontents*` payloads with supported filename extensions: `.tex`, `.ltx`, `.drv`, `.tikz`, `.sty`, `.def`, `.cfg`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.dbx`, `.cls`, `.clo`, `.bib`, `.bst`, `.dtx`, `.fdd`, and `.ins`. Each payload uses its standalone formatter. Set `bibtex.format-filecontents = false` to preserve embedded contents. Literal whitespace-separated rows in `\addplot table` are also aligned by default, controlled by `breaks.pgfplots-tables`.
 

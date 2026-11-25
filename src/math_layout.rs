@@ -7,6 +7,7 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 mod modes;
+mod relations;
 mod symbols;
 
 use crate::{CompiledConfig, FileKind, FormatError, code_layout, syntax};
@@ -477,6 +478,26 @@ fn skip_space(source: &str, mut cursor: usize, end: usize) -> usize {
     cursor
 }
 
+fn contains_math_comment(body: &str) -> bool {
+    body.match_indices('%')
+        .any(|(at, _)| !syntax::is_escaped(body, at))
+}
+
+fn sized_hbox_end(source: &str, after: usize) -> Option<usize> {
+    let spec = crate::trivia::skip(source, after);
+    if !(source[spec..]
+        .get(..2)
+        .is_some_and(|s| s.eq_ignore_ascii_case("to"))
+        || source[spec..]
+            .get(..6)
+            .is_some_and(|s| s.eq_ignore_ascii_case("spread")))
+    {
+        return None;
+    }
+    let group = syntax::parameter_text_end(source, spec)?;
+    syntax::balanced_end(source, group, b'{', b'}')
+}
+
 // Preserve adjacent groups when the command has no trusted math signature.
 fn opaque_arguments(
     source: &str,
@@ -694,7 +715,9 @@ impl Editor<'_> {
         let mut body = range.start + 1..range.end - 1;
         let original_body = (body.start, body.end);
         // TeX comments retain the newline separating them from closing braces.
-        if self.source.as_bytes()[range.start] == b'{' && !self.source[body.clone()].contains('%') {
+        if self.source.as_bytes()[range.start] == b'{'
+            && !contains_math_comment(&self.source[body.clone()])
+        {
             let text = &self.source[body.clone()];
             let first = text.len() - text.trim_start_matches(char::is_whitespace).len();
             let mut last = text.trim_end_matches(char::is_whitespace).len();
@@ -882,7 +905,28 @@ impl Editor<'_> {
                 let signature = (!overridden)
                     .then(|| self.modes.signature_at(name, cursor))
                     .flatten();
-                if let Some(signature) = signature {
+                let input = &self.source[..end];
+                let constructed = matches!(name, "csname" | "ifcsname")
+                    .then(|| {
+                        syntax::csname_end(input, command_end, command_at)
+                            .or_else(|| (!overridden).then_some(end))
+                    })
+                    .flatten();
+                if let Some(finish) = constructed {
+                    range.end = finish;
+                    if name == "csname" {
+                        for argument in opaque_arguments(input, range.end, end) {
+                            range.end = argument.end;
+                        }
+                    }
+                    self.opaque.insert(cursor, range.end);
+                } else if !overridden
+                    && name == "hbox"
+                    && let Some(finish) = sized_hbox_end(input, command_end)
+                {
+                    range.end = finish;
+                    self.opaque.insert(cursor, finish);
+                } else if let Some(signature) = signature {
                     let modes = self.modes;
                     for argument in modes
                         .arguments_at(self.source, cursor, command_end, end, signature)
@@ -1017,6 +1061,8 @@ impl Editor<'_> {
         atoms.truncate(write);
         let mut previous = MathClass::Rel;
         let mut opener = false;
+        let mut previous_end = range.start;
+        let mut has_line_sign = false;
         for atom in &mut atoms {
             atom.unary = atom.class == MathClass::Bin
                 && (opener
@@ -1024,6 +1070,17 @@ impl Editor<'_> {
                         previous,
                         MathClass::Op | MathClass::Bin | MathClass::Rel | MathClass::Punct
                     ));
+            if !atom.unary
+                && atom.class == MathClass::Bin
+                && self.source[previous_end..atom.range.start].contains('\n')
+                && relations::is_sign(&self.source[atom.range.clone()])
+            {
+                has_line_sign = true;
+            }
+            previous_end = atom.range.end;
+            if matches!(&self.source[atom.range.clone()], "\\quad" | "\\qquad") {
+                continue;
+            }
             if atom.barrier {
                 previous = MathClass::Rel;
                 opener = false
@@ -1031,6 +1088,9 @@ impl Editor<'_> {
                 previous = atom.class;
                 opener = atom.delimiter == Some(DelimiterRole::Open)
             }
+        }
+        if has_line_sign {
+            relations::mark_authored_signs(self.source, &mut atoms);
         }
         atoms
     }
@@ -1299,7 +1359,8 @@ fn layout_displays(
             continue;
         }
         let body = &source[region.body.clone()];
-        if body.contains('%') || body.contains("\\\\") || overlaps(protected, &region.body) {
+        if contains_math_comment(body) || body.contains("\\\\") || overlaps(protected, &region.body)
+        {
             continue;
         }
         let line_start = source[..*start].rfind('\n').map_or(0, |offset| offset + 1);
@@ -1388,7 +1449,10 @@ fn layout_displays(
             continue;
         }
         let candidates = break_candidates(source, &atoms, layout.priority);
-        if let Some(replacement) = greedy_breaks(source, &atoms, &candidates, &layout)
+        let lines = relations::layout(source, &atoms, &candidates, &layout)
+            .or_else(|| greedy_breaks(source, &atoms, &candidates, &layout));
+        if let Some(lines) = lines
+            && let replacement = format!("{ending}{lines}{ending}{prefix}")
             && replacement != body
         {
             replacements.push((region.body.clone(), replacement))
@@ -1486,7 +1550,7 @@ fn greedy_breaks(
         })
         .unwrap_or(layout.unit_width);
     let ending = layout.ending;
-    let mut output = format!("{ending}{}{}", layout.prefix, layout.unit);
+    let mut output = format!("{}{}", layout.prefix, layout.unit);
     let gap_before = |index: usize| {
         let authored = &source[pieces[index - 1].end..pieces[index].start];
         if layout.spacing || authored.contains(['\r', '\n']) {
@@ -1571,8 +1635,6 @@ fn greedy_breaks(
             }
             start = stop;
         }
-        output.push_str(ending);
-        output.push_str(layout.prefix);
         return Some(output);
     }
     let mut width = layout.unit_width;
@@ -1597,8 +1659,6 @@ fn greedy_breaks(
         output.push_str(&text);
         width += piece_width;
     }
-    output.push_str(ending);
-    output.push_str(layout.prefix);
     Some(output)
 }
 
