@@ -119,13 +119,18 @@ def time_individual_files(binary, papers, count, runs):
     # Ranking the relative paths by hash keeps the sample stable across platforms.
     paths.sort(key=lambda path: hashlib.sha256(path.as_posix().encode()).digest())
     timings = {path: [] for path in paths[:count]}
+    files_with_errors = set()
     for i in range(runs):
-        for path, samples in timings.items():
+        for checked, (path, samples) in enumerate(timings.items(), 1):
             start = time.perf_counter()
-            check(binary, papers, 1, 1, path)
+            errors, _, _ = check(binary, papers, 1, 1, path)
             samples.append((time.perf_counter() - start) * 1000)
+            if errors:
+                files_with_errors.add(path)
+            if checked % 1000 == 0:
+                print(f"Pass {i + 1}/{runs}: {checked}/{count} files", file=sys.stderr, flush=True)
         print(f"Single-file pass {i + 1}: {count} checks", file=sys.stderr, flush=True)
-    return {path.as_posix(): statistics.median(samples) for path, samples in timings.items()}
+    return {path.as_posix(): samples for path, samples in timings.items()}, len(files_with_errors)
 
 
 def main():
@@ -134,7 +139,9 @@ def main():
     parser.add_argument("--checkout", type=Path, help="reuse local openai/math Git objects")
     parser.add_argument("--temp-dir", type=Path, help="parent directory for temporary corpus")
     parser.add_argument("--workers", type=positive, default=8, help="worker threads for the whole-corpus check")
-    parser.add_argument("--sample-files", type=positive, help="time a fixed sample of files individually, one thread per invocation")
+    individual = parser.add_mutually_exclusive_group()
+    individual.add_argument("--sample-files", type=positive, help="time a fixed sample of files individually, one thread per invocation")
+    individual.add_argument("--all-files", action="store_true", help="time every included .tex file individually, one thread per invocation")
     parser.add_argument("--runs", type=positive, default=3)
     args = parser.parse_args()
     binary = Path(shutil.which(args.tift) or args.tift).resolve(strict=True)
@@ -143,7 +150,7 @@ def main():
     result = {"revision": REVISION, "version": subprocess.check_output([binary, "--version"], text=True).strip(),
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "platform": platform.platform(), "processor": platform.processor(),
-              "workers": 1 if args.sample_files else args.workers}
+              "workers": 1 if args.sample_files or args.all_files else args.workers}
     with tempfile.TemporaryDirectory(dir=args.temp_dir, prefix="tift-math-") as work:
         papers, paper_count, file_count, size, excluded_files, excluded_bytes = prepare(
             args.checkout, Path(work)
@@ -156,9 +163,12 @@ def main():
             excluded_files=excluded_files,
             excluded_bytes=excluded_bytes,
         )
-        if args.sample_files:
+        if args.sample_files or args.all_files:
             result["runs_per_file"] = args.runs
-            result["median_ms_by_file"] = time_individual_files(binary, papers, args.sample_files, args.runs)
+            times, errors = time_individual_files(binary, papers, args.sample_files or file_count, args.runs)
+            result["elapsed_ms_by_file"] = times
+            result["median_ms_by_file"] = {path: statistics.median(samples) for path, samples in times.items()}
+            result["files_with_errors"] = errors
         else:
             result["runs"] = []
             for i in range(args.runs):
