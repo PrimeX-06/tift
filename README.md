@@ -18,7 +18,7 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 - Indent LaTeX environments, lists, and nested structures.
 - Align table columns, paired equations, matrices, and inline PGFPlots data tables, and format math spacing.
 - Format standalone and embedded BibTeX and BibLaTeX bibliographies, with optional sorting and cleanup.
-- Format classic BibTeX style programs (`.bst`), including field declarations, postfix expressions, and nested functions.
+- Format the `.bst` files that tell BibTeX how to display bibliography entries.
 - Wrap prose at nearby sentence endings and keep references such as `Figure \ref{fig:setup}` and quantities such as `250 ms` together.
 - Support common LaTeX packages and CJK documents.
 - Preserve verbatim content and allow local formatting controls.
@@ -104,8 +104,6 @@ Use `tift --dump-config > tift.toml` to start with all built-in settings, or `ti
 Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
 
 By default, tift formats `filecontents` and `filecontents*` payloads with supported filename extensions: `.tex`, `.ltx`, `.drv`, `.tikz`, `.sty`, `.def`, `.cfg`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.dbx`, `.cls`, `.clo`, `.bib`, `.bst`, `.dtx`, `.fdd`, and `.ins`. Each payload uses its standalone formatter. Set `bibtex.format-filecontents = false` to preserve embedded contents. Literal whitespace-separated rows in `\addplot table` are also aligned by default, controlled by `breaks.pgfplots-tables`.
-
-BibTeX style files use the project indentation and whitespace settings. Each top-level command starts on its own line. Multiline groups indent one level, with an extra level for the two explicit branches of a multiline `if$`. Short anonymous functions can stay inline. A single-line `FUNCTION` definition containing just one quoted string stays on one line when it has no comment and fits `wrap.columns`. Quoted strings retain their exact contents. Set `comments.align-trailing = true` to align consecutive comments at the same indentation. The formatter accepts complete commands individually or as a program. It reports malformed tokens and groups at their source locations. BibTeX handles name resolution, command ordering, and stack evaluation.
 
 ## Editor
 
