@@ -64,6 +64,12 @@
           <div class="code-panel">
             <div class="panel-bar">
               <label for="playground-source">Source</label>
+              <select id="playground-indent" aria-label="Output indentation" title="Output indentation">
+                <option value="2">2 spaces</option>
+                <option value="4" selected>4 spaces</option>
+                <option value="8">8 spaces</option>
+                <option value="tabs">Tabs</option>
+              </select>
             </div>
             <div class="source-editor">
               <pre aria-hidden="true"><code id="source-highlight"></code></pre>

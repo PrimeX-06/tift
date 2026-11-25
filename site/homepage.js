@@ -59,68 +59,186 @@ function setupPlayground() {
   const status = document.querySelector("#playground-status");
   const copy = document.querySelector("#copy-output");
   const languages = document.querySelector(".language-switch");
+  const indentation = document.querySelector("#playground-indent");
   const examples = {
     latex: [
-      String.raw`% Align equations and their labels
+      String.raw`% Motion under constant acceleration
+\section{A ball in flight}
+Let $v_0$ be the launch speed and $\theta$ the angle.
+Choose the launch point as the origin.
+
 \begin{align}
-v&=v_0+at\label{eq:velocity}\\
-x(t)&=x_0+v_0t+\frac12 at^2\label{eq:position}
+a_x&=0, & a_y&=-g,\\
+v_x(t)&=v_0\cos\theta, & v_y(t)&=v_0\sin\theta-gt,\\
+x(t)&=v_0t\cos\theta, & y(t)&=v_0t\sin\theta-\tfrac12 gt^2.
 \end{align}
+
+At the highest point the vertical velocity is zero.
+For a landing at the launch height we obtain
+\begin{align}
+t_{\mathrm{peak}}&=\frac{v_0\sin\theta}{g},\\
+h_{\max}&=\frac{v_0^2\sin^2\theta}{2g},\\
+t_{\mathrm{flight}}&=2t_{\mathrm{peak}},\\
+R&=v_0t_{\mathrm{flight}}\cos\theta
+\label{eq:range}
+\end{align}
+Equation~\eqref{eq:range} gives the horizontal range.
 `,
-      String.raw`% Line up table columns
-\begin{tabular}{lrr}
-Method&Trials&Accuracy\\
+      String.raw`% Compare classifiers on held-out data
+\begin{table}[htbp]
+\centering
+\caption{Test results by classifier.}
+\label{tab:classifiers}
+\begin{tabular}{lrrr}
 \hline
-Baseline&20&0.81\\
-Fine-tuned&120&0.94\\
+Model&Precision&Recall&F1\\
+\hline
+Majority vote&0.50&1.00&0.67\\
+Naive Bayes&0.78&0.72&0.75\\
+Logistic regression&0.84&0.80&0.82\\
+Decision tree&0.81&0.79&0.80\\
+Random forest&0.88&0.85&0.86\\
+Gradient boosting&0.90&0.87&0.88\\
+\hline
 \end{tabular}
+\end{table}
+
+Table~\ref{tab:classifiers} compares the same test split.
+Gradient boosting gives the highest F1 score.
 `,
-      String.raw`% Indent a nested list
+      String.raw`% Outline a reproducible experiment
+\section{Experimental protocol}
 \begin{enumerate}
-\item Prepare the data.
+\item Prepare the observations.
 \begin{itemize}
-\item Remove duplicates.
-\item Split the training and test sets.
+\item Remove duplicate measurements.
+\item Keep one row per subject.
+\item Reserve a held-out test set.
 \end{itemize}
-\item Fit the model.
+\item Train the models.
+\begin{itemize}
+\item Fit a baseline on the training split.
+\item Tune the learning rate on the validation split.
+\item Save the selected parameters.
+\end{itemize}
+\item Report the results.
+\begin{itemize}
+\item Evaluate once on the test split.
+\item Plot residuals against predicted values.
+\end{itemize}
 \end{enumerate}
 `,
-      String.raw`% Lay out a figure and its caption
+      String.raw`% Compare two views of a training run
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=.8\linewidth]{results}
-\caption{Accuracy by training epoch.}
+\begin{subfigure}{.47\linewidth}
+\centering
+\includegraphics[width=\linewidth]{training-loss}
+\caption{Training loss by epoch.}
+\label{fig:loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.47\linewidth}
+\centering
+\includegraphics[width=\linewidth]{validation-accuracy}
+\caption{Validation accuracy by epoch.}
 \label{fig:accuracy}
+\end{subfigure}
+\caption{Learning curves for the selected model.}
+\label{fig:learning}
 \end{figure}
+
+Figure~\ref{fig:learning} shows both curves.
+The loss in panel~\ref{fig:loss} stabilizes first.
 `,
-      String.raw`% Align a matrix
+      String.raw`% Apply a rotation and a scaling
+\section{Planar transformations}
+A quarter turn followed by a stretch changes a point as follows.
 \[
-A=\begin{pmatrix}
-1&-12&0\\
-100&3&24\\
-0&7&-1
-\end{pmatrix}
+R=\begin{pmatrix}
+0&-1\\
+1&0
+\end{pmatrix},
+\qquad
+S=\begin{pmatrix}
+2&0\\
+0&3
+\end{pmatrix}.
 \]
+
+\begin{align}
+p&=\begin{pmatrix}2\\1\end{pmatrix},\\
+Rp&=\begin{pmatrix}-1\\2\end{pmatrix},\\
+SRp&=\begin{pmatrix}-2\\6\end{pmatrix}.
+\end{align}
+The order matters because $SR\ne RS$.
 `,
     ],
     bibtex: [
-      `% Align journal article fields
-@article{shannon1948,author={Claude E. Shannon},
+      `% Journal articles on information theory
+@article{shannon1948,
+author={Claude E. Shannon},
 title={A Mathematical Theory of Communication},
-journal={Bell System Technical Journal},volume={27},year={1948}}
+journal={Bell System Technical Journal},
+volume={27},
+number={3},
+pages={379--423},
+year={1948},
+doi={10.1002/j.1538-7305.1948.tb01338.x}
+}
+
+@article{huffman1952,
+author={David A. Huffman},
+title={A Method for the Construction of Minimum-Redundancy Codes},
+journal={Proceedings of the IRE},
+volume={40},
+number={9},
+pages={1098--1101},
+year={1952},
+doi={10.1109/JRPROC.1952.273898}
+}
 `,
       `% Reuse a publisher across book entries
 @string{aw="Addison-Wesley"}
-@book{knuth1984,title={The {TeXbook}},author={Donald E. Knuth},
-publisher=aw,year={1984}}
-@book{lamport1994,title={{LaTeX}: A Document Preparation System},
-author={Leslie Lamport},publisher=aw,year={1994}}
+
+@book{knuth1984,
+title={The {TeXbook}},
+author={Donald E. Knuth},
+publisher=aw,
+series={Computers and Typesetting},
+volume={A},
+year={1984}
+}
+
+@book{lamport1994,
+title={{LaTeX}: A Document Preparation System},
+author={Leslie Lamport},
+publisher=aw,
+edition={2},
+year={1994},
+isbn={978-0-201-52983-8}
+}
 `,
-      `% Keep capitalization in a conference reference
-@inproceedings{attention2017,
-author={Vaswani, Ashish and others}, title={Attention Is All You Need},
-booktitle={Advances in Neural Information Processing Systems ({NeurIPS})},
-pages={5998--6008},year={2017}}
+      `% Conference papers on neural networks
+@inproceedings{vaswani2017,
+author={Vaswani, Ashish and others},
+title={Attention Is All You Need},
+booktitle={Advances in Neural Information Processing Systems},
+volume={30},
+pages={5998--6008},
+year={2017}
+}
+
+@inproceedings{he2016,
+author={He, Kaiming and Zhang, Xiangyu and
+Ren, Shaoqing and Sun, Jian},
+title={Deep Residual Learning for Image Recognition},
+booktitle={Proceedings of the {IEEE} Conference on
+Computer Vision and Pattern Recognition},
+pages={770--778},
+year={2016},
+doi={10.1109/CVPR.2016.90}
+}
 `,
     ],
   };
@@ -186,6 +304,8 @@ pages={5998--6008},year={2017}}
         revision: current,
         source: text,
         bibtex: language === "bibtex",
+        indentWidth: indentation.value === "tabs" ? 4 : Number(indentation.value),
+        useTabs: indentation.value === "tabs",
       }), 150);
     }
   }
@@ -205,6 +325,7 @@ pages={5998--6008},year={2017}}
   update();
   source.addEventListener("scroll", syncScroll, { passive: true });
   source.addEventListener("input", update);
+  indentation.addEventListener("change", update);
   source.addEventListener("compositionstart", () => { composing = true; });
   source.addEventListener("compositionend", () => {
     composing = false;
@@ -240,7 +361,7 @@ pages={5998--6008},year={2017}}
       } else {
         highlight(output, data.text, language);
         copy.disabled = data.text.length === 0;
-        setStatus(data.diagnostic || "Formatted with default settings.", data.diagnostic ? "warning" : "");
+        setStatus(data.diagnostic || "Formatted.", data.diagnostic ? "warning" : "");
       }
     }
   });
@@ -260,7 +381,7 @@ async function startFormatter() {
   self.addEventListener("message", ({ data }) => {
     let result;
     try {
-      result = formatSnippet(data.source, data.bibtex);
+      result = formatSnippet(data.source, data.bibtex, data.indentWidth, data.useTabs);
       self.postMessage({
         revision: data.revision,
         text: result.text,

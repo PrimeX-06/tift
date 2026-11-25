@@ -257,6 +257,20 @@ nav a:hover, .text-link:hover { text-decoration: underline; }
   font-weight: 650;
 }
 
+#playground-indent {
+  min-height: 2rem;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #cfb7a8;
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--rust);
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+#playground-indent:hover { border-color: var(--rust); }
+
 .output-panel {
   background: #22283a;
   border-color: #343b50;
