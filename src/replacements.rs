@@ -170,6 +170,8 @@ pub fn apply_for_kind(
         }
         let ranges = if kind == FileKind::Bibtex {
             crate::bibtex::protected_ranges(&text)?
+        } else if kind == FileKind::Bst {
+            crate::bst::protected_ranges(&text, true)
         } else {
             protected_ranges(&text, &config.config)?
         };

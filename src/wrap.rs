@@ -28,6 +28,14 @@ pub struct WrapConfig {
     /// `preserve`, `wrap`, `unwrap`, or `rewrap` (join then wrap).
     pub mode: String,
     pub columns: usize,
+    /// Prefer nearby sentence endings, then Chinese clause punctuation, on overflow.
+    pub prefer_sentence_ends: bool,
+    /// Keep figure and table names with a following literal reference.
+    pub keep_reference_names: bool,
+    /// Keep a plain number and a recognized unit symbol on the same source line.
+    pub keep_number_units: bool,
+    /// Keep the last two English words together when they fit on a continuation.
+    pub avoid_lone_last_word: bool,
     #[serde(rename = "stage")]
     pub when: Stage,
     /// Additional control-word names allowed to begin prose lines.
@@ -59,6 +67,10 @@ impl Default for WrapConfig {
             align_description: false,
             mode: "preserve".into(),
             columns: 80,
+            prefer_sentence_ends: true,
+            keep_reference_names: true,
+            keep_number_units: true,
+            avoid_lone_last_word: false,
             when: Stage::Before,
             prose_commands: Vec::new(),
             text_commands: None,
@@ -323,6 +335,7 @@ struct Region {
 struct Canonical {
     text: String,
     opaque: Vec<Range<usize>>,
+    quantities: Vec<Range<usize>>,
     hard_breaks: Vec<HardBreak>,
 }
 
@@ -689,15 +702,18 @@ fn format_text_with_arguments(
                 output.push_str(line);
                 continue;
             }
-            let prefix = format!(
+            let base_prefix = format!(
                 "{}{} ",
                 &content[..indent_len],
                 body[..prefix_len].trim_end()
             );
-            if paragraph
-                .as_ref()
-                .is_some_and(|p| !p.comment || p.continuation != prefix)
-            {
+            let raw_prefix = &content[..indent_len + prefix_len];
+            let list_marker = comment_list_marker(&body[prefix_len..]);
+            if paragraph.as_ref().is_some_and(|p| {
+                !p.comment
+                    || list_marker.is_some()
+                    || (p.continuation != base_prefix && p.continuation != raw_prefix)
+            }) {
                 flush(
                     &mut paragraph,
                     source,
@@ -708,17 +724,26 @@ fn format_text_with_arguments(
                     &mut output,
                 )?;
             }
-            let paragraph = paragraph.get_or_insert_with(|| Paragraph {
-                regions: Vec::new(),
-                continuation: prefix.clone(),
-                prefix,
-                ending: String::new(),
-                newline: if ending == "\r\n" { "\r\n" } else { "\n" },
-                comment: true,
-                join_with_space: true,
+            let paragraph = paragraph.get_or_insert_with(|| {
+                let (prefix, continuation) = match list_marker {
+                    Some(marker) => (
+                        format!("{raw_prefix}{marker}"),
+                        comment_item_continuation(raw_prefix, marker, config.config.indent.width),
+                    ),
+                    None => (base_prefix.clone(), base_prefix),
+                };
+                Paragraph {
+                    regions: Vec::new(),
+                    continuation,
+                    prefix,
+                    ending: String::new(),
+                    newline: if ending == "\r\n" { "\r\n" } else { "\n" },
+                    comment: true,
+                    join_with_space: true,
+                }
             });
             paragraph.regions.push(Region {
-                range: body_start + prefix_len..content_end,
+                range: body_start + prefix_len + list_marker.map_or(0, str::len)..content_end,
                 space_before: true,
                 newline_before: paragraph_boundary(&paragraph.ending),
             });
@@ -759,14 +784,26 @@ fn format_text_with_arguments(
                     sentences_active,
                     &mut output,
                 )?;
+                let list_marker = comment_list_marker(&source[text_start..content_end]);
+                let body_start = text_start + list_marker.map_or(0, str::len);
+                let continuation = if let Some(item) = list_marker {
+                    let base = format!(
+                        "{}{}",
+                        &content[..indent_len],
+                        &source[comment_start..text_start]
+                    );
+                    comment_item_continuation(&base, item, config.config.indent.width)
+                } else {
+                    format!("{}{} ", &content[..indent_len], marker)
+                };
                 paragraph = Some(Paragraph {
                     regions: vec![Region {
-                        range: text_start..content_end,
+                        range: body_start..content_end,
                         space_before: true,
                         newline_before: None,
                     }],
-                    prefix: source[start..text_start].to_owned(),
-                    continuation: format!("{}{} ", &content[..indent_len], marker),
+                    prefix: source[start..body_start].to_owned(),
+                    continuation,
                     ending: ending.into(),
                     newline: if ending == "\r\n" { "\r\n" } else { "\n" },
                     comment: true,
@@ -1664,12 +1701,21 @@ fn flush(
     let Some(paragraph) = paragraph.take() else {
         return Ok(());
     };
-    let canonical = canonicalize(
+    let mut canonical = canonicalize(
         source,
         &paragraph.regions,
         opaque,
         config.config.wrap.collapse_spaces,
     );
+    if wrap_active
+        && !paragraph.comment
+        && matches!(
+            config.config.wrap.mode.as_str(),
+            "wrap" | "stable" | "rewrap"
+        )
+    {
+        keep_prose_pairs(&mut canonical, &paragraph.continuation, config);
+    }
     let sentence_excluded = config
         .text
         .sentence_exclude
@@ -1682,10 +1728,25 @@ fn flush(
         .transpose()
         .map_err(crate::FormatError::Syntax)?
         .unwrap_or(false);
-    let sentences = if sentences_active && !paragraph.comment && !sentence_excluded {
+    let split_sentences = sentences_active && !paragraph.comment && !sentence_excluded;
+    let prefer_endings = wrap_active
+        && config.config.wrap.prefer_sentence_ends
+        && matches!(
+            config.config.wrap.mode.as_str(),
+            "wrap" | "rewrap" | "stable"
+        )
+        && !paragraph.comment
+        && !sentence_excluded;
+    let detected = if split_sentences || prefer_endings {
         sentence_ranges(&canonical, &config.text).map_err(crate::FormatError::Syntax)?
     } else {
-        std::iter::once(0..canonical.text.len()).collect()
+        Vec::new()
+    };
+    let paragraph_range = 0..canonical.text.len();
+    let sentences = if split_sentences {
+        detected.as_slice()
+    } else {
+        std::slice::from_ref(&paragraph_range)
     };
     let preserve_lines = wrap_active
         && matches!(config.config.wrap.mode.as_str(), "wrap" | "stable")
@@ -1731,6 +1792,7 @@ fn flush(
         emit_lines(
             &canonical,
             sentence.clone(),
+            prefer_endings.then_some(detected.as_slice()),
             prefix,
             continuation,
             if config.config.wrap.separator.is_empty() {
@@ -1755,6 +1817,82 @@ fn flush(
     Ok(())
 }
 
+fn keep_prose_pairs(text: &mut Canonical, continuation: &str, config: &crate::CompiledConfig) {
+    let wrap = &config.config.wrap;
+    let mut pairs = Vec::new();
+    if wrap.keep_number_units {
+        text.quantities = quantity_ranges(text);
+    }
+    if wrap.keep_reference_names && text.text.contains("\\ref") {
+        static REFERENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"\b(?i:figures?|figs?\.|tables?|tabs?\.)[ \t]+\\ref\*?\{[^{}\\%\s]+\}",
+            )
+            .unwrap()
+        });
+        for reference in REFERENCE.find_iter(&text.text) {
+            if containing(reference.start(), &text.opaque).is_none()
+                && !text.text[..reference.start()].ends_with('\\')
+            {
+                pairs.push(reference.range());
+            }
+        }
+    }
+    if wrap.avoid_lone_last_word {
+        let tab_width = config.config.indent.width;
+        if let Some((before_last, last)) = text.text.rsplit_once([' ', '\t'])
+            && last
+                .trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"', ')'])
+                .bytes()
+                .all(|b| b.is_ascii_alphabetic())
+            && last.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && let Some((before_pair, penultimate)) = before_last
+                .trim_end_matches([' ', '\t'])
+                .rsplit_once([' ', '\t'])
+            && !penultimate.is_empty()
+            && penultimate.bytes().all(|b| b.is_ascii_alphabetic())
+        {
+            let pair = before_pair.len() + 1..text.text.len();
+            let indent = display_width(continuation, 0, tab_width);
+            if !intersects(pair.clone(), &text.opaque)
+                && !intersects(pair.clone(), &text.quantities)
+                && indent + display_width(&text.text[pair.clone()], indent, tab_width)
+                    <= wrap.columns
+            {
+                pairs.push(pair);
+            }
+        }
+    }
+    if !pairs.is_empty() {
+        text.opaque.extend(pairs);
+        merge_ranges(&mut text.opaque);
+    }
+}
+
+fn quantity_ranges(text: &Canonical) -> Vec<Range<usize>> {
+    static QUANTITY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"[+−-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t]+",
+            r"(?:°[CF]|min|mol|[kMGT]i?B|[kMG]?Hz|[kMh]?Pa|[μµnm]s|[μµncmk]m|",
+            r"[μµmk]g|[μµm]L|[μµmk][AVW]|kJ|[KshmgLAVWBJ])"
+        ))
+        .unwrap()
+    });
+    let word_char = |c: char| c == '_' || (c.is_alphanumeric() && !is_cjk(c));
+    QUANTITY
+        .find_iter(&text.text)
+        .map(|m| m.range())
+        .filter(|r| {
+            !intersects(r.clone(), &text.opaque)
+                && !text.text[..r.start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| word_char(c) || matches!(c, '\\' | '.'))
+                && !text.text[r.end..].chars().next().is_some_and(word_char)
+        })
+        .collect()
+}
+
 fn canonicalize(
     source: &str,
     regions: &[Region],
@@ -1768,6 +1906,7 @@ fn canonicalize(
     let mut result = Canonical {
         text: String::with_capacity(capacity),
         opaque: Vec::new(),
+        quantities: Vec::new(),
         hard_breaks: Vec::new(),
     };
     for region in regions {
@@ -2035,10 +2174,43 @@ fn visit_atoms(
     }
 }
 
+fn visit_prose_atoms(
+    text: &Canonical,
+    sentence: Range<usize>,
+    break_chars: &HashSet<char>,
+    mut visit: impl FnMut(Atom),
+) {
+    let first = text.quantities.partition_point(|r| r.end <= sentence.start);
+    if text
+        .quantities
+        .get(first)
+        .is_none_or(|r| r.start >= sentence.end)
+    {
+        return visit_atoms(text, sentence, break_chars, visit);
+    }
+    // Join only atoms crossed by a quantity. Adjacent CJK characters retain
+    // their own break points, including in text with no surrounding spaces.
+    let mut quantities = text.quantities[first..].iter().peekable();
+    let mut held: Option<Atom> = None;
+    visit_atoms(text, sentence, break_chars, |atom| {
+        let end = atom.range.end;
+        let group = held.get_or_insert(atom);
+        group.range.end = end;
+        while quantities.next_if(|r| r.end <= end).is_some() {}
+        if quantities.peek().is_none_or(|r| r.start >= end) {
+            visit(held.take().expect("current atom"));
+        }
+    });
+    if let Some(group) = held {
+        visit(group);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_lines(
     text: &Canonical,
     sentence: Range<usize>,
+    sentence_boundaries: Option<&[Range<usize>]>,
     prefix: &str,
     continuation: &str,
     newline: &str,
@@ -2061,6 +2233,7 @@ fn emit_lines(
             let carry = emit_layout(
                 text,
                 start..boundary.before,
+                sentence_boundaries,
                 current_prefix,
                 continuation,
                 newline,
@@ -2088,6 +2261,7 @@ fn emit_lines(
     emit_layout(
         text,
         start..sentence.end,
+        sentence_boundaries,
         current_prefix,
         continuation,
         newline,
@@ -2103,6 +2277,7 @@ fn emit_lines(
 fn emit_layout(
     text: &Canonical,
     sentence: Range<usize>,
+    sentence_boundaries: Option<&[Range<usize>]>,
     prefix: &str,
     continuation: &str,
     newline: &str,
@@ -2125,7 +2300,8 @@ fn emit_layout(
     let mut previous: Option<Atom> = None;
     let mut carry = None;
     let mut error = None;
-    visit_atoms(text, sentence, &config.text.break_chars, |atom| {
+    let mut preferred: Option<PreferredBreak> = None;
+    visit_prose_atoms(text, sentence, &config.text.break_chars, |atom| {
         if error.is_some() {
             return;
         }
@@ -2161,24 +2337,49 @@ fn emit_layout(
                             .next_back()
                             .is_some_and(is_opening_punctuation)
                 }));
-        let separator_width = display_width(separator, width, tab_width);
+        let mut separator_width = display_width(separator, width, tab_width);
         let mut value_width = display_width(value, width + separator_width, tab_width);
+        if let Some(boundaries) = sentence_boundaries
+            && line_has_text
+            && can_break
+            && width <= columns
+            && columns - width <= 12.min(columns / 2)
+        {
+            let sentence_end = boundaries
+                .binary_search_by_key(&atom.range.start, |s| s.start)
+                .is_ok();
+            let clause_end = text.text[..atom.separator.start].ends_with(['，', '；', '：']);
+            if sentence_end || (clause_end && !preferred.as_ref().is_some_and(|p| p.sentence_end)) {
+                preferred = Some(PreferredBreak {
+                    separator: atom.separator.clone(),
+                    output_at: output.len(),
+                    sentence_end,
+                });
+            }
+        }
+        if line_has_text
+            && can_break
+            && width + separator_width + value_width > columns
+            && let Some(point) = preferred.take().filter(|p| p.output_at < output.len())
+        {
+            // Move the already emitted start of the next sentence onto its continuation.
+            let suffix = output.split_off(point.output_at + point.separator.len());
+            output.truncate(point.output_at);
+            push_wrap_break(
+                output,
+                &text.text[point.separator.clone()],
+                newline,
+                comment,
+            );
+            carry = Some((point.separator.end, output.len()));
+            output.push_str(continuation);
+            output.push_str(&suffix);
+            width = continuation_width + display_width(&suffix, continuation_width, tab_width);
+            separator_width = display_width(separator, width, tab_width);
+            value_width = display_width(value, width + separator_width, tab_width);
+        }
         if line_has_text && can_break && width + separator_width + value_width > columns {
-            if !comment && newline.starts_with('%') {
-                // The separating space belongs before the comment marker so TeX
-                // retains the original word boundary after suppressing newline.
-                output.push_str(separator);
-            }
-            if comment {
-                output.push_str(newline.trim_start_matches('%'));
-            } else if separator.is_empty() {
-                // CJK and configured break points may have no source space.
-                // Suppress the newline token to retain that adjacency.
-                output.push('%');
-                output.push_str(newline.trim_start_matches('%'));
-            } else {
-                output.push_str(newline);
-            }
+            push_wrap_break(output, separator, newline, comment);
             carry = Some((atom.range.start, output.len()));
             output.push_str(continuation);
             width = continuation_width;
@@ -2191,6 +2392,7 @@ fn emit_layout(
             && width + value_width > columns
             && columns > continuation_width
             && !intersects(atom.range.clone(), &text.opaque)
+            && !intersects(atom.range.clone(), &text.quantities)
             && !value.contains(['\\', '~', '\u{a0}', '\u{202f}', '\u{2060}'])
         {
             let mut emitted = false;
@@ -2204,6 +2406,7 @@ fn emit_layout(
                     }
                     output.push_str(newline.trim_start_matches('%'));
                     carry = None;
+                    preferred = None;
                     output.push_str(continuation);
                     width = continuation_width;
                     grapheme_width = display_width(grapheme, width, tab_width);
@@ -2220,6 +2423,27 @@ fn emit_layout(
         previous = Some(atom);
     });
     error.map_or(Ok(carry), Err)
+}
+
+struct PreferredBreak {
+    separator: Range<usize>,
+    output_at: usize,
+    sentence_end: bool,
+}
+
+fn push_wrap_break(output: &mut String, separator: &str, newline: &str, comment: bool) {
+    if comment {
+        output.push_str(newline.trim_start_matches('%'));
+    } else if separator.is_empty() {
+        // A tight CJK or custom boundary must not introduce a TeX space.
+        output.push('%');
+        output.push_str(newline.trim_start_matches('%'));
+    } else {
+        if newline.starts_with('%') {
+            output.push_str(separator);
+        }
+        output.push_str(newline);
+    }
 }
 
 pub(crate) fn display_width(text: &str, start: usize, tab_width: usize) -> usize {
@@ -2298,6 +2522,23 @@ fn comment_prefix(body: &str) -> Option<usize> {
     let marks = body.bytes().take_while(|&byte| byte == b'%').count();
     let spaces = body[marks..].len() - body[marks..].trim_start_matches([' ', '\t']).len();
     Some(marks + spaces)
+}
+
+fn comment_list_marker(body: &str) -> Option<&str> {
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    let end = match (digits, *body.as_bytes().get(digits)?) {
+        (0, b'-' | b'*' | b'+') => 1,
+        (1.., b'.' | b')') => digits + 1,
+        _ => return None,
+    };
+    let content = body[end..].trim_start_matches([' ', '\t']);
+    (!content.is_empty() && content.len() < body.len() - end)
+        .then(|| &body[..body.len() - content.len()])
+}
+
+fn comment_item_continuation(prefix: &str, marker: &str, tab_width: usize) -> String {
+    let width = display_width(marker, display_width(prefix, 0, tab_width), tab_width);
+    format!("{prefix}{}", " ".repeat(width))
 }
 
 fn item_continuation(prefix: &str, marker: &str, tab_width: usize) -> String {
@@ -2543,6 +2784,13 @@ pub(crate) fn align_trailing_comments(
         let width = display_width(code, 0, config.config.indent.width);
         groups.push((line, next_line, indent, gap, width));
     }
+    align_comment_groups(source, &groups)
+}
+
+pub(crate) fn align_comment_groups(
+    source: &str,
+    groups: &[(usize, usize, &str, Range<usize>, usize)],
+) -> Result<String, crate::FormatError> {
     let mut edits = Vec::new();
     for group in groups.chunk_by(|a, b| a.1 == b.0 && a.2 == b.2) {
         if group.len() < 2 {

@@ -31,6 +31,14 @@ pub struct SourceToken {
     pub span: Range<usize>,
 }
 
+impl SourceToken {
+    fn control<'a>(&self, source: &'a str) -> Option<(&'a str, usize)> {
+        // A lone escape at EOF has no command name.
+        (self.kind == SourceTokenKind::Control && self.span.len() > 1)
+            .then(|| (&source[self.span.start + 1..self.span.end], self.span.end))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleOrigin {
     Builtin,
@@ -227,17 +235,17 @@ impl SourceModel {
             Ok((ranges, diagnostics)) => {
                 let mut model = Self::with_ranges(source, config, &ranges);
                 model.diagnostics.extend(diagnostics);
-                let ranges = model.protected.clone();
                 let owned = compiled
                     .is_none()
                     .then(|| CompiledConfig::new(config.clone()).ok())
                     .flatten();
                 if let Some(compiled) = compiled.or(owned.as_ref()) {
                     let structure = {
+                        let ranges = model.protected_ranges();
                         let analysis = crate::source_analysis::SourceAnalysis::for_model(
-                            source, config, &ranges, &model,
+                            source, config, ranges, &model,
                         );
-                        syntax::shared_blocks_with_analysis(source, compiled, &ranges, &analysis)
+                        syntax::shared_blocks_with_analysis(source, compiled, ranges, &analysis)
                     };
                     match structure {
                         Ok(structure) => {
@@ -276,7 +284,7 @@ impl SourceModel {
 
     /// Reader candidates use the same lexical partition even inside delayed
     /// declaration bodies; the declaration reader controls their visibility.
-    pub(crate) fn reader_positions(source: &str) -> Vec<usize> {
+    pub(crate) fn reader_positions(source: &str) -> impl Iterator<Item = usize> + '_ {
         SourceTokens::new(source, &[])
             .filter(|t| {
                 matches!(
@@ -288,7 +296,6 @@ impl SourceModel {
                 )
             })
             .map(|t| t.span.start)
-            .collect()
     }
 
     /// Literal group ends from the common lexical partition. Consumers that
@@ -312,29 +319,46 @@ impl SourceModel {
 
     #[doc(hidden)]
     pub fn loader_occurrences(source: &str) -> HashMap<usize, (String, usize)> {
-        let mut counts = HashMap::<String, usize>::new();
-        let mut result = HashMap::new();
-        for token in SourceTokens::new(source, &[]) {
-            if token.kind == SourceTokenKind::Control
-                && let Some((name, _)) = syntax::command_at(source, token.span.start)
-                && matches!(
-                    name,
-                    "input"
-                        | "include"
-                        | "documentclass"
-                        | "LoadClass"
-                        | "LoadClassWithOptions"
-                        | "usepackage"
-                        | "RequirePackage"
-                        | "RequirePackageWithOptions"
-                )
-            {
-                let occurrence = counts.entry(name.into()).or_default();
-                result.insert(token.span.start, (name.into(), *occurrence));
+        Self::loaders(source)
+            .map(|(at, name, occurrence)| (at, (name.to_owned(), occurrence)))
+            .collect()
+    }
+
+    fn loaders(source: &str) -> impl Iterator<Item = (usize, &str, usize)> {
+        let mut counts = HashMap::new();
+        SourceTokens::new(source, &[]).filter_map(move |token| {
+            let (name, _) = token.control(source)?;
+            if matches!(
+                name,
+                "input"
+                    | "include"
+                    | "documentclass"
+                    | "LoadClass"
+                    | "LoadClassWithOptions"
+                    | "usepackage"
+                    | "RequirePackage"
+                    | "RequirePackageWithOptions"
+            ) {
+                let occurrence = counts.entry(name).or_insert(0);
+                let loader = (token.span.start, name, *occurrence);
                 *occurrence += 1;
+                Some(loader)
+            } else {
+                None
             }
-        }
-        result
+        })
+    }
+
+    // Anchor-free import events already carry their byte offsets.
+    pub(crate) fn loader_position_lookup(
+        source: &str,
+    ) -> impl Fn(&(String, usize)) -> Option<usize> {
+        let positions = std::cell::LazyCell::new(move || {
+            Self::loaders(source)
+                .map(|(at, name, occurrence)| ((name, occurrence), at))
+                .collect::<HashMap<_, _>>()
+        });
+        move |(name, occurrence)| positions.get(&(name.as_str(), *occurrence)).copied()
     }
 
     fn import_events(&self, config: &Config) -> Vec<SourceImportEvent> {
@@ -344,15 +368,12 @@ impl SourceModel {
         {
             return Vec::new();
         }
-        let loaders: HashMap<_, _> = Self::loader_occurrences(&self.source)
-            .into_iter()
-            .map(|(at, key)| (key, at))
-            .collect();
+        let loader_position = Self::loader_position_lookup(&self.source);
         let offset = |at: usize, loader: &Option<(String, usize)>| -> Option<usize> {
             let Some(loader) = loader else {
                 return Some(at.min(self.source.len()));
             };
-            let loader_start = *loaders.get(loader)?;
+            let loader_start = loader_position(loader)?;
             let (_, end) = syntax::command_at(&self.source, loader_start)?;
             let mut start = skip(&self.source, end);
             if self.source.as_bytes().get(start) == Some(&b'[') {
@@ -416,10 +437,7 @@ impl SourceModel {
         source: &str,
         config: &Config,
     ) -> Vec<crate::config::CommandImportEvent> {
-        let loaders: HashMap<_, _> = Self::loader_occurrences(source)
-            .into_iter()
-            .map(|(at, key)| (key, at))
-            .collect();
+        let loader_position = Self::loader_position_lookup(source);
         config
             .syntax
             .command_import_events
@@ -427,7 +445,7 @@ impl SourceModel {
             .filter_map(|event| {
                 let mut event = event.clone();
                 if let Some(loader) = &event.loader {
-                    let start = *loaders.get(loader)?;
+                    let start = loader_position(loader)?;
                     let (_, end) = syntax::command_at(source, start)?;
                     let mut cursor = skip(source, end);
                     if source.as_bytes().get(cursor) == Some(&b'[') {
@@ -633,26 +651,29 @@ impl SourceModel {
         let transparent: HashSet<_> = self
             .tokens
             .iter()
-            .filter(|token| token.kind == SourceTokenKind::Control)
-            .filter_map(|token| syntax::command_at(&self.source, token.span.start))
+            .filter_map(|token| token.control(&self.source))
             .filter_map(|(name, end)| syntax::token_list_argument_range(&self.source, name, end))
             .flat_map(|range| [range.start, range.end - 1])
             .collect();
-        let mut pairs = HashMap::new();
-        let mut groups = Vec::new();
-        for (index, token) in self.tokens.iter().enumerate() {
-            match token.kind {
-                SourceTokenKind::OpenGroup => groups.push(index),
-                SourceTokenKind::CloseGroup => {
-                    if let Some(open) = groups.pop() {
-                        pairs.insert(open, index);
+        // Only foreach lookahead and grouped primitive definition targets need
+        // matching token indices. Ordinary argument groups need no lookup table.
+        let pairs = std::cell::LazyCell::new(|| {
+            let mut pairs = HashMap::new();
+            let mut groups = Vec::new();
+            for (index, token) in self.tokens.iter().enumerate() {
+                match token.kind {
+                    SourceTokenKind::OpenGroup => groups.push(index),
+                    SourceTokenKind::CloseGroup => {
+                        if let Some(open) = groups.pop() {
+                            pairs.insert(open, index);
+                        }
                     }
-                    // The structural parser diagnoses unmatched delimiters after
-                    // command operands and conditional protection are resolved.
+                    _ => (),
                 }
-                _ => (),
             }
-        }
+            pairs
+        });
+        let closing_group = |index| pairs.get(&index).copied();
         let mut bindings = HashMap::<String, Binding>::new();
         if config.syntax.environment_argument_events.is_empty() {
             for (name, signature) in &config.syntax.inferred_environment_arguments {
@@ -679,7 +700,7 @@ impl SourceModel {
                 .enumerate()
                 .filter_map(|(at, token)| {
                     (token.kind == SourceTokenKind::Control)
-                        .then(|| definition(&self.source, &self.tokens, &pairs, at))
+                        .then(|| definition(&self.source, &self.tokens, &closing_group, at))
                         .flatten()
                         .map(|(d, _, _, _)| d.name)
                 })
@@ -859,11 +880,7 @@ impl SourceModel {
                 pos += 1;
                 continue;
             }
-            if token.kind != SourceTokenKind::Control {
-                pos += 1;
-                continue;
-            }
-            let Some((control, end)) = syntax::command_at(&self.source, start) else {
+            let Some((control, end)) = token.control(&self.source) else {
                 pos += 1;
                 continue;
             };
@@ -892,7 +909,7 @@ impl SourceModel {
                 && !bindings.contains_key(name)
                 && let Some(binding) = syntax::arguments::foreach_binding(&self.source, end, |at| {
                     let index = self.tokens.partition_point(|token| token.span.start < at);
-                    pairs.get(&index).map(|&close| self.tokens[close].span.end)
+                    closing_group(index).map(|close| self.tokens[close].span.end)
                 })
             {
                 for variable in binding.names {
@@ -1252,7 +1269,8 @@ impl SourceModel {
                 continue;
             }
             if !bindings.contains_key(name)
-                && let Some(definition) = definition(&self.source, &self.tokens, &pairs, pos)
+                && let Some(definition) =
+                    definition(&self.source, &self.tokens, &closing_group, pos)
             {
                 let (mut declaration, finish, global, provide) = definition;
                 // Expl3 definitions share the delayed-body semantics of
@@ -2557,10 +2575,10 @@ fn next(tokens: &[SourceToken], mut at: usize) -> usize {
 fn definition(
     source: &str,
     tokens: &[SourceToken],
-    pairs: &HashMap<usize, usize>,
+    closing_group: &impl Fn(usize) -> Option<usize>,
     at: usize,
 ) -> Option<(Declaration, usize, bool, bool)> {
-    let (command, command_end) = syntax::command_at(source, tokens[at].span.start)?;
+    let (command, command_end) = tokens[at].control(source)?;
     let command = command.trim_end_matches('*');
     let primitive = matches!(command, "def" | "gdef" | "edef" | "xdef");
     let classic = syntax::classic_command_definition(command);
@@ -2618,7 +2636,7 @@ fn definition(
     };
     let (name, name_end) = syntax::command_at(source, tokens.get(name_at)?.span.start)?;
     if target_group {
-        let finish = *pairs.get(&cursor)?;
+        let finish = closing_group(cursor)?;
         if next(tokens, name_at + 1) != finish {
             return None;
         }

@@ -35,6 +35,9 @@
 !/examples/tift.toml
 /tests/
 /benches/
+!/performance/
+/performance/*
+!/performance/openai_math.py
 /scripts/
 /reports/
 AGENTS.md

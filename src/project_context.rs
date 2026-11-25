@@ -632,7 +632,7 @@ impl ProjectContext {
         if config.config.replacement_only
             || matches!(
                 FileKind::from_path(path),
-                Some(FileKind::Bibtex | FileKind::Dtx | FileKind::Ins)
+                Some(FileKind::Bibtex | FileKind::Bst | FileKind::Dtx | FileKind::Ins)
             )
         {
             return Ok(PreparedSource {

@@ -4,6 +4,7 @@ pub mod alignment;
 pub mod argument_layout;
 pub mod bibtex;
 mod block_storage;
+mod bst;
 pub mod code_layout;
 pub mod config;
 mod description;

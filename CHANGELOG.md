@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.9
+
+- Format classic BibTeX `.bst` styles with indented function bodies, compact field lists, and optional trailing-comment alignment.
+- Format supported source types declared in `filecontents` and `filecontents*` using the same settings as standalone files. Set `bibtex.format-filecontents = false` to preserve the embedded source.
+- Indent matched algpseudocode branches, loops, functions, and procedures inside `algorithmic`. Set `indent.algpseudocode = false` to preserve the original indentation.
+- Keep consecutive same-row booktabs `\cmidrule` commands together by default. Set `breaks.split-cmidrules = true` for one rule per line.
+- When wrapping prose, prefer nearby sentence endings and keep reference names and common number–unit pairs together. Enable `wrap.avoid-lone-last-word` to keep a short final pair of English words together. Wrapped comment lists use hanging indents.
+
+[Download tift 0.1.9](https://github.com/PrimeX-06/tift/releases/tag/v0.1.9) or install with `cargo install tift --version 0.1.9 --locked --registry crates-io`.
+
 ## 0.1.8
 
 - Align each equation pair in `align`, `alignat`, `aligned`, and related environments with a right-aligned left side and a left-aligned right side. Use the three native column directions in `eqnarray`.

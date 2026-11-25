@@ -7,6 +7,7 @@ beamer-columns = true # Indent the body of a standalone column command in Beamer
 pgfplots-panels = true # Indent each panel after a standalone \nextgroupplot.
 bibliography-items = true # Indent existing text lines after a standalone \bibitem.
 beamer-overprint = true # Indent overlay declarations inside overprint.
+algpseudocode = true # Indent matched control flow inside algorithmic environments.
 maximum = 40
 
 [indent.rules.document]
@@ -64,6 +65,10 @@ align-description = false # Align description bodies and hanging lines. Long lab
 mode = "preserve" # "wrap" folds long lines; "rewrap" joins then folds; "unwrap" joins prose.
 # "stable" carries overflow onto the next prose line, preserving later line breaks.
 columns = 88
+prefer-sentence-ends = true # On overflow, prefer a nearby sentence end, then a Chinese comma, semicolon, or colon.
+keep-reference-names = true # Keep Figure, Fig., Table, etc. with a following literal \ref.
+keep-number-units = true # Keep plain quantities such as 250 ms, 37 °C, and 10 km together.
+avoid-lone-last-word = false # Keep a final English word with its predecessor when both fit.
 stage = "after"
 collapse-spaces = true
 long-words = "overflow" # "break" allows grapheme-safe splitting of long plain words.
@@ -72,7 +77,7 @@ long-words = "overflow" # "break" allows grapheme-safe splitting of long plain w
 # break-chars = ['-'] # Width-triggered tight breaks retain TeX spacing using %.
 
 [comments]
-wrap = false # Reflow comments during prose wrapping.
+wrap = false # Reflow comments during prose wrapping. Bulleted and numbered items use hanging indents.
 align-trailing = false # Align spaced end-of-line comments at the same indentation.
 
 # Arguments expand only with an active width, or explicit mode = "expand".
@@ -114,7 +119,7 @@ final-newline = "always"
 [breaks]
 enabled = true # Environment/loop boundaries, table rules and eligible captions receive lines.
 # tikz-path-columns = 88 # Split long drawing paths before line segments, curves and nodes.
-split-cmidrules = true # Put consecutive standalone booktabs cmidrule commands on separate lines.
+split-cmidrules = false # Keep same-row cmidrules together; enable to put each rule on its own line.
 pgfplots-coordinates = false # Put each literal coordinate on its own line in addplot and addplot3.
 pgfplots-tables = true # Align whitespace-separated inline addplot table records.
 pgfplots-named-tables = true # Align existing rows in standalone pgfplotstableread declarations.
@@ -196,7 +201,7 @@ indent = false
 [bibtex]
 separate-entries = true # Leave one blank line between regular bibliography entries.
 compact-strings = false # Group short literal @string assignments within wrap.columns.
-format-filecontents = true # Format .bib payloads in filecontents and filecontents*.
+format-filecontents = true # Format supported payload file types in filecontents.
 normalize = true # Normalize field assignments.
 name-case = "preserve" # "lower" or "upper" selects uniform type and field spelling.
 align-fields = true # Applied during normalization.

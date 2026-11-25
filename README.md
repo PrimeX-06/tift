@@ -18,7 +18,8 @@ tift is a fast, configurable formatter for LaTeX and BibTeX. Keep documents cons
 - Indent LaTeX environments, lists, and nested structures.
 - Align table columns, paired equations, matrices, and inline PGFPlots data tables, and format math spacing.
 - Format standalone and embedded BibTeX and BibLaTeX bibliographies, with optional sorting and cleanup.
-- Wrap long prose and captions to a chosen line width.
+- Format classic BibTeX style programs (`.bst`), including field declarations, postfix expressions, and nested functions.
+- Wrap prose at nearby sentence endings and keep references such as `Figure \ref{fig:setup}` and quantities such as `250 ms` together.
 - Support common LaTeX packages and CJK documents.
 - Preserve verbatim content and allow local formatting controls.
 - Format whole projects, preview changes, and check formatting in CI.
@@ -44,6 +45,7 @@ See the [installation guide](https://github.com/PrimeX-06/tift/wiki/Getting-Star
 
 ```sh
 tift --diff main.tex                # preview changes
+tift --diff journal.bst             # preview a bibliography style
 tift main.tex                       # format a file in place
 tift .                              # format a project recursively
 tift --check .                      # check formatting in CI
@@ -58,6 +60,16 @@ Concurrent tift processes serialize writes to the same output path, including ba
 Files use UTF-8 by default. Declare another encoding in a header comment, such as `% !TeX encoding = windows-1252` or `% Encoding: latin1` in a bibliography. Formatting preserves the declared encoding.
 
 Use `tift --help` or the [command-line guide](https://github.com/PrimeX-06/tift/wiki/CLI) for more options.
+
+## Performance
+
+| Corpus | Sample | Median check time | Throughput |
+|---|---:|---:|---:|
+| [OpenAI Math](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a) | 721 papers · 7,720 `.tex` files · 121.9 MiB | 241.0 s | 32.0 files/s |
+
+Measured with `tift 0.1.8 --check --no-cache --no-config`, 8 workers, and 3 runs on Windows 11 with an Intel Core i9-14900HX. Every run checked 7,720 files, reported 429 diagnostic-bearing files, and marked 7,052 files for formatting. The sample pins OpenAI Math revision `adc7f1241b42e322a6451854ab7e4b4c146bf78a`. `latexmk` checked the 188 papers containing tift diagnostics. It compiled 187 roots. One paper requiring the unavailable `astra-plain.bst` style was excluded. Papers without tift diagnostics were not run through `latexmk`.
+
+Run the same benchmark with `python performance/openai_math.py --tift path/to/tift --workers 8 --runs 3`.
 
 ## Configuration
 
@@ -76,9 +88,11 @@ tift discovers project settings automatically. The [configuration guide](https:/
 
 Use `tift --dump-config > tift.toml` to start with all built-in settings, or `tift --show-config main.tex` to inspect a file's effective configuration.
 
-Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.1.8](https://github.com/PrimeX-06/tift/blob/v0.1.8/examples/tift.toml)
+Comment wrapping and trailing-comment alignment live in `[comments]`. Use `whitespace.blank-lines` to limit consecutive blank lines and `[output]` for line endings and the final newline. Each replacement selects one `match` mode (`"literal"`, `"regex"`, or `"enhanced"`). [Annotated configuration for 0.1.9](https://github.com/PrimeX-06/tift/blob/v0.1.9/examples/tift.toml)
 
-By default, tift formats `.bib` contents in `filecontents` and `filecontents*` and aligns literal whitespace-separated rows in `\addplot table`. To preserve either source layout, set `bibtex.format-filecontents = false` or `breaks.pgfplots-tables = false`.
+By default, tift formats `filecontents` and `filecontents*` payloads with supported filename extensions: `.tex`, `.ltx`, `.drv`, `.tikz`, `.sty`, `.def`, `.cfg`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.dbx`, `.cls`, `.clo`, `.bib`, `.bst`, `.dtx`, `.fdd`, and `.ins`. Each payload uses its standalone formatter. Set `bibtex.format-filecontents = false` to preserve embedded contents. Literal whitespace-separated rows in `\addplot table` are also aligned by default, controlled by `breaks.pgfplots-tables`.
+
+BibTeX style files use the project indentation and whitespace settings. Each top-level command starts on its own line. Multiline groups indent one level, with an extra level for the two explicit branches of a multiline `if$`. Short anonymous functions can stay inline. A single-line `FUNCTION` definition containing just one quoted string stays on one line when it has no comment and fits `wrap.columns`. Quoted strings retain their exact contents. Set `comments.align-trailing = true` to align consecutive comments at the same indentation. The formatter accepts complete commands individually or as a program. It reports malformed tokens and groups at their source locations. BibTeX handles name resolution, command ordering, and stack evaluation.
 
 ## Editor
 

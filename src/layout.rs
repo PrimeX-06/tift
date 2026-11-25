@@ -227,7 +227,12 @@ fn format_document_stages(
         && !config.config.replacement_only
         && matches!(
             kind,
-            FileKind::Tex | FileKind::Tikz | FileKind::Class | FileKind::Style
+            FileKind::Tex
+                | FileKind::Tikz
+                | FileKind::Class
+                | FileKind::Style
+                | FileKind::Dtx
+                | FileKind::Ins
         )
         && source.contains("filecontents")
     {
@@ -273,9 +278,18 @@ fn format_document_stages(
         },
     )?;
     if !config.config.replacement_only {
-        if kind == FileKind::Bibtex {
-            text = stage("bibtex", &text, &mut trace, &mut details, config, || {
-                let output = crate::bibtex::format_bibtex_detailed(&text, config)?;
+        if matches!(kind, FileKind::Bibtex | FileKind::Bst) {
+            let name = if kind == FileKind::Bst {
+                "bst"
+            } else {
+                "bibtex"
+            };
+            text = stage(name, &text, &mut trace, &mut details, config, || {
+                let output = if kind == FileKind::Bst {
+                    crate::bst::format_style(&text, config)?
+                } else {
+                    crate::bibtex::format_bibtex_detailed(&text, config)?
+                };
                 diagnostics.extend(output.diagnostics.into_iter().map(|mut diagnostic| {
                     if bom {
                         diagnostic.span.start += 3;
@@ -600,7 +614,9 @@ fn format_document_stages(
     let before_final = trace.is_some().then(|| text.clone());
     let ending = preferred_ending(source, config);
     let mut boundary_protection = |text: &str| -> Result<Vec<Range<usize>>, FormatError> {
-        if kind == FileKind::Bibtex {
+        if kind == FileKind::Bst {
+            Ok(crate::bst::protected_ranges(text, false))
+        } else if kind == FileKind::Bibtex {
             crate::bibtex::protected_ranges(text)
         } else {
             Ok(parsing.snapshot(text, false, false)?.protected.clone())
@@ -1020,6 +1036,18 @@ fn indent_with_argument_ranges(
     let mut branches = BTreeMap::new();
     let newlines: Vec<usize> = memchr::memchr_iter(b'\n', source.as_bytes()).collect();
     let indent = &config.config.indent;
+    let algorithm_lines = if indent.algpseudocode && source.contains("algorithmic") {
+        let analysis = SourceAnalysis::with_memo(
+            source,
+            &config.config,
+            protected,
+            std::rc::Rc::clone(&parsed.metadata),
+        );
+        crate::packages::code_algorithms::indent_lines(source, config, protected, &analysis)?
+    } else {
+        BTreeMap::new()
+    };
+    let algorithm_unit = indent.unit_with_spaces("environment", "algorithmic", &spaces);
     let markers = [
         (
             indent.beamer_columns && source.contains(r"\column"),
@@ -1237,7 +1265,8 @@ fn indent_with_argument_ranges(
         let in_configuration = configuration_ranges
             .get(configuration_ranges.partition_point(|range| range.end <= first))
             .is_some_and(|range| range.contains(&first));
-        if in_protected && !in_configuration
+        let algorithm_depth = algorithm_lines.get(&first).copied();
+        if in_protected && !in_configuration && algorithm_depth.is_none()
             || in_argument_literal
             || in_configuration && line.trim_matches([' ', '\t', '\r', '\n']).is_empty()
         {
@@ -1316,6 +1345,10 @@ fn indent_with_argument_ranges(
         } else {
             std::borrow::Cow::Borrowed(cached_prefix.as_str())
         };
+        if let Some(depth) = algorithm_depth.filter(|&depth| depth > 0) {
+            let depth = depth.min(indent.maximum.unwrap_or(usize::MAX));
+            prefix.to_mut().push_str(&algorithm_unit.repeat(depth));
+        }
         if let Some(maximum) = config.config.indent.maximum {
             let mut width = 0usize;
             let mut length = 0usize;
@@ -2186,17 +2219,27 @@ fn table_rule_boundaries(
                 };
                 // When ranges share a physical line, give the group a single
                 // pair of boundaries. A named break rule takes precedence.
-                if name == "cmidrule"
-                    && named.is_none()
+                let tabularray = crate::package_tables::is_tabularray(&block.name);
+                let merge_cmidrules = named.is_none()
                     && !config.config.breaks.split_cmidrules
-                    && !crate::package_tables::is_tabularray(&block.name)
-                {
+                    && if tabularray {
+                        matches!(name, "cmidrule" | "cmidrulemore")
+                    } else {
+                        name == "cmidrule"
+                    };
+                if merge_cmidrules {
                     loop {
                         let rest = source[end..block.body.end].trim_start_matches([' ', '\t']);
                         let next = block.body.end - rest.len();
-                        if !rest.starts_with(r"\cmidrule")
-                            || !syntax::command_at(source, next).is_some_and(|(n, _)| n == name)
-                        {
+                        let Some((next_name, _)) = syntax::command_at(source, next) else {
+                            break;
+                        };
+                        let is_cmidrule = if tabularray {
+                            matches!(next_name, "cmidrule" | "cmidrulemore")
+                        } else {
+                            next_name == "cmidrule"
+                        };
+                        if !is_cmidrule {
                             break;
                         }
                         let Some(close) =

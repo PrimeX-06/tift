@@ -16,6 +16,7 @@ pub(crate) use crate::block_storage::SharedBlock;
 use crate::block_storage::{BlockName, NamePool, NameStore, OwnedNames, StructuralBlock};
 use crate::config::SyntaxConfig;
 use crate::{Config, FormatError};
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
@@ -1047,7 +1048,7 @@ fn balanced_end_with_comments(
     None
 }
 
-fn env_at(source: &str, start: usize) -> Option<(&str, bool, usize)> {
+pub(crate) fn env_at(source: &str, start: usize) -> Option<(&str, bool, usize)> {
     let (command, end) = command_at(source, start)?;
     env_after_command(source, command, end)
 }
@@ -4805,7 +4806,7 @@ fn protected_ranges_with_inferred_environments(
     let mut package_commands_redefined = HashSet::new();
     let mut visual_overrides = crate::packages::visual_languages::Overrides::default();
     let mut conditional_bindings = ConditionalBindings::default();
-    let mut catcode_scopes: Vec<(String, bool, usize)> = Vec::new();
+    let mut catcode_scopes: Vec<(Cow<'_, str>, bool, usize)> = Vec::new();
     let mut inline_tikz_start = None;
     let mut pitex_verbatim = HashSet::new();
     let mut kkverb_delimiters = ("|".to_owned(), "|".to_owned());
@@ -5311,7 +5312,7 @@ fn protected_ranges_with_inferred_environments(
                         || crate::tikz_scan::environment(name)
                             && !visual_overrides.contains(name)
                             && !config.syntax.environment_arguments.contains_key(name);
-                    catcode_scopes.push((format!("\\end{{{name}}}"), drawing, pos));
+                    catcode_scopes.push((format!("\\end{{{name}}}").into(), drawing, pos));
                 } else {
                     conditional_bindings.leave();
                     xparse_bindings.leave();
@@ -6284,7 +6285,7 @@ fn protected_ranges_with_inferred_environments(
                         source,
                         executed_name,
                         executed_end,
-                        catcode_scopes.last().map(|scope| scope.0.as_str()),
+                        catcode_scopes.last().map(|scope| scope.0.as_ref()),
                         global_catcode,
                         !xparse_bindings.contains(false, "active"),
                         &mut closed_scope,
@@ -6349,7 +6350,7 @@ fn protected_ranges_with_inferred_environments(
                             if scope.0 == "}" {
                                 balanced_end(source, scope.2, b'{', b'}').is_some()
                             } else {
-                                source[scope.2..].contains(&scope.0)
+                                source[scope.2..].contains(scope.0.as_ref())
                             }
                         }) {
                         // Unknown catcodes can hide closing braces of outer scopes.
@@ -6409,39 +6410,33 @@ fn protected_ranges_with_inferred_environments(
                 visual_overrides.leave();
                 catcode_scopes.pop();
             }
-            pos += source[pos..]
-                .chars()
-                .next()
-                .expect("valid position")
-                .len_utf8();
+            pos += character.len_utf8();
             if config.syntax.special.is_empty() {
-                let next = memchr::memchr3(b'\\', b'%', b'{', &source.as_bytes()[pos..])
-                    .map_or(source.len(), |i| pos + i);
-                let next = memchr::memchr(b'`', &source.as_bytes()[pos..])
-                    .map_or(next, |i| next.min(pos + i));
-                let next = memchr::memchr(b'}', &source.as_bytes()[pos..])
-                    .map_or(next, |i| next.min(pos + i));
-                let next = if package_context.at(pos).has_package("codedescribe") {
-                    memchr::memchr(b'!', &source.as_bytes()[pos..])
-                        .map_or(next, |i| next.min(pos + i))
-                } else {
-                    next
-                };
-                let next = delayed_key_ranges
+                let limit = delayed_key_ranges
                     .range(pos..)
                     .next()
-                    .map_or(next, |(&start, _)| next.min(start));
-                let next = short_verbatim
-                    .iter()
-                    .filter_map(|&delimiter| {
-                        source[pos..].find(delimiter).map(|offset| pos + offset)
-                    })
-                    .min()
-                    .map_or(next, |offset| next.min(offset));
-                pos = macro_ranges
+                    .map_or(input_end, |(&start, _)| start.min(input_end));
+                let limit = macro_ranges
                     .last()
                     .filter(|r| r.start >= pos)
-                    .map_or(next, |r| next.min(r.start));
+                    .map_or(limit, |r| limit.min(r.start));
+                let text = &source[pos..limit];
+                let code_punctuation = package_context.at(pos).has_package("codedescribe");
+                let structural = |byte| {
+                    matches!(byte, b'\\' | b'%' | b'{' | b'}' | b'`')
+                        || byte == b'!' && code_punctuation
+                };
+                // Stop at the first active delimiter in a single forward scan.
+                // Short-verbatim delimiters can be non-ASCII source characters.
+                let offset = if short_verbatim.is_empty() {
+                    text.bytes().position(structural)
+                } else {
+                    text.char_indices().find_map(|(offset, ch)| {
+                        (ch.is_ascii() && structural(ch as u8) || short_verbatim.contains(&ch))
+                            .then_some(offset)
+                    })
+                };
+                pos += offset.unwrap_or(text.len());
             }
         }
     }

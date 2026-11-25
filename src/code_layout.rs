@@ -695,7 +695,14 @@ pub(crate) fn format_code_with_context(
         fragments.extend(
             scanner::environments(source, &protected)
                 .into_iter()
-                .filter(|(name, _)| algorithm_environment(name))
+                .filter(|(name, range)| {
+                    algorithm_environment(name)
+                        && !(name.trim_end_matches('*') == "algorithm"
+                            && overlapping_ranges(&protected, range).iter().any(|child| {
+                                syntax::env_at(source, child.start)
+                                    .is_some_and(|(name, begin, _)| begin && name == "algorithmic")
+                            }))
+                })
                 .map(|(_, range)| (range, false)),
         );
         if !fragments.is_empty() {

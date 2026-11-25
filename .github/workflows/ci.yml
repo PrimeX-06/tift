@@ -32,6 +32,7 @@ jobs:
               ".github/workflows/ci.yml", ".github/workflows/release.yml",
               ".github/workflows/pages.yml", "examples/tift.toml",
               "site/index.html", "site/homepage.css", "site/homepage.js",
+              "performance/openai_math.py",
               "site/branding/tift-bibtex-formatting.png", "site/branding/tift-latex-formatting.png",
               "site/branding/tift-logo.svg", "site/branding/tift-logo.tex",
           }

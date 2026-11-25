@@ -18,7 +18,7 @@ pub use cleanup::CleanupConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BibtexConfig {
-    /// Apply bibliography settings inside literal filecontents bibliography files.
+    /// Format supported file types inside literal filecontents environments.
     pub format_filecontents: bool,
     /// Normalize assignment layout. Field alignment also requires `align_fields`.
     pub normalize: bool,
@@ -88,30 +88,32 @@ pub fn validate(config: &BibtexConfig) -> Result<(), String> {
     cleanup::validate(&config.cleanup)
 }
 
-/// A filecontents payload starts after the opening line and ends before the
-/// closing line, including when the environment itself is indented.
-fn embedded_body(region: &str, name: &str, header: usize) -> Option<Range<usize>> {
+/// Resolve a supported payload type from the declared filename and locate its
+/// contents, including when the environment itself is indented.
+fn embedded_body(
+    region: &str,
+    name: &str,
+    header: usize,
+) -> Option<(crate::FileKind, Range<usize>)> {
     let mut open = crate::trivia::skip(region, header);
     if region.as_bytes().get(open) == Some(&b'[') {
         open = crate::trivia::skip(region, syntax::balanced_end(region, open, b'[', b']')?);
     }
     let end = syntax::balanced_end(region, open, b'{', b'}')?;
     let file = region[open + 1..end - 1].trim();
-    let literal = file
+    let filename = file
         .strip_prefix(r"\jobname")
         .filter(|tail| !tail.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
-        .unwrap_or(file);
-    if literal.contains(['\\', '{', '}', '%', '#', '~', '^'])
-        || !literal
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("bib"))
-    {
+        .map_or_else(|| file.to_owned(), |tail| format!("jobname{tail}"));
+    if filename.contains(['\\', '{', '}', '%', '#', '~', '^']) {
         return None;
     }
+    let kind = crate::FileKind::from_path(std::path::Path::new(&filename))?;
     let first = end + region[end..].find('\n')? + 1;
     let close = region.strip_suffix(&format!("\\end{{{name}}}"))?;
     let last = close.rfind('\n')? + 1;
-    (first <= last && close[last..].trim_matches([' ', '\t']).is_empty()).then_some(first..last)
+    (first <= last && close[last..].trim_matches([' ', '\t']).is_empty())
+        .then_some((kind, first..last))
 }
 
 pub(crate) fn format_embedded(
@@ -149,11 +151,17 @@ pub(crate) fn format_embedded(
         {
             continue;
         }
-        let Some(body) = embedded_body(region, name, header) else {
+        let Some((kind, body)) = embedded_body(region, name, header) else {
             continue;
         };
         let body = span.start + body.start..span.start + body.end;
-        let result = format_bibtex_detailed(&source[body.clone()], config)?;
+        let result = if kind == crate::FileKind::Bibtex {
+            format_bibtex_detailed(&source[body.clone()], config)?
+        } else if kind == crate::FileKind::Bst {
+            crate::bst::format_style(&source[body.clone()], config)?
+        } else {
+            crate::format(&source[body.clone()], kind, config)?
+        };
         for mut diagnostic in result.diagnostics {
             diagnostic.span.start += body.start + bom_bytes;
             diagnostic.span.end += body.start + bom_bytes;

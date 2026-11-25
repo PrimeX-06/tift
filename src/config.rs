@@ -10,6 +10,7 @@ pub enum FileKind {
     Style,
     Class,
     Bibtex,
+    Bst,
     Dtx,
     Ins,
 }
@@ -36,6 +37,8 @@ impl FileKind {
             Some(Self::Class)
         } else if extension.eq_ignore_ascii_case("bib") {
             Some(Self::Bibtex)
+        } else if extension.eq_ignore_ascii_case("bst") {
+            Some(Self::Bst)
         } else if ["dtx", "fdd"]
             .iter()
             .any(|suffix| extension.eq_ignore_ascii_case(suffix))
@@ -429,6 +432,7 @@ pub struct IndentConfig {
     pub pgfplots_panels: bool,
     pub bibliography_items: bool,
     pub beamer_overprint: bool,
+    pub algpseudocode: bool,
     pub maximum: Option<usize>,
     pub rules: BTreeMap<String, IndentRule>,
     pub categories: BTreeMap<String, IndentRule>,
@@ -462,6 +466,7 @@ impl Default for IndentConfig {
             pgfplots_panels: true,
             bibliography_items: true,
             beamer_overprint: true,
+            algpseudocode: true,
             maximum: None,
             rules,
             categories,
@@ -643,7 +648,7 @@ impl Default for BreakConfig {
             pgfplots_coordinates: false,
             pgfplots_tables: true,
             pgfplots_named_tables: true,
-            split_cmidrules: true,
+            split_cmidrules: false,
             categories: BTreeMap::new(),
             rules: BTreeMap::new(),
         }

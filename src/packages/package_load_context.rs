@@ -56,13 +56,10 @@ impl ContextIndex {
         if config.syntax.package_load_events.is_empty() {
             return context;
         }
-        let loaders: HashMap<_, _> = crate::source_model::SourceModel::loader_occurrences(source)
-            .into_iter()
-            .map(|(at, loader)| (loader, at))
-            .collect();
+        let loader_position = crate::source_model::SourceModel::loader_position_lookup(source);
         for event in &config.syntax.package_load_events {
             if let Some(loader) = &event.loader {
-                if let Some(&at) = loaders.get(loader) {
+                if let Some(at) = loader_position(loader) {
                     context
                         .imports
                         .entry(at)

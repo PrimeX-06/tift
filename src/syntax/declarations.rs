@@ -210,8 +210,10 @@ fn infer_declaration_config_impl(
     let mut declarations_changed = !incremental;
     let mut reader_complete = source.is_empty() || source.ends_with('\n');
     let reader_start = cursor;
-    let reader_positions =
-        crate::source_model::SourceModel::reader_positions(&source[reader_start..]);
+    let mut reader_positions =
+        crate::source_model::SourceModel::reader_positions(&source[reader_start..])
+            .map(|at| at + reader_start)
+            .peekable();
     let mut protected_index = 0usize;
     while cursor < source.len() {
         while protected
@@ -523,9 +525,10 @@ fn infer_declaration_config_impl(
             .iter()
             .find(|range| range.start >= cursor)
             .map_or(source.len(), |range| range.start);
+        while reader_positions.next_if(|&at| at < cursor).is_some() {}
         cursor = reader_positions
-            .get(reader_positions.partition_point(|&at| at + reader_start < cursor))
-            .map_or(next_range, |&at| (at + reader_start).min(next_range));
+            .peek()
+            .map_or(next_range, |&at| at.min(next_range));
     }
     let independent_append_safe = append_safe
         && protected

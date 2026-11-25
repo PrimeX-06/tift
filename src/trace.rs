@@ -81,7 +81,7 @@ fn action(stage: &str) -> TraceAction {
         "replacements-before" | "replacements-after" => TraceAction::Replacement,
         "whitespace-before" | "whitespace-after" => TraceAction::Whitespace,
         "file-boundaries" => TraceAction::FileBoundary,
-        "bibtex" => TraceAction::Bibtex,
+        "bibtex" | "bst" => TraceAction::Bibtex,
         "selection" => TraceAction::Selection,
         _ => TraceAction::Other,
     }
@@ -194,6 +194,7 @@ fn rule(stage: &str, block: Option<&Block>, config: &CompiledConfig) -> Option<S
         "whitespace-before" | "whitespace-after" => Some("whitespace".into()),
         "file-boundaries" => Some("whitespace.line-ending/final-newline".into()),
         "bibtex" => Some("indent/whitespace".into()),
+        "bst" => Some("indent/whitespace/comments".into()),
         _ => None,
     }
 }
