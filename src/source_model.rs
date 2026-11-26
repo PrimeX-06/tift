@@ -90,6 +90,8 @@ pub struct Conditional {
 #[derive(Debug, Clone)]
 enum Replacement {
     Boundary(EnvironmentAlias),
+    WrappedEnvironment(String),
+    RestartEnvironment(String),
     GroupBegin,
     InlineMathShift,
     ConstructedWrapper(String),
@@ -175,6 +177,7 @@ pub struct SourceModel {
     environment_declaration_names: HashSet<String>,
     environment_arguments: HashMap<usize, EnvironmentArguments>,
     environment_header_starts: HashMap<usize, usize>,
+    explicit_wrapper_ends: HashMap<usize, usize>,
     context: crate::packages::context::ContextIndex,
     conditionals: Vec<Conditional>,
     rules: Vec<SyntaxRule>,
@@ -475,6 +478,7 @@ impl SourceModel {
             environment_declaration_names: HashSet::new(),
             environment_arguments: HashMap::new(),
             environment_header_starts: HashMap::new(),
+            explicit_wrapper_ends: HashMap::new(),
             context: crate::packages::context::ContextIndex::with_config(source, config),
             conditionals: Vec::new(),
             rules: Vec::new(),
@@ -576,6 +580,9 @@ impl SourceModel {
     }
     pub fn boundary_at(&self, at: usize) -> Option<&EnvironmentAlias> {
         self.boundaries.get(&at)
+    }
+    pub(crate) fn explicit_wrapper_end(&self, at: usize) -> Option<usize> {
+        self.explicit_wrapper_ends.get(&at).copied()
     }
     pub(crate) fn opens_group_at(&self, at: usize) -> bool {
         self.group_openers.contains(&at)
@@ -790,9 +797,13 @@ impl SourceModel {
                 for (name, alias) in &imports[import_index].aliases {
                     if !config.syntax.environment_aliases.contains_key(name) {
                         let command = imports[import_index].commands.get(name);
-                        let replacement = alias.as_ref().map_or(Replacement::Unknown, |alias| {
-                            Replacement::Boundary(alias.clone())
-                        });
+                        let replacement = match alias {
+                            Some(alias) => Replacement::Boundary(alias.clone()),
+                            None if command.is_some_and(|c| c.neutral_environment_wrapper) => {
+                                Replacement::NeutralWrapper
+                            }
+                            None => Replacement::Unknown,
+                        };
                         assign(
                             &mut bindings,
                             &mut scopes,
@@ -839,8 +850,12 @@ impl SourceModel {
                             &mut scopes,
                             name,
                             Binding {
-                                replacement: Replacement::Unknown,
-                                candidate: false,
+                                replacement: if command.neutral_environment_wrapper {
+                                    Replacement::NeutralWrapper
+                                } else {
+                                    Replacement::Unknown
+                                },
+                                candidate: command.neutral_environment_wrapper,
                                 signature: command.arguments.clone(),
                                 condition: None,
                                 literal_arguments: command.literal_arguments,
@@ -1122,10 +1137,26 @@ impl SourceModel {
             if matches!(name, "begin" | "end") {
                 let argument = skip(&self.source, end);
                 if let Some(finish) = syntax::balanced_end(&self.source, argument, b'{', b'}') {
-                    let alias = EnvironmentAlias {
+                    let mut alias = EnvironmentAlias {
                         environment: self.source[argument + 1..finish - 1].trim().into(),
                         begin: name == "begin",
                     };
+                    let mut finish = finish;
+                    if !alias.begin
+                        && let Some(outer) = self.context.at(start).environment()
+                        && outer != alias.environment
+                        && let Some(binding) = bindings.get(&format!("environment:{outer}"))
+                        && matches!(&binding.replacement, Replacement::WrappedEnvironment(inner) if *inner == alias.environment)
+                        && let Some(("endgroup", after)) =
+                            syntax::command_at(&self.source, skip(&self.source, finish))
+                        && !bindings.contains_key("endgroup")
+                    {
+                        alias.environment = outer.to_owned();
+                        self.context.skip_environment(&alias.environment, after);
+                        self.boundaries.insert(start, alias.clone());
+                        self.explicit_wrapper_ends.insert(start, after);
+                        finish = after;
+                    }
                     if alias.begin
                         && !config
                             .syntax
@@ -1227,7 +1258,12 @@ impl SourceModel {
                         &mut scopes,
                         &key,
                         Binding {
-                            replacement: Replacement::Unknown,
+                            replacement: if certain {
+                                wrapped_environment(&self.source, &declaration)
+                                    .map_or(Replacement::Unknown, Replacement::WrappedEnvironment)
+                            } else {
+                                Replacement::Unknown
+                            },
                             candidate: false,
                             signature,
                             condition: None,
@@ -1714,6 +1750,12 @@ impl SourceModel {
                 scopes.push(HashMap::new());
             } else if bindings.get(name).is_some_and(|binding| matches!(binding.replacement, Replacement::InlineMathShift)) {
                 self.inline_math_shifts.insert(start);
+            } else if let Some(Replacement::RestartEnvironment(environment)) =
+                bindings.get(name).map(|binding| &binding.replacement)
+                && self.context.at(start).environment() == Some(environment.as_str())
+            {
+                restore_scope(&mut bindings, &mut scopes);
+                scopes.push(HashMap::new());
             } else if let Some(alias) = resolve(name, &bindings) {
                 self.context
                     .observe_environment(&alias.environment, alias.begin, end);
@@ -1778,6 +1820,10 @@ impl SourceModel {
                 crate::config::ImportedCommand {
                     arguments: bindings[name].signature.clone(),
                     literal_arguments: bindings[name].literal_arguments,
+                    neutral_environment_wrapper: matches!(
+                        bindings[name].replacement,
+                        Replacement::NeutralWrapper
+                    ),
                     global: bindings[name].global,
                 },
             );
@@ -1881,25 +1927,24 @@ fn stored_parameter_mask_with_bindings(
     context: &crate::packages::context::InvocationContext<'_>,
     bindings: &HashMap<String, Binding>,
 ) -> u16 {
-    if !body.contains('#') {
-        return 0;
+    let (stored, used) = parameter_usage(body, bindings, Some(context));
+    if used & UNNUMBERED_PARAMETER != 0 {
+        0
+    } else {
+        stored & !used & 0x1ff
     }
-    let mut mask = 0;
-    for parameter in 1..=9 {
-        if !body.contains(&format!("#{parameter}")) {
-            continue;
+}
+
+const UNNUMBERED_PARAMETER: u16 = 1 << 9;
+
+fn parameter_bits(body: &str, range: Range<usize>) -> u16 {
+    let bytes = body.as_bytes();
+    memchr::memchr_iter(b'#', &bytes[range.clone()]).fold(0, |mask, at| {
+        mask | match bytes.get(range.start + at + 1) {
+            Some(digit @ b'1'..=b'9') => 1 << (digit - b'1'),
+            _ => UNNUMBERED_PARAMETER,
         }
-        let mut isolated = body.to_owned();
-        for other in 1..=9 {
-            if other != parameter {
-                isolated = isolated.replace(&format!("#{other}"), "\\tiftparameter ");
-            }
-        }
-        if parameters_only_in_data(&isolated, bindings, Some(context)) {
-            mask |= 1 << (parameter - 1);
-        }
-    }
-    mask
+    })
 }
 
 fn parameters_only_in_data(
@@ -1907,11 +1952,23 @@ fn parameters_only_in_data(
     bindings: &HashMap<String, Binding>,
     context: Option<&crate::packages::context::InvocationContext<'_>>,
 ) -> bool {
+    let (stored, used) = parameter_usage(body, bindings, context);
+    stored != 0 && used == 0
+}
+
+// Keep separate bitsets for uses inside data and uses in executed text.
+// All nine argument slots share the same token scan.
+fn parameter_usage(
+    body: &str,
+    bindings: &HashMap<String, Binding>,
+    context: Option<&crate::packages::context::InvocationContext<'_>>,
+) -> (u16, u16) {
     if !body.contains('#') {
-        return false;
+        return (0, 0);
     }
     let mut cursor = 0;
-    let mut saw_parameter = false;
+    let mut stored = 0;
+    let mut used = 0;
     for token in SourceTokens::new(body, &[]) {
         if token.span.start < cursor || token.kind == SourceTokenKind::Comment {
             continue;
@@ -1919,59 +1976,69 @@ fn parameters_only_in_data(
         if token.kind == SourceTokenKind::Control
             && let Some((name, end)) = syntax::command_at(body, token.span.start)
         {
-            let finish = syntax::delayed_data_end(body, name, end)
-                .or_else(|| syntax::primitive_data_end(body, name, end))
-                .or_else(|| syntax::test_operand_end(body, name, end))
-                .or_else(|| syntax::let_declaration_end(body, name, end))
-                .or_else(|| {
-                    context
-                        .and_then(|context| {
-                            crate::packages::command_data_ranges_in_context(
-                                body, name, end, context,
-                            )
-                        })
-                        .and_then(|ranges| ranges.last().map(|range| range.end))
-                })
-                .or_else(|| {
-                    syntax::message_data_arguments(body, name, end)
-                        .and_then(|arguments| arguments.last().map(|argument| argument.end))
-                })
-                .or_else(|| {
-                    if let Some(binding) = bindings.get(name) {
-                        if !binding.literal_arguments && binding.literal_slots & 1 != 0 {
-                            let arguments =
-                                invocation_arguments(body, end, binding.signature.as_ref()?)?;
-                            return arguments
-                                .iter()
-                                .enumerate()
-                                .take_while(|(index, _)| {
-                                    *index < 9 && binding.literal_slots & (1 << index) != 0
-                                })
-                                .last()
-                                .map(|(_, argument)| argument.end);
-                        }
-                        binding
-                            .literal_arguments
-                            .then_some(binding.signature.as_ref())
-                            .flatten()
-                            .and_then(|signature| invocation_arguments(body, end, signature))
-                            .and_then(|arguments| arguments.last().map(|argument| argument.end))
-                    } else {
-                        crate::packages::commands::is_recording_command(name)
-                            .then(|| crate::packages::command_data_end(body, name, end))
-                            .flatten()
+            let finish = match name {
+                "scantokens" => syntax::balanced_end(body, skip(body, end), b'{', b'}'),
+                // TeX reads this parameter for its character code.
+                "catcode" => {
+                    let at = skip(body, end);
+                    body.as_bytes()
+                        .get(at..at + 3)
+                        .filter(|operand| matches!(*operand, [b'`', b'#', b'1'..=b'9']))
+                        .map(|_| at + 3)
+                }
+                _ => None,
+            }
+            .or_else(|| syntax::delayed_data_end(body, name, end))
+            .or_else(|| syntax::primitive_data_end(body, name, end))
+            .or_else(|| syntax::test_operand_end(body, name, end))
+            .or_else(|| syntax::let_declaration_end(body, name, end))
+            .or_else(|| {
+                context
+                    .and_then(|context| {
+                        crate::packages::command_data_ranges_in_context(body, name, end, context)
+                    })
+                    .and_then(|ranges| ranges.last().map(|range| range.end))
+            })
+            .or_else(|| {
+                syntax::message_data_arguments(body, name, end)
+                    .and_then(|arguments| arguments.last().map(|argument| argument.end))
+            })
+            .or_else(|| {
+                if let Some(binding) = bindings.get(name) {
+                    if !binding.literal_arguments && binding.literal_slots & 1 != 0 {
+                        let arguments =
+                            invocation_arguments(body, end, binding.signature.as_ref()?)?;
+                        return arguments
+                            .iter()
+                            .enumerate()
+                            .take_while(|(index, _)| {
+                                *index < 9 && binding.literal_slots & (1 << index) != 0
+                            })
+                            .last()
+                            .map(|(_, argument)| argument.end);
                     }
-                })
-                .or_else(|| expl3_stored_data_end(body, name, end));
+                    binding
+                        .literal_arguments
+                        .then_some(binding.signature.as_ref())
+                        .flatten()
+                        .and_then(|signature| invocation_arguments(body, end, signature))
+                        .and_then(|arguments| arguments.last().map(|argument| argument.end))
+                } else {
+                    crate::packages::commands::is_recording_command(name)
+                        .then(|| crate::packages::command_data_end(body, name, end))
+                        .flatten()
+                }
+            })
+            .or_else(|| expl3_stored_data_end(body, name, end));
             if let Some(finish) = finish {
-                saw_parameter |= body[end..finish].contains('#');
+                stored |= parameter_bits(body, end..finish);
                 cursor = finish;
             }
-        } else if body[token.span.clone()].contains('#') {
-            return false;
+        } else {
+            used |= parameter_bits(body, token.span);
         }
     }
-    saw_parameter
+    (stored, used)
 }
 
 /// These kernel operations store their token-list operand. Their declaration
@@ -2095,6 +2162,8 @@ fn resolve(name: &str, bindings: &HashMap<String, Binding>) -> Option<Environmen
             Replacement::Boundary(alias) => return Some(alias.clone()),
             Replacement::Forward(target) => target,
             Replacement::Unknown
+            | Replacement::RestartEnvironment(_)
+            | Replacement::WrappedEnvironment(_)
             | Replacement::NeutralWrapper
             | Replacement::GroupBegin
             | Replacement::InlineMathShift
@@ -2107,6 +2176,8 @@ fn resolve(name: &str, bindings: &HashMap<String, Binding>) -> Option<Environmen
                 Replacement::Boundary(alias) => return Some(alias.clone()),
                 Replacement::Forward(target) => target,
                 Replacement::Unknown
+                | Replacement::RestartEnvironment(_)
+                | Replacement::WrappedEnvironment(_)
                 | Replacement::NeutralWrapper
                 | Replacement::GroupBegin
                 | Replacement::InlineMathShift
@@ -2145,6 +2216,9 @@ fn replacement(body: &str) -> Replacement {
     let mut body = body[skip(body, 0)..].trim_end();
     if let Some(("noexpand", end)) = syntax::command_at(body, 0) {
         body = &body[skip(body, end)..];
+    }
+    if let Some(wrapper) = layout_environment_wrapper(body) {
+        return wrapper;
     }
     let mut cursor = 0;
     let mut shifts = 0;
@@ -2224,6 +2298,103 @@ fn replacement(body: &str) -> Replacement {
     Replacement::Unknown
 }
 
+fn wrapped_environment(source: &str, declaration: &EnvironmentDeclaration) -> Option<String> {
+    let [begin, end] = declaration.bodies.as_slice() else {
+        return None;
+    };
+    let close = &source[end.clone()];
+    let (inner, false, after) = syntax::env_at(close, skip(close, 0))? else {
+        return None;
+    };
+    if skip(close, after) != close.len()
+        || inner.is_empty()
+        || inner.contains(['#', '\\', '{', '}', '%'])
+    {
+        return None;
+    }
+    let open = &source[begin.clone()];
+    let mut tokens = SourceTokens::new(open, &[]);
+    let mut found = false;
+    while let Some(token) = tokens.next() {
+        if token.kind == SourceTokenKind::OpenGroup {
+            tokens.position = syntax::balanced_end(open, token.span.start, b'{', b'}')?;
+        } else if token.kind == SourceTokenKind::Control {
+            let (name, _) = syntax::command_at(open, token.span.start)?;
+            if name == "begin" {
+                if found || syntax::env_at(open, token.span.start)?.0 != inner {
+                    return None;
+                }
+                found = true;
+            } else if matches!(name, "end" | "begingroup" | "endgroup" | "else" | "fi")
+                || name.starts_with("if")
+            {
+                return None;
+            }
+        }
+    }
+    found.then(|| inner.to_owned())
+}
+
+/// Layout-only commands may surround a literal boundary. A switch between
+/// adjacent minipages ends one local scope and opens another at the same depth.
+fn layout_environment_wrapper(body: &str) -> Option<Replacement> {
+    let mut cursor = 0;
+    let mut boundary = None;
+    while skip(body, cursor) < body.len() {
+        let at = skip(body, cursor);
+        let (name, end) = syntax::command_at(body, at)?;
+        cursor = end;
+        if matches!(
+            name,
+            "bigskip" | "medskip" | "smallskip" | "noindent" | "par"
+        ) {
+            continue;
+        }
+        let (environment, begin, end) = syntax::env_after_command(body, name, end)?;
+        if environment.is_empty()
+            || !environment
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'*')
+        {
+            return None;
+        }
+        cursor = end;
+        if begin && environment == "minipage" {
+            cursor = syntax::arguments::signature_end(body, end, "ooom")?;
+            let mut header = SourceTokens::new(&body[end..cursor], &[]);
+            if header.any(|token| {
+                token.kind == SourceTokenKind::Control
+                    && !matches!(
+                        token.control(&body[end..cursor]).map(|(name, _)| name),
+                        Some(
+                            "linewidth"
+                                | "textwidth"
+                                | "columnwidth"
+                                | "hsize"
+                                | "textheight"
+                                | "baselineskip"
+                        )
+                    )
+            }) {
+                return None;
+            }
+        }
+        boundary = Some(match boundary {
+            None => Replacement::Boundary(EnvironmentAlias {
+                environment: environment.into(),
+                begin,
+            }),
+            Some(Replacement::Boundary(previous))
+                if begin && !previous.begin && previous.environment == environment =>
+            {
+                Replacement::RestartEnvironment(environment.into())
+            }
+            _ => return None,
+        });
+    }
+    boundary
+}
+
 /// A complete static wrapper leaves the caller's environment stack untouched.
 /// Conditional branches must each restore their entry stack. Parameters can
 /// stand for neutral arguments only after each invocation proves those operands;
@@ -2298,6 +2469,7 @@ fn body_has_environment_effect(
     let mut seen_boundary = false;
     let mut uncertain = false;
     let mut invalid_condition = false;
+    let mut loops = Vec::new();
     while let Some(token) = tokens.next() {
         if !neutral_parameters
             && token.kind == SourceTokenKind::Text
@@ -2319,7 +2491,25 @@ fn body_has_environment_effect(
             tokens.position = finish;
             continue;
         }
-        if matches!(name, "csname" | "endcsname" | "expandafter" | "scantokens") {
+        // Common one-step expansion into a braced display argument. Keep
+        // scanning its contents so literal environment effects remain visible.
+        if name == "expandafter"
+            && let Some((reader, after)) = syntax::command_at(body, skip(body, end))
+            && matches!(reader, "url" | "email" | "path")
+            && let Some(("expandafter", brace)) = syntax::command_at(body, skip(body, after))
+            && body.as_bytes().get(skip(body, brace)) == Some(&b'{')
+        {
+            tokens.position = brace;
+            continue;
+        }
+        if let Some(close) = syntax::loop_end(name) {
+            loops.push((close, conditions.len()));
+        } else if loops.last().is_some_and(|&(close, _)| name == close)
+            && let Some((_, depth)) = loops.pop()
+        {
+            invalid_condition |=
+                conditions.len() != depth + 1 || conditions.pop() != Some(environments.len());
+        } else if matches!(name, "csname" | "endcsname" | "expandafter" | "scantokens") {
             if complete {
                 return true;
             }
@@ -2366,7 +2556,8 @@ fn body_has_environment_effect(
             tokens.position = finish;
         }
     }
-    (complete || seen_boundary) && (uncertain || invalid_condition || !conditions.is_empty())
+    (complete || seen_boundary)
+        && (uncertain || invalid_condition || !conditions.is_empty() || !loops.is_empty())
         || !environments.is_empty()
 }
 
@@ -2453,6 +2644,20 @@ fn neutral_wrapper_arguments(
     config: &Config,
     bindings: &HashMap<String, Binding>,
 ) -> bool {
+    // An adjacent star is a separate TeX token for a \newcommand with
+    // ordinary positional arguments, including after an absent optional slot.
+    let end = if signature
+        .signature
+        .as_ref()
+        .is_none_or(|shape| shape.bytes().all(|s| matches!(s, b'o' | b'm')))
+        && source[..end]
+            .strip_suffix('*')
+            .is_some_and(|prefix| prefix.ends_with(|c: char| c.is_ascii_alphabetic() || c == '@'))
+    {
+        end - 1
+    } else {
+        end
+    };
     let Some(arguments) = invocation_arguments(source, end, signature) else {
         return false;
     };
@@ -2487,12 +2692,8 @@ fn neutral_wrapper_arguments(
         if boolean_ranges.contains(&(argument.start, argument.end)) {
             return true;
         }
-        if source.get(argument.clone()) == Some("*")
-            && signature
-                .signature
-                .as_ref()
-                .is_some_and(|shape| shape.contains('s'))
-        {
+        let operand = &source[argument.clone()];
+        if operand == "*" || operand.len() == 1 && operand.as_bytes()[0].is_ascii_alphanumeric() {
             return true;
         }
         // An unbraced operand can be a single math shift or a grouping token.

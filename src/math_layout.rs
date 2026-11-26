@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 mod modes;
 mod relations;
 mod symbols;
+pub(crate) use symbols::known_command as known_math_command;
 
 use crate::{CompiledConfig, FileKind, FormatError, code_layout, syntax};
 use modes::MathModes;
@@ -1695,7 +1696,12 @@ fn flat_piece(source: &str, atoms: &[Atom], range: &Range<usize>) -> Option<Stri
             let delimiter_gap = atom.delimiter == Some(DelimiterRole::Close)
                 || previous.is_some_and(|left| left.delimiter == Some(DelimiterRole::Open));
             if !delimiter_gap
-                || previous.is_some_and(|left| control_word_seam(&source[left.range.clone()], text))
+                || atom.delimiter == Some(DelimiterRole::Close) && sized_delimiter(text)
+                || previous.is_some_and(|left| {
+                    let left_text = &source[left.range.clone()];
+                    control_word_seam(left_text, text)
+                        || left.delimiter == Some(DelimiterRole::Open) && sized_delimiter(left_text)
+                })
             {
                 output.push(' ')
             }

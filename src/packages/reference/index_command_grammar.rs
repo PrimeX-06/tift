@@ -41,6 +41,8 @@ command_signatures! {
     // splitidx:98--129. The entry is read after changing special catcodes.
     "index" | "sindex" => "om",
     "indexentry" => "omm",
+    // forest-index.sty registers the supplied control sequence for memoization.
+    "forest@memoize" => "m",
     // splitidx:259,308; index:46--111. The shared minimum is one argument;
     // index's four-argument newindex form must not absorb arbitrary body groups.
     "newindex" | "newprotectedindex" => "om",

@@ -57,7 +57,7 @@ commands! {
     "mtcsettitle" | "mtcsettitlefont" | "mtcsetpagenumbers" | "mtcsetrules"
         | "mtcsetdepth" | "mtcsetoffset" => ("mm", "mm"),
     "mtcsetfont" | "mtcsetformat" | "mtcsetfeature" => ("mmm", "mmm"),
-    "immediateaddtocontents" => ("mm", "mm"),
+    "addtocontents" | "immediateaddtocontents" => ("mm", "mm"),
     // Graphics driver options and the conversion command are stored data.
     "bmpsizesetup" | "epstopdfsetup" => ("m", "m"),
     "epstopdfDeclareGraphicsRule" => ("mmmm", "mmmm"),

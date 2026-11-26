@@ -88,7 +88,9 @@ pub(crate) fn context_command_data_ranges(
         };
         return Some(std::iter::once(start..finish).collect());
     }
-    if matches!(name, "filename" | "dirname") && context.has_package("tex-live") {
+    if matches!(name, "filename" | "dirname") && context.has_package("tex-live")
+        || name == "path" && context.has_package("url") && !context.possibly_has_package("tikz")
+    {
         let start = crate::trivia::skip(source, end);
         let finish = crate::code_package_syntax::raw_group_end(source, start)?;
         return Some(std::iter::once(start..finish).collect());

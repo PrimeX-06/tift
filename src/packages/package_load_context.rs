@@ -151,6 +151,12 @@ impl ContextIndex {
                 self.load("pitex", cursor + input.len(), certain);
             }
             if matches!(
+                input.trim_matches(['{', '}']),
+                "pgfmanual-en-macros" | "pgfmanual-en-macros.tex"
+            ) {
+                self.load("pgfmanual-en-macros", cursor + input.len(), certain);
+            }
+            if matches!(
                 input,
                 "pdfToolbox" | "pdfToolbox.tex" | "{pdfToolbox}" | "{pdfToolbox.tex}"
             ) {

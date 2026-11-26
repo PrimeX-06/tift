@@ -106,19 +106,34 @@ pub(crate) fn preserves_tight_whitespace(name: &str) -> bool {
     header_signature(name).is_some()
 }
 
-pub(crate) fn is_data_command(name: &str) -> bool {
+fn matrix_command(name: &str) -> bool {
     matches!(
         name,
-        "depstyle"
-            | "depkeys"
-            | "deproot"
-            | "depedge"
-            | "wordgroup"
-            | "groupedge"
-            | "Tree"
-            | "pie"
-            | "pgfpie@pie"
+        "xymatrix"
+            | "xymatrix@"
+            | "xymatrix@C"
+            | "xymatrix@R"
+            | "xymatrix@M"
+            | "xymatrix@W"
+            | "xymatrix@H"
+            | "xymatrix@L"
     )
+}
+
+pub(crate) fn is_data_command(name: &str) -> bool {
+    matrix_command(name)
+        || matches!(
+            name,
+            "depstyle"
+                | "depkeys"
+                | "deproot"
+                | "depedge"
+                | "wordgroup"
+                | "groupedge"
+                | "Tree"
+                | "pie"
+                | "pgfpie@pie"
+        )
 }
 
 pub(super) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
@@ -213,6 +228,20 @@ pub(crate) fn literal_data_range(
     name: &str,
     in_tikz: bool,
 ) -> Option<Range<usize>> {
+    // Xy-pic reads spacing switches and the following alignment as one matrix.
+    if matrix_command(name) {
+        let start = skip(source, command_end);
+        let brace = if name == "xymatrix" && source.as_bytes().get(start) != Some(&b'@') {
+            start
+        } else {
+            start
+                + source[start..].find(|c: char| {
+                    !(c.is_ascii_alphanumeric() || "@=.+-!<>^".contains(c) || c == ' ' || c == '\t')
+                })?
+        };
+        let end = syntax::balanced_end(source, brace, b'{', b'}')?;
+        return Some(command_end..end);
+    }
     if name == "Tree" {
         let start = skip(source, command_end);
         let mut end = syntax::balanced_end(source, start, b'[', b']')?;

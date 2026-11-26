@@ -314,7 +314,9 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
             },
         );
     }
-    if let Some(shape) = stored_kernel_signature(name) {
+    if let Some(shape) =
+        algorithmic_block_signature(source, name, end).or_else(|| stored_kernel_signature(name))
+    {
         return Some(shape);
     }
     if matches!(name.trim_end_matches('*'), "lipsum" | "lipsumexp") {
@@ -358,7 +360,8 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
 }
 
 pub(crate) fn is_metadata_command(name: &str) -> bool {
-    stored_kernel_signature(name).is_some()
+    matches!(name, "algblockdefx" | "algcblockdefx")
+        || stored_kernel_signature(name).is_some()
         || matches!(
             name.trim_end_matches('*'),
             "patchcmd"
@@ -421,7 +424,9 @@ pub(crate) fn command_header_end(source: &str, name: &str, end: usize) -> Option
             command_signature(source, name, end)?,
         );
     }
-    if let Some(shape) = stored_kernel_signature(name) {
+    if let Some(shape) =
+        algorithmic_block_signature(source, name, end).or_else(|| stored_kernel_signature(name))
+    {
         return crate::syntax::arguments::signature_end(source, end, shape);
     }
     let shape = match name.trim_end_matches('*') {
@@ -461,6 +466,23 @@ pub(crate) fn command_data_ranges(
     }
     let finish = syntax::balanced_end(source, start, b'{', b'}')?;
     Some(std::iter::once(start + 1..finish - 1).collect())
+}
+
+// algorithmicx skips the starting text specification when the starting
+// command name is empty. The closing command still has its own text.
+fn algorithmic_block_signature(source: &str, name: &str, end: usize) -> Option<&'static str> {
+    let (prefix, full, end_only) = match name {
+        "algblockdefx" => ("o", "ommoomoom", "ommoom"),
+        "algcblockdefx" => ("om", "ommmoomoom", "ommmoom"),
+        _ => return None,
+    };
+    let at = trivia(
+        source,
+        syntax::arguments::signature_end(source, end, prefix)?,
+    );
+    let empty = source.as_bytes().get(at) == Some(&b'{')
+        && source.as_bytes().get(trivia(source, at + 1)) == Some(&b'}');
+    Some(if empty { end_only } else { full })
 }
 
 fn stored_kernel_signature(name: &str) -> Option<&'static str> {
@@ -531,8 +553,6 @@ fn stored_kernel_signature(name: &str) -> Option<&'static str> {
         "ekvdefinekeys" => Some("mm"),
         "changemenuelement" => Some("mmm"),
         "DeclareSubstanceProperty" => Some("moo"),
-        "algblockdefx" => Some("ommoomoom"),
-        "algcblockdefx" => Some("ommmoomoom"),
         "algcdefx" => Some("ommmoom"),
         "pdfstringdefDisableCommands" => Some("m"),
         "fakeverb" => Some("m"),

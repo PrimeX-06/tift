@@ -6,7 +6,8 @@ specifications! {
     // Signs, uncertainty parentheses, list separators and unit operators are
     // significant tokens in the package input languages.
     "sisetup" => ("m", "U", "m"),
-    "num" | "numlist" | "numproduct" | "complexnum" | "tablenum"
+    "num" => ("og", "UU", "og"),
+    "numlist" | "numproduct" | "complexnum" | "tablenum"
         | "ang" | "duration" | "unit" | "si" => ("om", "UU", "om"),
     "qtylist" | "qtyproduct" | "complexqty" | "SIlist" => ("omm", "UUU", "omm"),
     "numrange" => ("omm", "UUU", "omm"),
@@ -38,6 +39,9 @@ pub(super) fn context_specification(
     name: &str,
     context: &InvocationContext<'_>,
 ) -> Option<CommandSpec> {
+    if name == "num" && context.possibly_has_package("siunitx") {
+        return Some(CommandSpec::new("om", "UU", "om"));
+    }
     if context.has_package("SIunits") {
         match name.trim_end_matches('*') {
             "unit" => return Some(CommandSpec::new("mm", "UU", "mm")),

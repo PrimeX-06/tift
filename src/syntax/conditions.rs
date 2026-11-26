@@ -17,6 +17,7 @@ pub(super) fn package_condition(name: &str) -> bool {
         "ifpdf"
             | "ifxetex"
             | "ifluatex"
+            | "pgfutil@ifluatex"
             | "ifpdftex"
             | "ifptex"
             | "ifuptex"

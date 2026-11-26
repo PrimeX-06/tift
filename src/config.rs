@@ -889,6 +889,7 @@ pub struct PackageLoadEvent {
 pub struct ImportedCommand {
     pub arguments: Option<EnvironmentArguments>,
     pub literal_arguments: bool,
+    pub neutral_environment_wrapper: bool,
     pub global: bool,
 }
 

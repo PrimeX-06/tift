@@ -39,6 +39,22 @@ pub struct PreparedSource {
     pub input_graph: Option<blake3::Hash>,
 }
 
+/// A literal XeTeX assignment directly preceding a loader selects the codec
+/// of the child. Blank lines and TeX comments can separate the two commands.
+fn preceding_xetex_encoding(prefix: &str) -> Option<&str> {
+    let line = prefix.lines().rev().find_map(|line| {
+        let line = line.split('%').next()?.trim();
+        (!line.is_empty()).then_some(line)
+    })?;
+    let value = line.strip_prefix(r"\XeTeXdefaultencoding")?.trim();
+    let label = value.strip_prefix('"')?.strip_suffix('"')?;
+    (!label.is_empty()
+        && label
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c)))
+    .then_some(label)
+}
+
 #[derive(Default)]
 struct InputGraph {
     source: String,
@@ -51,6 +67,7 @@ struct InputGraph {
     // Their calls may invalidate later dynamic names and must stay in history.
     binding_targets: HashSet<String>,
     literal_inputs_index: Option<LiteralInputState>,
+    declarations: Option<DeclarationSnapshot>,
 
     file_ends: HashMap<PathBuf, usize>,
     file_inference_ends: HashMap<PathBuf, usize>,
@@ -137,8 +154,13 @@ fn declaration_snapshot(source: &str, config: &Config) -> DeclarationSnapshot {
 }
 
 impl InputGraph {
-    fn declaration_snapshot(&self, config: &Config) -> DeclarationSnapshot {
-        declaration_snapshot(&self.source, config)
+    fn declaration_snapshot(&mut self, config: &Config) -> DeclarationSnapshot {
+        if let Some(snapshot) = &self.declarations {
+            return snapshot.clone();
+        }
+        let snapshot = declaration_snapshot(&self.source, config);
+        self.declarations = Some(snapshot.clone());
+        snapshot
     }
     fn expand_input_name(
         &mut self,
@@ -355,6 +377,9 @@ impl InputGraph {
             });
         self.append_segment(source, neutral);
         self.append("\n");
+        if !reusable {
+            self.declarations = None;
+        }
         if reusable {
             self.last_options
                 .as_mut()
@@ -367,6 +392,9 @@ impl InputGraph {
         self.append_segment(prefix, reusable);
         self.append(input);
         self.append("\n");
+        if !reusable {
+            self.declarations = None;
+        }
         if reusable {
             self.last_options
                 .as_mut()
@@ -658,35 +686,38 @@ impl ProjectContext {
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let root = self.resolve_root(&path, marker.as_deref(), &config.config)?;
         let has_inputs = marker.is_none() && {
-            let candidates = input_candidates(&source);
-            candidates.iter().any(|input| {
-                let loader = syntax::command_at(&source, input.span.start)
-                    .expect("input candidate")
-                    .0;
-                if config.config.syntax.commands.contains_key(loader)
-                    || ignored_resource_input(input, loader, &config.config.syntax)
-                {
-                    return false;
-                }
-                if !matches!(loader, "input" | "include")
-                    && !input
-                        .name
-                        .split(',')
-                        .any(|name| self.input_path(name, &path, &root).ok().flatten().is_some())
-                {
-                    return false;
-                }
-                // CompiledConfig already validated this exact syntax. Reuse
-                // it across files instead of rebuilding it for each candidate.
-                literal_inputs_with_syntax(
-                    &source[..input.span.end],
-                    &config.config,
-                    config.compiled_syntax(),
-                )
-                .is_ok_and(|(inputs, _)| {
-                    inputs.iter().any(|candidate| candidate.span == input.span)
-                })
-            })
+            // Classify all literal loaders in one lexical pass. The previous
+            // per-candidate prefix scan repeated protection and tokenization
+            // from the start of the file for every loader.
+            let literal =
+                literal_inputs_with_syntax(&source, &config.config, config.compiled_syntax());
+            match literal {
+                Ok((inputs, _)) => inputs.iter().any(|input| {
+                    let loader = syntax::command_at(&source, input.span.start)
+                        .expect("input candidate")
+                        .0;
+                    if config.config.syntax.commands.contains_key(loader)
+                        || ignored_resource_input(input, loader, &config.config.syntax)
+                    {
+                        return false;
+                    }
+                    matches!(loader, "input" | "include")
+                        || input.name.split(',').any(|name| {
+                            self.input_path(name, &path, &root).ok().flatten().is_some()
+                        })
+                }),
+                Err(_) => input_candidates(&source).iter().any(|input| {
+                    let loader = syntax::command_at(&source, input.span.start)
+                        .expect("input candidate")
+                        .0;
+                    !config.config.syntax.commands.contains_key(loader)
+                        && !ignored_resource_input(input, loader, &config.config.syntax)
+                        && (matches!(loader, "input" | "include")
+                            || input.name.split(',').any(|name| {
+                                self.input_path(name, &path, &root).ok().flatten().is_some()
+                            }))
+                }),
+            }
         };
         let mut input_graph = None;
         let config = if marker.is_some() || has_inputs {
@@ -696,8 +727,10 @@ impl ProjectContext {
             } else {
                 let mut graph = InputGraph::default();
 
+                let root_source = self.read_normalized_source(&root)?;
                 self.expand_inputs(
                     &root,
+                    root_source,
                     &root,
                     &config.config,
                     &mut HashSet::new(),
@@ -845,6 +878,7 @@ impl ProjectContext {
     fn expand_inputs(
         &mut self,
         path: &Path,
+        source: Arc<String>,
         root: &Path,
         config: &Config,
         stack: &mut HashSet<PathBuf>,
@@ -853,7 +887,6 @@ impl ProjectContext {
         if stack.len() >= 128 || !stack.insert(path.to_path_buf()) {
             return Ok(());
         }
-        let source = self.read_normalized_source(path)?;
         let loader_occurrences = tift::source_model::SourceModel::loader_occurrences(&source);
         let (entry_aliases, entry_arguments, entry_packages, entry_commands) =
             graph.declaration_snapshot(config);
@@ -894,9 +927,7 @@ impl ProjectContext {
             // creating a declaration checkpoint and scanning the cumulative
             // graph twice. Dynamic filenames still need prefix inference.
 
-            let prune_unresolved = true;
-
-            if prune_unresolved && !input.name.contains('\\') {
+            if !input.name.contains('\\') {
                 let mut local_target = false;
                 for name in input.name.split(',').filter(|name| !name.is_empty()) {
                     if self.input_path(name, path, root)?.is_some() {
@@ -941,10 +972,20 @@ impl ProjectContext {
                 graph.preamble_end =
                     document_start.map(|start| graph.source.len() + start.saturating_sub(cursor));
             }
-            let mut alias_prefix = graph.source.clone();
-            alias_prefix.push_str(&source[cursor..input.span.start]);
             let (before_aliases, before_arguments, before_packages, before_commands) =
-                declaration_snapshot(&alias_prefix, config);
+                if reusable_prefix {
+                    graph.declaration_snapshot(config)
+                } else {
+                    // Declaration snapshots only need the graph prefix. Extend
+                    // the existing buffer temporarily so each loader avoids
+                    // cloning the cumulative project source.
+                    let prefix = &source[cursor..input.span.start];
+                    let graph_length = graph.source.len();
+                    graph.source.push_str(prefix);
+                    let snapshot = declaration_snapshot(&graph.source, config);
+                    graph.source.truncate(graph_length);
+                    snapshot
+                };
             graph.append_prepared_input(
                 &source[cursor..input.span.start],
                 &source[input.span.clone()],
@@ -957,12 +998,29 @@ impl ProjectContext {
                     continue;
                 }
                 if let Some(child) = self.input_path(name, path, root)? {
-                    self.expand_inputs(&child, root, config, stack, graph)?;
+                    if stack.contains(&child) || stack.len() >= 128 {
+                        continue;
+                    }
+                    let child_source = if let Some(label) =
+                        preceding_xetex_encoding(&source[..input.span.start])
+                    {
+                        // The same child can be input under two different encodings.
+                        // Keep the caller's choice out of the standalone-file cache.
+                        let bytes = fs::read(&child)
+                            .map_err(|error| format!("{}: {error}", child.display()))?;
+                        SourceFile::decode_with_default(bytes, Some(label))
+                            .map_err(|error| format!("{}: {error}", child.display()))?
+                            .text
+                    } else {
+                        self.read_normalized_source(&child)?
+                    };
+                    self.expand_inputs(&child, child_source, root, config, stack, graph)?;
                 }
             }
             graph.append_line("");
-            let (after_aliases, after_arguments, after_packages, after_commands) =
-                graph.declaration_snapshot(config);
+            let after = declaration_snapshot(&graph.source, config);
+            graph.declarations = Some(after.clone());
+            let (after_aliases, after_arguments, after_packages, after_commands) = after;
             let commands = after_commands
                 .into_iter()
                 .filter(|(name, command)| before_commands.get(name) != Some(command))

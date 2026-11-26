@@ -1,8 +1,8 @@
-//! File encoding is selected only by an explicit header comment.
+//! File encodings, explicit TeX declarations, and lossless write guards.
 
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use encoding_rs::Encoding;
 
@@ -20,10 +20,25 @@ pub(super) struct SourceFile {
     pub text: Arc<String>,
     original: Option<Vec<u8>>,
     codec: Codec,
+    fallback: EncodingFallback,
+}
+
+#[derive(Clone, Copy)]
+enum EncodingFallback {
+    Utf8,
+    TexDeclaration,
+    Parent(Codec),
 }
 
 impl SourceFile {
     pub fn decode(bytes: Vec<u8>) -> Result<Self, String> {
+        Self::decode_with_default(bytes, None)
+    }
+
+    pub fn decode_with_default(
+        bytes: Vec<u8>,
+        input_default: Option<&str>,
+    ) -> Result<Self, String> {
         // A UTF-16 BOM lets us read its header. UTF-16 is accepted only when
         // that header explicitly selects it, just like other legacy encodings.
         let bootstrap = if bytes.starts_with(&[0xff, 0xfe]) {
@@ -34,7 +49,20 @@ impl SourceFile {
             None
         };
         let header = bootstrap.map(|codec| codec.decode(&bytes)).transpose()?;
-        let codec = declared_codec(header.as_deref().map_or(&bytes, str::as_bytes), bootstrap)?;
+        let declared = declared_codec(header.as_deref().map_or(&bytes, str::as_bytes), bootstrap)?;
+        let (codec, fallback) = if let Some(codec) = declared {
+            (codec, EncodingFallback::Utf8)
+        } else if let Some(label) = input_default {
+            let codec = Codec::for_label(label, bootstrap)?;
+            (codec, EncodingFallback::Parent(codec))
+        } else if bootstrap.is_none() && std::str::from_utf8(&bytes).is_err() {
+            (
+                tex_codec(&String::from_utf8_lossy(&bytes)).unwrap_or(Codec::Utf8),
+                EncodingFallback::TexDeclaration,
+            )
+        } else {
+            (Codec::Utf8, EncodingFallback::Utf8)
+        };
         if bootstrap.is_some_and(|bom| bom != codec)
             || bytes.starts_with(b"\xef\xbb\xbf") && codec != Codec::Utf8
         {
@@ -46,6 +74,7 @@ impl SourceFile {
                     text: Arc::new(text),
                     original: None,
                     codec,
+                    fallback,
                 })
                 .map_err(|error| {
                     format!(
@@ -65,6 +94,7 @@ impl SourceFile {
             text: Arc::new(text),
             original: Some(bytes),
             codec,
+            fallback,
         })
     }
 
@@ -81,7 +111,13 @@ impl SourceFile {
             return Ok(Cow::Borrowed(self.original_bytes()));
         }
         let bom = matches!(self.codec, Codec::Utf16Le | Codec::Utf16Be).then_some(self.codec);
-        if declared_codec(text.as_bytes(), bom)? != self.codec {
+        let declared = declared_codec(text.as_bytes(), bom)?;
+        let expected = declared.or_else(|| match self.fallback {
+            EncodingFallback::Utf8 => Some(Codec::Utf8),
+            EncodingFallback::TexDeclaration => tex_codec(text),
+            EncodingFallback::Parent(codec) => Some(codec),
+        });
+        if expected.unwrap_or(Codec::Utf8) != self.codec {
             return Err(
                 "formatting changed the encoding magic comment; original bytes retained".into(),
             );
@@ -115,7 +151,7 @@ impl SourceFile {
     }
 }
 
-fn declared_codec(bytes: &[u8], bom: Option<Codec>) -> Result<Codec, String> {
+fn declared_codec(bytes: &[u8], bom: Option<Codec>) -> Result<Option<Codec>, String> {
     let mut codec = None;
     for declaration in magic_encodings(bytes)? {
         let next = Codec::for_label(&declaration, bom)?;
@@ -124,7 +160,88 @@ fn declared_codec(bytes: &[u8], bom: Option<Codec>) -> Result<Codec, String> {
         }
         codec = Some(next);
     }
-    Ok(codec.unwrap_or(Codec::Utf8))
+    Ok(codec)
+}
+
+/// Only literal, unconditional package loads in the opening preamble select
+/// a fallback. A quoted command in a macro, example or comment is inert.
+fn tex_codec(source: &str) -> Option<Codec> {
+    static LOAD: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?x)\A (?:\s|%[^\r\n]*(?:[\r\n]|\z))* \\(documentclass|usepackage|RequirePackage)\s*
+        (?:\[([^\]\\%]*)\]\s*)? \{([A-Za-z0-9.,_\x20-]+)\}(?:\s*\[[0-9/.-]+\])?",
+        )
+        .expect("package declaration")
+    });
+    if source.contains(r"\inputencoding") || source.contains(r"\XeTeXinputencoding") {
+        return None;
+    }
+    let mut rest = source;
+    let mut selected = None;
+    let mut cjk = false;
+    while let Some(load) = LOAD.captures(rest) {
+        if &load[1] != "documentclass" {
+            for package in load[3].split(',').map(str::trim) {
+                if package == "inputenc" {
+                    let codec = Codec::for_label(load.get(2)?.as_str().trim(), None).ok()?;
+                    if selected.is_some_and(|previous| previous != codec) {
+                        return None;
+                    }
+                    selected = Some(codec);
+                }
+                cjk |= package == "CJK";
+            }
+        }
+        rest = &rest[load.get(0)?.end()..];
+    }
+    if cjk && source.contains(r"\begin{CJK") {
+        return cjk_document_codec(source)
+            .filter(|codec| selected.is_none_or(|other| other == *codec));
+    }
+    selected
+}
+
+/// A CJK encoding is local to its environment. Use one file codec only when
+/// all non-ASCII data lies inside matching literal CJK environments.
+fn cjk_document_codec(source: &str) -> Option<Codec> {
+    static HEADER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\A\s*(?:\[[a-zA-Z0-9-]+\]\s*)?\{([a-zA-Z0-9_-]+)\}")
+            .expect("CJK encoding argument")
+    });
+    let config = tift::Config::default();
+    let syntax = tift::syntax::compile(&config.syntax).ok()?;
+    let mut selected = None;
+    let mut active = None;
+    let mut outside = 0;
+    for token in tift::syntax::lex(source, &config, &syntax).ok()? {
+        if !matches!(
+            token.kind,
+            tift::syntax::TokenKind::BeginEnvironment | tift::syntax::TokenKind::EndEnvironment
+        ) {
+            continue;
+        }
+        let Some((name @ ("CJK" | "CJK*"), begin, end)) = token.environment_at(source) else {
+            continue;
+        };
+        if begin {
+            if active.is_some() || !source[outside..token.span.start].is_ascii() {
+                return None;
+            }
+            let header = HEADER.captures(&source[end..])?;
+            let codec = Codec::for_label(&header[1], None).ok()?;
+            if selected.is_some_and(|previous| previous != codec) {
+                return None;
+            }
+            selected = Some(codec);
+            active = Some(name.to_owned());
+        } else {
+            if active.take().as_deref() != Some(name) {
+                return None;
+            }
+            outside = end;
+        }
+    }
+    selected.filter(|_| active.is_none() && source[outside..].is_ascii())
 }
 
 impl Codec {

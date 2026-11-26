@@ -356,16 +356,32 @@ pub(crate) fn primitive_data_end(source: &str, name: &str, end: usize) -> Option
             }
             start = skip_trivia(source, finish);
         }
-        if let Some(("def" | "edef" | "xdef", after)) = command_at(source, start)
+        if let Some((kind @ ("def" | "edef" | "xdef"), after)) = command_at(source, start)
             && let Some((target, after_target)) = command_at(source, skip_trivia(source, after))
-            && let body = skip_trivia(source, after_target)
+            && let Some(body) = parameter_text_end(source, after_target)
             && let Some(finish) = balanced_end(source, body, b'{', b'}')
-            && command_at(source, skip_trivia(source, body + 1))
-                .is_some_and(|(n, _)| n == "endgroup")
-            && let Some((called, finish)) = command_at(source, skip_trivia(source, finish))
+            && let Some(("endgroup", payload)) = command_at(source, skip_trivia(source, body + 1))
+            && let Some((called, after_call)) = command_at(source, skip_trivia(source, finish))
             && target == called
         {
-            return Some(finish);
+            let parameters = source[after_target..body].trim();
+            if parameters.is_empty() {
+                return Some(after_call);
+            }
+            // An expanded identity macro replays its delimited argument with
+            // the delimiter converted to a character by \string.
+            if kind != "def"
+                && let Some(delimiter) = parameters.strip_prefix("#1")
+                && delimiter.len() == 1
+                && delimiter.as_bytes()[0].is_ascii_alphabetic()
+                && let Some(rest) = source[payload..finish - 1].trim().strip_prefix("#1")
+                && let rest = rest.trim_start()
+                && let Some(("string", end)) = command_at(rest, 0)
+                && rest[end..].trim() == delimiter
+                && xparse::until_end(source, after_call, source.len(), delimiter).is_some()
+            {
+                return Some(after_call);
+            }
         }
     }
     // Expansion suppression and token comparisons read tokens as data. A
@@ -1354,17 +1370,34 @@ fn line_delimited_environment_end(
     None
 }
 
-/// alltt and semiverbatim keep TeX escapes and brace groups. A percent
-/// character is display text, so it does not hide the closing command.
-fn semiverbatim_environment_end(source: &str, mut cursor: usize, name: &str) -> Option<usize> {
+/// Collected TeX bodies retain groups and comments. In alltt and semiverbatim
+/// a percent character is display text.
+fn tokenized_environment_end(
+    source: &str,
+    mut cursor: usize,
+    name: &str,
+    comments: bool,
+) -> Option<usize> {
     let mut brace_depth = 0usize;
     let mut environment_depth = 1usize;
-    while let Some(offset) = memchr::memchr3(b'\\', b'{', b'}', &source.as_bytes()[cursor..]) {
+    while let Some(offset) = {
+        let rest = &source.as_bytes()[cursor..];
+        let structural = memchr::memchr3(b'\\', b'{', b'}', rest);
+        if comments {
+            memchr::memchr(b'%', &rest[..structural.unwrap_or(rest.len())]).or(structural)
+        } else {
+            structural
+        }
+    } {
         cursor += offset;
         match source.as_bytes()[cursor] {
+            b'%' if comments => {
+                cursor = line_end(source, cursor);
+                continue;
+            }
             b'{' => brace_depth += 1,
             b'}' => brace_depth = brace_depth.saturating_sub(1),
-            _ => {
+            b'\\' => {
                 let (command, finish) = command_at(source, cursor)?;
                 if brace_depth == 0
                     && let Some((other, begin, end)) = env_at(source, cursor)
@@ -1393,6 +1426,7 @@ fn semiverbatim_environment_end(source: &str, mut cursor: usize, name: &str) -> 
                 };
                 continue;
             }
+            _ => {}
         }
         cursor += 1;
     }
@@ -1458,6 +1492,15 @@ fn case_condition(name: &str) -> bool {
         conditions::canonical_condition_control(name),
         "ifcase" | "if_case:w"
     )
+}
+
+pub(crate) fn loop_end(name: &str) -> Option<&'static str> {
+    match name {
+        "loop" => Some("repeat"),
+        "pgfutil@loop" => Some("pgfutil@repeat"),
+        "pgfmathloop" => Some("repeatpgfmathloop"),
+        _ => None,
+    }
 }
 
 /// Whether a command opens a primitive, known package, or configured condition.
@@ -4542,7 +4585,9 @@ fn dynamic_catcode_end(
             {
                 return source.len();
             }
-            if c != '\\' && matches!(command, "def" | "gdef" | "edef" | "xdef") {
+            if (c != '\\' || changed.values().any(|code| matches!(code, 1 | 2)))
+                && matches!(command, "def" | "gdef" | "edef" | "xdef")
+            {
                 let mut next = finish;
                 while next < source.len() {
                     let token = source[next..].chars().next().expect("catcode token");
@@ -4693,21 +4738,23 @@ fn dynamic_catcode_end(
             cursor = finish;
             continue;
         }
-        if c == '{' && code == 1 {
+        if code == 1 {
             nested.push(("}".into(), changed.clone()));
-        } else if c == '}' && code == 2 {
+        } else if code == 2 {
             if pending_conditions.last() == Some(&nested.len()) {
                 return source.len();
             }
             if nested.last().is_some_and(|(end, _)| end == "}") {
                 changed = nested.pop().expect("catcode scope").1;
             } else if nested.is_empty() && can_restore_scope && scope == Some("}") {
+                if c != '}' {
+                    *closed_scope = true;
+                    return cursor + c.len_utf8();
+                }
                 return cursor;
             } else {
                 return source.len();
             }
-        } else if matches!(code, 1 | 2) && !pending_conditions.is_empty() {
-            return source.len();
         }
         cursor += c.len_utf8();
     }
@@ -5190,6 +5237,30 @@ fn protected_ranges_with_inferred_environments(
                 } else {
                     None
                 };
+                // doc.sty changes the catcodes of percent, spaces and braces.
+                // Its delimiter includes the percent and four literal spaces.
+                if begin
+                    && matches!(name, "macrocode" | "macrocode*")
+                    && !config.syntax.environment_arguments.contains_key(name)
+                    && !xparse_bindings.contains(true, name)
+                    && ["doc", "ltxdoc", "xdoc2"]
+                        .iter()
+                        .any(|p| package_context.at(pos).has_package(p))
+                {
+                    let delimiter = format!("%    \\end{{{name}}}");
+                    let end = source[finish..]
+                        .find(&delimiter)
+                        .map(|offset| finish + offset + delimiter.len())
+                        .ok_or_else(|| {
+                            FormatError::Syntax(format!(
+                                "unclosed verbatim environment {name:?} at byte {pos}"
+                            ))
+                        })?;
+                    ranges.push(pos..end);
+                    package_context.skip_environment(name, end);
+                    pos = end;
+                    continue;
+                }
                 if begin
                     && (config.protect.environments.iter().any(|n| n == name)
                         || config.protect.file_contents.iter().any(|n| n == name)
@@ -5241,13 +5312,16 @@ fn protected_ranges_with_inferred_environments(
                     let terminator_kind = package_verbatim.get(name).copied();
                     let line_delimited = name == "comment"
                         || terminator_kind == Some(VerbatimTerminator::UnindentedLine);
-                    let indented_line_delimited =
-                        crate::luadraw_syntax::is_line_delimited_environment(name)
-                            || crate::code_environments::is_line_delimited_environment(name)
-                            || crate::code_package_syntax::is_line_delimited_environment(name)
-                            || terminator_kind == Some(VerbatimTerminator::IndentedLine);
-                    let end = if crate::code_package_syntax::obeys_tex_command_boundaries(name) {
-                        semiverbatim_environment_end(source, finish, name)
+                    let indented_line_delimited = listing_header.is_some()
+                        && crate::packages::listing_wrappers::is_terminal_listing(name)
+                        || crate::luadraw_syntax::is_line_delimited_environment(name)
+                        || crate::code_environments::is_line_delimited_environment(name)
+                        || crate::code_package_syntax::is_line_delimited_environment(name)
+                        || terminator_kind == Some(VerbatimTerminator::IndentedLine);
+                    let end = if name == "ebnf" && listing_header.is_some() {
+                        tokenized_environment_end(source, finish, name, true)
+                    } else if crate::code_package_syntax::obeys_tex_command_boundaries(name) {
+                        tokenized_environment_end(source, finish, name, false)
                     } else if crate::packages::visual_languages::has_exact_line_end(name) {
                         crate::packages::visual_languages::exact_line_end(source, finish, name)
                     } else if indented_line_delimited {
@@ -5602,11 +5676,17 @@ fn protected_ranges_with_inferred_environments(
                     if !uncertain
                         && matches!(base, "def" | "gdef" | "edef" | "xdef")
                         && let Some(body) = macro_body(source, base, end)
-                        && crate::source_model::parameters_are_stored(
-                            &source[body.start + 1..body.end - 1],
-                        )
                     {
-                        xparse_bindings.mark_literal(target);
+                        let body = &source[body.start + 1..body.end - 1];
+                        if crate::source_model::parameters_are_stored(body) {
+                            xparse_bindings.mark_literal(target);
+                        } else if body.contains('#') {
+                            let mask = crate::source_model::stored_parameter_mask(
+                                body,
+                                &package_context.at(pos),
+                            );
+                            xparse_bindings.mark_literal_slots(target, mask);
+                        }
                     }
                 }
                 let configured = config.syntax.commands.get(base);
@@ -5849,7 +5929,13 @@ fn protected_ranges_with_inferred_environments(
                                 visual_overrides.assign(environment, global_catcode);
                             }
                         }
-                    } else if let Some((target, _)) = command_at(source, target) {
+                    } else if let Some((target, after_target)) = command_at(source, target) {
+                        // PGF defines its public setter by partially applying
+                        // the key reader. This definition retains its handlers.
+                        let forwards_tikz_keys = target == "tikzset"
+                            && matches!(base, "def" | "gdef")
+                            && source[skip_trivia(source, after_target)..]
+                                .starts_with(r"{\pgfqkeys{/tikz}}");
                         let environment = crate::packages::scoped_environment_for_command(target)
                             .or_else(|| {
                                 (crate::packages::has_scoped_command_data(target)
@@ -5858,7 +5944,10 @@ fn protected_ranges_with_inferred_environments(
                                 .then_some(target)
                             });
                         let provide = matches!(base, "providecommand" | "ProvideDocumentCommand");
-                        if !provide || environment.is_none() {
+                        if forwards_tikz_keys {
+                            package_commands_redefined.remove(target);
+                            visual_overrides.restore_default(target);
+                        } else if !provide || environment.is_none() {
                             package_commands_redefined.insert(target.to_owned());
                             if let Some(environment) = environment {
                                 visual_overrides.assign(
@@ -6084,11 +6173,15 @@ fn protected_ranges_with_inferred_environments(
                     visual_overrides.leave();
                     catcode_scopes.pop();
                 }
-                if base == "loop" && !conditional_bindings.assigned(base) {
-                    conditional_loops.push(active_conditions.len());
-                } else if base == "repeat"
+                if let Some(close) = loop_end(base)
                     && !conditional_bindings.assigned(base)
-                    && let Some(before) = conditional_loops.pop()
+                {
+                    conditional_loops.push((close, active_conditions.len()));
+                } else if conditional_loops
+                    .last()
+                    .is_some_and(|&(close, _)| close == base)
+                    && !conditional_bindings.assigned(base)
+                    && let Some((_, before)) = conditional_loops.pop()
                     && active_conditions.len() == before + 1
                 {
                     active_conditions.pop();
@@ -6646,7 +6739,9 @@ fn lex_with_constructed_commands(
                 if let Some(alias) = model.and_then(|model| model.boundary_at(pos)) {
                     pos = model
                         .and_then(|model| {
-                            model.constructed_commands().get(&pos).map(|(_, end)| *end)
+                            model.explicit_wrapper_end(pos).or_else(|| {
+                                model.constructed_commands().get(&pos).map(|(_, end)| *end)
+                            })
                         })
                         .unwrap_or_else(|| {
                             command_at(source, pos).expect("resolved alias token").1
@@ -7209,6 +7304,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
         .collect();
     let mut literal_ranges = Vec::new();
     let mut prior_literals = std::collections::BTreeMap::<usize, usize>::new();
+    let mut expl_syntax = false;
     let mut reverse_if_condition_arguments = HashMap::<usize, Range<usize>>::new();
     for token in tokens
         .iter()
@@ -7224,7 +7320,18 @@ fn parse_blocks_from_tokens<S: NameStore>(
         let Some((name, end)) = command_at(source, token.span.start) else {
             continue;
         };
-        if !expansion_precedes(source, token.span.start)
+        if matches!(name, "ExplSyntaxOn" | "ExplSyntaxOff") {
+            expl_syntax = name == "ExplSyntaxOn";
+            continue;
+        }
+        // In ordinary TeX a relation such as \rho_p:p is a math symbol,
+        // a subscript and a colon. Its p cannot introduce parameter text.
+        if name.contains(':')
+            && (expl_syntax
+                || !crate::math_layout::known_math_command(
+                    name.split(['_', ':']).next().unwrap_or(name),
+                ))
+            && !expansion_precedes(source, token.span.start)
             && let Some(call) = crate::code_layout::expl3::parse_call(source, name, end)
         {
             for (slot, argument) in call.arguments.iter().enumerate() {
@@ -7283,9 +7390,15 @@ fn parse_blocks_from_tokens<S: NameStore>(
     let mut command_headers: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
     let mut loop_conditions: HashMap<usize, usize> = HashMap::new();
     let mut configured_headers: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
+    let mut forest_groups = HashMap::new();
     let mut environment_ends = HashMap::new();
     let mut environment_headers = Vec::<usize>::new();
     let mut brace_groups = Vec::new();
+    let mut enclosing_environments = Vec::new();
+    let mut simple_group_environments = HashMap::new();
+    let mut open_brackets = Vec::new();
+    let mut bracket_scopes = Vec::new();
+    let mut paired_brackets = HashSet::new();
     let mut cross_argument_environments = HashSet::new();
     let mut cross_argument_control_groups = HashSet::new();
     let mut cross_argument_math = HashSet::new();
@@ -7301,9 +7414,27 @@ fn parse_blocks_from_tokens<S: NameStore>(
             environment_headers.pop();
         }
         let brace_owner = brace_groups.last().copied();
+        // Square brackets in prose are printable characters. Infer an
+        // unowned bracket group only when it closes in the same TeX scope.
+        match token.kind {
+            TokenKind::BeginEnvironment | TokenKind::OpenBrace => {
+                bracket_scopes.push(open_brackets.len())
+            }
+            TokenKind::EndEnvironment | TokenKind::CloseBrace => {
+                open_brackets.truncate(bracket_scopes.pop().unwrap_or(0))
+            }
+            TokenKind::OpenBracket => open_brackets.push(token.span.start),
+            TokenKind::CloseBracket
+                if open_brackets.len() > bracket_scopes.last().copied().unwrap_or(0) =>
+            {
+                paired_brackets.insert(open_brackets.pop().expect("open bracket in this scope"));
+            }
+            _ => {}
+        }
         match token.kind {
             TokenKind::BeginEnvironment => {
                 let (name, _, _) = token.environment_at(source).expect("environment token");
+                enclosing_environments.push(token.span.start);
                 environment_events
                     .entry(name.to_owned())
                     .or_default()
@@ -7323,6 +7454,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     cross_argument_environments.insert(token.span.start);
                     continue;
                 }
+                enclosing_environments.pop();
                 environment_events
                     .entry(name.to_owned())
                     .or_default()
@@ -7349,16 +7481,15 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     } else {
                         conditions::canonical_condition_control(name.trim_end_matches('*'))
                     } {
-                        "begingroup" => control_group_events.entry("group").or_default().push((
-                            token.span.start,
-                            true,
-                            brace_owner,
-                        )),
-                        "endgroup" => control_group_events.entry("group").or_default().push((
-                            token.span.start,
-                            false,
-                            brace_owner,
-                        )),
+                        name @ ("begingroup" | "endgroup") => {
+                            simple_group_environments
+                                .insert(token.span.start, enclosing_environments.last().copied());
+                            control_group_events.entry("group").or_default().push((
+                                token.span.start,
+                                name == "begingroup",
+                                brace_owner,
+                            ));
+                        }
                         "bgroup" => control_group_events.entry("brace").or_default().push((
                             token.span.start,
                             true,
@@ -7386,8 +7517,30 @@ fn parse_blocks_from_tokens<S: NameStore>(
             cross_argument_environments.insert(end);
         }
     }
-    for events in control_group_events.values() {
-        let (_, cross_pairs) = scoped_pairs(events);
+    for (kind, events) in &control_group_events {
+        let (local_pairs, cross_pairs) = scoped_pairs(events);
+        if *kind == "group" {
+            // An environment's implicit endgroup can close a simple group
+            // opened in its body, leaving the explicit endgroup for later.
+            // Keep the named environment tree intact for indentation.
+            for (start, end) in local_pairs {
+                let Some(inner) = simple_group_environments[&start] else {
+                    continue;
+                };
+                if environment_ends
+                    .get(&inner)
+                    .is_some_and(|&close| close < end)
+                    && simple_group_environments[&end].is_none_or(|outer| {
+                        outer < inner
+                            && environment_ends
+                                .get(&outer)
+                                .is_some_and(|&close| end < close)
+                    })
+                {
+                    cross_argument_control_groups.extend([start, end]);
+                }
+            }
+        }
         for (start, end) in cross_pairs {
             cross_argument_control_groups.insert(start);
             cross_argument_control_groups.insert(end);
@@ -7470,6 +7623,31 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     continue;
                 }
                 let i = add!(BlockKind::Environment, names.make(name), parent);
+                if name == "forest"
+                    && config.config.trees.forest
+                    && !config
+                        .config
+                        .syntax
+                        .environment_arguments
+                        .contains_key(name)
+                    && !analysis.declared_environments()?.contains(name)
+                    && let Some(&end) = environment_ends.get(&token.span.start)
+                {
+                    let body = token.span.end..end;
+                    let header = crate::layout::environment_header_end(
+                        source,
+                        body,
+                        name,
+                        &config.config,
+                        analysis,
+                    );
+                    crate::tree_layout::forest_groups(
+                        source,
+                        header..end,
+                        tokens,
+                        &mut forest_groups,
+                    );
+                }
                 if let Some(rule) = config
                     .config
                     .syntax
@@ -7596,6 +7774,20 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 if token.kind == TokenKind::OpenBrace {
                     conditional_bindings.enter();
                 }
+                if let Some(group) = forest_groups.get(&token.span.start) {
+                    use crate::tree_layout::ForestGroup;
+                    let block = match group {
+                        ForestGroup::Node => Some((BlockKind::NamedGroup, "forest")),
+                        ForestGroup::KeyValue(key) => Some((BlockKind::KeyValue, *key)),
+                        ForestGroup::LiteralBracket => None,
+                    };
+                    if let Some((kind, name)) = block {
+                        let i = add!(kind, names.make(name), parent);
+                        stack.push(i);
+                    }
+                    pending = None;
+                    continue;
+                }
                 let in_math = stack.iter().rev().any(|&i| match blocks[i].kind {
                     BlockKind::Special => matches!(
                         blocks[i].name.as_str(),
@@ -7702,9 +7894,8 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     parent.is_some_and(|i| source.as_bytes()[blocks[i].begin.start] == b'[');
                 if token.kind == TokenKind::OpenBracket
                     && owner.is_none()
-                    && key.is_none()
-                    && !named
-                    && !inside_bracket
+                    && (key.is_none() && !named && !inside_bracket
+                        || !paired_brackets.contains(&token.span.start))
                 {
                     pending = None;
                     continue;
@@ -7888,7 +8079,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     pending = None;
                     continue;
                 }
-                if base == "loop" {
+                if loop_end(base).is_some() {
                     let i = add!(BlockKind::Loop, names.make(base), parent);
                     loop_conditions.insert(
                         i,
@@ -7901,13 +8092,13 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     pending = None;
                     continue;
                 }
-                if base == "repeat" {
+                if matches!(base, "repeat" | "pgfutil@repeat" | "repeatpgfmathloop") {
                     let position = stack
                         .iter()
                         .rposition(|&i| blocks[i].kind != BlockKind::Condition)
                         .ok_or_else(|| {
                             FormatError::Syntax(format!(
-                                "unexpected \\repeat at byte {}",
+                                "unexpected \\{base} at byte {}",
                                 token.span.start
                             ))
                         })?;
@@ -7923,6 +8114,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         .collect();
                     let expected = loop_conditions.get(&i).copied().unwrap_or(0) + 1;
                     if blocks[i].kind != BlockKind::Loop
+                        || loop_end(&blocks[i].name) != Some(base)
                         || conditions.len() != 1
                         || stack
                             .iter()
@@ -7931,7 +8123,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             != expected
                     {
                         return Err(FormatError::Syntax(format!(
-                            "\\repeat requires one unfinished loop condition at byte {}",
+                            "\\{base} requires one unfinished loop condition at byte {}",
                             token.span.start
                         )));
                     }
@@ -8425,6 +8617,11 @@ fn dynamic_environment_name(name: &str) -> bool {
 
 fn declaration_cross_segment_command(command: &str) -> bool {
     command != "iff" && command.starts_with("if")
+        || loop_end(command).is_some()
+        || matches!(
+            command,
+            "pgfutil@repeat" | "repeatpgfmathloop" | "pgfutil@ifluatex"
+        )
         || command.starts_with("@if")
         || matches!(
             command,

@@ -92,17 +92,39 @@ def prepare(checkout, work):
     )
 
 
-def check(binary, papers, workers, expected, target="."):
-    process = subprocess.run([binary, "--check", "--no-cache", "--no-config", "--threads",
+def check(binary, papers, workers, expected, target=".", *, write=False):
+    mode = [] if write else ["--check"]
+    process = subprocess.run([binary, *mode, "--no-cache", "--no-config", "--threads",
                               str(workers), str(target)], cwd=papers, capture_output=True)
     messages = process.stderr.decode("utf-8", "replace")
-    summary = re.search(r"(?m)^(\d+) file\(s\) would change; (\d+) checked\.\r?$", messages)
-    diagnostics = re.findall(r"(?m)^(.+?): error: ", messages)
+    verb = "changed" if write else "would change"
+    summary = re.search(rf"(?m)^(\d+) file\(s\) {verb}; (\d+) checked\.\r?$", messages)
+    errors = {"parse_error_files": set(), "format_error_files": set(), "operation_error_files": set()}
+    count = 0
+    for line in messages.splitlines():
+        if line.startswith("error: "):
+            path, separator, detail = line[7:].partition(".tex: ")
+            if not separator:
+                raise RuntimeError(line)
+            path += ".tex"
+            category = "format_error_files" if "internal formatter error" in detail else "operation_error_files"
+        elif ": error: " in line:
+            path, detail = line.split(": error: ", 1)
+            category = ("format_error_files" if detail.startswith("Source retained because a formatting stage")
+                        else "parse_error_files")
+        else:
+            continue
+        errors[category].add(path)
+        count += 1
     if not summary or int(summary[2]) != expected or process.returncode not in (0, 1, 2):
         raise RuntimeError(f"Incomplete corpus run: {messages[-1200:]}")
-    if process.returncode == 2 and not diagnostics:
+    if (process.returncode == 2) != bool(count):
         raise RuntimeError(f"tift exited with {process.returncode}: {messages[-1200:]}")
-    return len(set(diagnostics)), len(diagnostics), int(summary[1])
+    failed = set.union(*errors.values())
+    outcome = {key: len(paths) for key, paths in errors.items()}
+    outcome.update(files_with_errors=len(failed), diagnostics=count)
+    outcome["changed" if write else "would_change"] = int(summary[1])
+    return outcome, failed
 
 
 def positive(value):
@@ -123,7 +145,7 @@ def time_individual_files(binary, papers, count, runs):
     for i in range(runs):
         for checked, (path, samples) in enumerate(timings.items(), 1):
             start = time.perf_counter()
-            errors, _, _ = check(binary, papers, 1, 1, path)
+            _, errors = check(binary, papers, 1, 1, path)
             samples.append((time.perf_counter() - start) * 1000)
             if errors:
                 files_with_errors.add(path)
@@ -143,6 +165,8 @@ def main():
     individual.add_argument("--sample-files", type=positive, help="time a fixed sample of files individually, one thread per invocation")
     individual.add_argument("--all-files", action="store_true", help="time every included .tex file individually, one thread per invocation")
     parser.add_argument("--runs", type=positive, default=3)
+    parser.add_argument("--verify-idempotence", action="store_true",
+                        help="after timing, format the temporary corpus and check its output a second time")
     args = parser.parse_args()
     binary = Path(shutil.which(args.tift) or args.tift).resolve(strict=True)
     if args.temp_dir is not None:
@@ -173,12 +197,20 @@ def main():
             result["runs"] = []
             for i in range(args.runs):
                 start = time.perf_counter()
-                outcome = check(binary, papers, args.workers, result["files"])
+                outcome, _ = check(binary, papers, args.workers, result["files"])
                 elapsed = time.perf_counter() - start
-                result["runs"].append({"seconds": elapsed, "files_with_errors": outcome[0],
-                                       "diagnostics": outcome[1], "would_change": outcome[2]})
-                print(f"Run {i + 1}: {elapsed:.3f}s, {outcome[0]} files with errors", file=sys.stderr, flush=True)
+                result["runs"].append({"seconds": elapsed, **outcome})
+                print(f"Run {i + 1}: {elapsed:.3f}s, {outcome['files_with_errors']} files with errors", file=sys.stderr, flush=True)
             result["median_seconds"] = statistics.median(r["seconds"] for r in result["runs"])
+        if args.verify_idempotence:
+            first, first_errors = check(binary, papers, args.workers, file_count, write=True)
+            second, second_errors = check(binary, papers, args.workers, file_count)
+            result["verification"] = {
+                "first_pass": first, "second_pass": second,
+                "new_error_files": len(second_errors - first_errors),
+                "stable_files": file_count - len(first_errors | second_errors) - second["would_change"]
+                                if first_errors <= second_errors and not first["operation_error_files"] else None,
+            }
     print(json.dumps(result, indent=2))
     return 0
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- Read nested braces in xparse verbatim arguments and unbraced text-font arguments. Recognize balanced environment wrappers across file imports and explicit TeX group endings in wrapper definitions.
+- Parse literal brackets in prose and simple TeX groups that cross an environment ending. Preserve doc macrocode, sim-os-menus terminal listings, and naive-ebnf grammar bodies.
+- Indent nested Forest nodes and multiline conditional branches at their structural depth while preserving existing tree line breaks in the default mode.
+- Recognize Forest's macro memoization command, preserve listings in its manual, and handle delayed code written by `\addtocontents`.
+- Preserve numberedblock and PGF manual listings, path arguments in URL wrappers, and Xy-pic matrices. Track minipage wrappers, plain TeX loops, and algorithmicx block declarations with an empty starting name.
+- Read legacy documents with explicit inputenc or CJK encodings and local inputs preceded by a literal XeTeX encoding assignment. Preserve the document's original encoding when formatting.
+- Preserve spacing around sized math delimiters and handle a minus sign after a conditional or divisibility bar when wrapping equations.
+- Support atomic in-place writes to long Windows paths and reduce repeated scanning of TeX commands and arguments.
+
+[Download tift 0.2.1](https://github.com/PrimeX-06/tift/releases/tag/v0.2.1) or install with `cargo install tift --version 0.2.1 --locked --registry crates-io`.
+
 ## 0.2.0
 
 - Format lines added or edited since a Git revision with `--changed-since <REV>`. Run `tift --diff --changed-since HEAD` to preview formatting across staged and unstaged edits. New, non-ignored input files are formatted in full.

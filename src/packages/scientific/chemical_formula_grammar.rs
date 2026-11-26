@@ -8,7 +8,8 @@ specifications! {
     "mhchemoptions" => ("m", "U", "m"),
 
     // chemformula sanitizes formulas before parsing bonds and reaction arrows.
-    "ch" | "chcpd" => ("om", "UU", "om"),
+    "ch" => ("og", "UU", "og"),
+    "chcpd" => ("om", "UU", "om"),
     "chname" => ("R(){}R(){}", "UU", "R(){}R(){}"),
     "chlewis" => ("omm", "UUU", "omm"),
     "chstoich" | "bond" | "ShowChemBond" | "setchemformula" => ("m", "U", "m"),
@@ -39,8 +40,9 @@ specifications! {
     "subcmpdproperty" => ("mmm", "UUU", "mmm"),
     "setchemnum" => ("m", "U", "m"),
     // elements.sty queries and declares names, symbols, distributions and
-    // isotope lists using atomic numbers or element identifiers.
-    "elementname" | "elementsymbol" | "atomicnumber" | "elconf" | "Z"
+    // isotope lists using atomic numbers or element identifiers. The short
+    // \Z command is context-sensitive and is registered below.
+    "elementname" | "elementsymbol" | "atomicnumber" | "elconf"
     | "mainelementisotope" => ("m", "U", "m"),
     "setatomname" | "DeclareAtomName" => ("omm", "UUU", "omm"),
     "saveelementname" | "saveelementsymbol" | "saveatomicnumber"
@@ -51,15 +53,24 @@ specifications! {
 }
 
 pub(super) fn is_context_metadata(name: &str) -> bool {
-    name.trim_end_matches('*') == "ce"
+    matches!(name.trim_end_matches('*'), "Z" | "ce")
 }
 
 pub(super) fn context_specification(
     name: &str,
     context: &InvocationContext<'_>,
 ) -> Option<CommandSpec> {
+    if name == "ch" && context.possibly_has_package("chemformula") {
+        return Some(CommandSpec::new("om", "UU", "om"));
+    }
     // Preserve a possible mhchem argument even when its load is conditional.
     // The short command name has no global interpretation outside that context.
-    (is_context_metadata(name) && context.possibly_has_package("mhchem"))
+    let package = match name.trim_end_matches('*') {
+        "ce" => "mhchem",
+        "Z" => "elements",
+        _ => return None,
+    };
+    context
+        .possibly_has_package(package)
         .then_some(CommandSpec::new("m", "U", "m"))
 }

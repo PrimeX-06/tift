@@ -93,15 +93,10 @@ pub(crate) fn format_with_context(
                 &analysis,
             );
             // Forest options preceding the root stay opaque.
-            if let Some(start) = forest_root(source, header..env.body.end)
-                && let Some(end) = syntax::balanced_end(source, start, b'[', b']')
-                && end <= env.body.end
-                && !parsed
-                    .protected
-                    .iter()
-                    .any(|range| range.start < end && start < range.end)
+            if let Some(root) = forest_root(tokens, header..env.body.end)
+                && !syntax::overlaps(&root, &parsed.protected)
             {
-                roots.push((start..end, false));
+                roots.push((root, false));
             }
         }
     }
@@ -279,18 +274,112 @@ fn literal_directory_name(name: &str) -> bool {
     true
 }
 
-fn forest_root(source: &str, range: Range<usize>) -> Option<usize> {
-    let mut at = range.start;
-    while at < range.end {
-        match source.as_bytes()[at] {
-            b'[' => return Some(at),
-            b'{' => at = syntax::balanced_end(source, at, b'{', b'}')?,
-            b'%' => at = source[at..].find('\n').map_or(range.end, |n| at + n + 1),
-            b'\\' => at = syntax::command_at(source, at)?.1,
-            _ => at += source[at..].chars().next()?.len_utf8(),
+fn forest_root(tokens: &[syntax::Token], body: Range<usize>) -> Option<Range<usize>> {
+    use syntax::TokenKind;
+
+    let first = tokens.partition_point(|token| token.span.start < body.start);
+    let mut start = None;
+    let mut braces = 0usize;
+    let mut nodes = 0usize;
+    for token in tokens[first..]
+        .iter()
+        .take_while(|t| t.span.start < body.end)
+    {
+        match token.kind {
+            TokenKind::OpenBrace => braces += 1,
+            TokenKind::CloseBrace => braces = braces.checked_sub(1)?,
+            TokenKind::OpenBracket if braces == 0 => {
+                start.get_or_insert(token.span.start);
+                nodes += 1;
+            }
+            TokenKind::CloseBracket if braces == 0 => {
+                nodes = nodes.checked_sub(1)?;
+                if nodes == 0 {
+                    return Some(start?..token.span.end);
+                }
+            }
+            _ => (),
         }
     }
     None
+}
+
+pub(crate) enum ForestGroup<'s> {
+    Node,
+    KeyValue(&'s str),
+    LiteralBracket,
+}
+
+/// Braces shield node content and PGF values from Forest's bracket parser.
+/// Paired brackets inside a brace may still be ordinary TeX command options.
+pub(crate) fn forest_groups<'s>(
+    source: &'s str,
+    body: Range<usize>,
+    tokens: &[syntax::Token],
+    groups: &mut std::collections::HashMap<usize, ForestGroup<'s>>,
+) {
+    use syntax::TokenKind;
+
+    let Some(root) = forest_root(tokens, body.clone()) else {
+        return;
+    };
+    let first = tokens.partition_point(|token| token.span.start < body.start);
+    let mut braces: Vec<(Option<&str>, usize)> = Vec::new();
+    let mut inner_brackets = Vec::new();
+    let mut key = None;
+    for token in tokens[first..]
+        .iter()
+        .take_while(|t| t.span.start < root.end)
+    {
+        match token.kind {
+            TokenKind::OpenBracket if braces.is_empty() && token.span.start >= root.start => {
+                groups.insert(token.span.start, ForestGroup::Node);
+                key = None;
+            }
+            TokenKind::OpenBracket if !braces.is_empty() => {
+                inner_brackets.push(token.span.start);
+                key = None;
+            }
+            TokenKind::CloseBracket => {
+                if braces
+                    .last()
+                    .is_some_and(|&(_, base)| inner_brackets.len() > base)
+                {
+                    inner_brackets.pop();
+                }
+                key = None;
+            }
+            TokenKind::Text if braces.last().is_none_or(|(owner, _)| owner.is_some()) => {
+                // A PGF key may take adjacent arguments, e.g. if level=1{...}{...}.
+                let text = &source[token.span.clone()];
+                let entry = if let Some((_, last)) = text.rsplit_once(',') {
+                    key = None;
+                    last
+                } else {
+                    text
+                };
+                if let Some((name, _)) = entry.split_once('=') {
+                    key = Some(name.trim()).filter(|name| !name.is_empty());
+                }
+            }
+            TokenKind::OpenBrace => {
+                if let Some(name) = key {
+                    groups.insert(token.span.start, ForestGroup::KeyValue(name));
+                }
+                braces.push((key.take(), inner_brackets.len()));
+            }
+            TokenKind::CloseBrace => {
+                if let Some((owner, base)) = braces.pop() {
+                    key = owner;
+                    for at in inner_brackets.drain(base..) {
+                        groups.insert(at, ForestGroup::LiteralBracket);
+                    }
+                }
+            }
+            TokenKind::Comment | TokenKind::Space | TokenKind::Newline => (),
+            _ => key = None,
+        }
+    }
 }
 
 fn render(

@@ -520,7 +520,12 @@ fn delimited_end(
     None
 }
 
-fn until_end(source: &str, start: usize, limit: usize, delimiter: &str) -> Option<usize> {
+pub(super) fn until_end(
+    source: &str,
+    start: usize,
+    limit: usize,
+    delimiter: &str,
+) -> Option<usize> {
     if delimiter.is_empty() {
         return Some(start);
     }
@@ -543,11 +548,14 @@ fn until_end(source: &str, start: usize, limit: usize, delimiter: &str) -> Optio
 
 fn verbatim_end(source: &str, start: usize, limit: usize) -> Option<usize> {
     let delimiter = source[start..limit].chars().next()?;
-    let close = if delimiter == '{' { '}' } else { delimiter };
     if delimiter.is_ascii_whitespace() || delimiter == '\\' {
         return None;
     }
     let begin = start + delimiter.len_utf8();
-    let end = source[begin..limit].find(close)? + begin;
-    (!source[begin..end].contains(['\r', '\n'])).then_some(end + close.len_utf8())
+    let end = if delimiter == '{' {
+        crate::code_package_syntax::raw_group_end(&source[..limit], start)?
+    } else {
+        begin + source[begin..limit].find(delimiter)? + delimiter.len_utf8()
+    };
+    (!source[begin..end].contains(['\r', '\n'])).then_some(end)
 }

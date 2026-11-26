@@ -92,7 +92,10 @@ pub(super) fn mark_authored_signs(source: &str, atoms: &mut [Atom]) {
     }
     let mut previous: Option<usize> = None;
     for (i, part) in parts.iter().enumerate() {
-        if part.class != MathClass::Rel {
+        // A divisibility or conditional bar does not start a new equation.
+        // Keep the interpretation used by break_candidates when a continuation
+        // after the bar happens to start with a minus sign.
+        if part.class != MathClass::Rel || part.text == "\\mid" {
             continue;
         }
         if let Some(prev) = previous

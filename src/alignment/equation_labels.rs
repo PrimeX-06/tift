@@ -60,11 +60,7 @@ impl Layout<'_> {
             .iter_mut()
             .filter(|r| r.eligible && r.starts_physical_line && !r.folded)
         {
-            if row
-                .cells
-                .iter()
-                .any(|c| source[c.source.clone()].trim_end().contains('\n'))
-            {
+            if row.cells.iter().any(|c| c.text.contains('\n')) {
                 continue;
             }
             let Some(cell) = row.cells.last_mut() else {

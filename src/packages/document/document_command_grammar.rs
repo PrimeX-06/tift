@@ -140,6 +140,26 @@ pub(crate) fn context_command_signature(
     _: usize,
     context: &crate::packages::InvocationContext<'_>,
 ) -> Option<&'static str> {
+    if matches!(
+        name,
+        "label"
+            | "textbf"
+            | "textit"
+            | "textmd"
+            | "textnormal"
+            | "textrm"
+            | "textsc"
+            | "textsf"
+            | "textsl"
+            | "texttt"
+            | "textup"
+            | "emph"
+    ) && (context.has_package("beamer")
+        || context.has_package("ltx-talk")
+        || context.has_package("beamerarticle"))
+    {
+        return Some("dm");
+    }
     let (scopes, shape) = exam_item(name)?;
     scopes.contains(&context.environment()?).then_some(shape)
 }
@@ -233,7 +253,7 @@ command_signatures! {
     "lstinputlisting" => "om",
     "LTXtable" => "mm",
     "label" | "textbf" | "textit" | "textmd" | "textnormal" | "textrm" | "textsc"
-        | "textsf" | "textsl" | "texttt" | "textup" | "emph" => "dm",
+        | "textsf" | "textsl" | "texttt" | "textup" | "emph" => "m",
     "color" | "pagecolor" => "dom",
     "mathcolor" | "textcolor" => "domm",
     "item" => "do",

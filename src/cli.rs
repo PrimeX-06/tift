@@ -1387,6 +1387,23 @@ fn create_backup(path: &Path, original: &[u8], count: usize) -> Result<(), Strin
 }
 
 fn atomic_write(path: &Path, original: &[u8], formatted: &[u8]) -> Result<(), String> {
+    // tempfile passes these paths directly to MoveFileExW. Use the extended
+    // absolute parent for both names, without following a final-component link.
+    #[cfg(windows)]
+    let absolute = {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::canonicalize(parent)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .join(
+                path.file_name()
+                    .ok_or_else(|| format!("{}: missing filename", path.display()))?,
+            )
+    };
+    #[cfg(windows)]
+    let path = absolute.as_path();
     let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!(

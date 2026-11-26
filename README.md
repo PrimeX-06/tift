@@ -15,7 +15,7 @@ tift keeps the source of a shared paper easy to review. Equations and table colu
 
 ## Install
 
-Download the archive for Windows, Linux, or macOS, extract the executable, and add its directory to `PATH`. [Download tift 0.2.0](https://github.com/PrimeX-06/tift/releases/tag/v0.2.0)
+Download the archive for Windows, Linux, or macOS, extract the executable, and add its directory to `PATH`. [Download tift 0.2.1](https://github.com/PrimeX-06/tift/releases/tag/v0.2.1)
 
 With Rust 1.99.1 or later, you can also install tift using Cargo.
 
@@ -77,7 +77,7 @@ mode = "wrap"
 columns = 88
 ```
 
-tift loads the file automatically when you format the project. [Annotated configuration for 0.2.0](https://github.com/PrimeX-06/tift/blob/v0.2.0/examples/tift.toml)
+tift loads the file automatically when you format the project. [Annotated configuration for 0.2.1](https://github.com/PrimeX-06/tift/blob/v0.2.1/examples/tift.toml)
 
 ## Editor
 

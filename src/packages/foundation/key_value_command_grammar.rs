@@ -160,6 +160,15 @@ pub(crate) fn definition_entries(source: &str) -> Vec<Range<usize>> {
 /// Literal property values are delayed definition data. Their braces are
 /// included so arbitrary TeX bodies cannot alter the surrounding parser scope.
 pub(crate) fn delayed_ranges(source: &str, name: &str, end: usize) -> Vec<Range<usize>> {
+    // PGF stores the function body for later expansion. Its group can be
+    // closed by a helper when the function runs. TikZ graph activations
+    // likewise register literal tokens, including raw math shifts.
+    if matches!(
+        name.trim_end_matches('*'),
+        "pgfmathdeclarefunction" | "tikz@lib@prepare@active"
+    ) {
+        return arguments(source, end, "mmm").unwrap_or_default();
+    }
     if matches!(
         name,
         "tikzset" | "pgfkeys" | "pgfqkeys" | "tcbset" | "forestset" | "gtrset"

@@ -20,11 +20,25 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn is_terminal_listing(name: &str) -> bool {
+    matches!(
+        name,
+        "TermUnix" | "TermWin" | "TermMac" | "TerminalUnix" | "TerminalWin" | "TerminalMac"
+    )
+}
+
 pub(crate) fn context_header_signature(
     name: &str,
     context: &InvocationContext<'_>,
 ) -> Option<&'static str> {
     match name {
+        // forest-doc.sty displays these lines through listings and saves a copy.
+        "forestexample" if context.has_package("forest-doc") => Some("o"),
+        "numVblock" if context.has_package("numberedblock") => Some("o"),
+        "codeexample" if context.has_package("pgfmanual-en-macros") => Some("o"),
+        _ if is_terminal_listing(name) && context.has_package("sim-os-menus") => Some("om"),
+        // naive-ebnf tokenizes punctuation in the collected grammar body.
+        "ebnf" if context.has_package("naive-ebnf") => Some("o"),
         "example" | "sidebyside" | "sourcecode" | "bash"
             if context.has_package("cnltx-example") =>
         {
