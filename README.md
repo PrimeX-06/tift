@@ -41,14 +41,14 @@ You can also pass a bibliography (`references.bib`) or a BibTeX style file (`jou
 
 ## Performance
 
-tift 0.2.0 took **29.6 ms** to check a TeX file on Windows 11 (median, including CLI startup). Across all 7,720 files, **89.6%** finished within 50 ms.
+tift 0.2.1 took **48.4 ms** to check a TeX file on Windows 11 (median, including CLI startup). Across all 7,720 files, **55.7%** finished within 50 ms.
 
 ```mermaid
 xychart-beta
     title "Single-file check times"
     x-axis ["≤25 ms", ">25–50 ms", ">50–100 ms", ">100 ms"]
     y-axis "Files" 0 --> 5000
-    bar [2154, 4760, 275, 531]
+    bar [7, 4295, 2804, 614]
 ```
 
 <details>
@@ -56,7 +56,7 @@ xychart-beta
 
 The benchmark covers the TeX sources of 721 papers. It excludes nine files from a paper missing `astra-plain.bst`. [Benchmark corpus](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a)
 
-Each file’s time is the median of three separate CLI runs with one worker, default settings, and the tift cache disabled on Windows 11 (Core i9-14900HX). The chart includes all 429 files that reported errors.
+Each file’s time is the median of three separate CLI runs with one worker, default settings, and the tift cache disabled on Windows 11 (Core i9-14900HX). All 7,720 files completed without formatter errors. A two-job Cargo build ran during part of the benchmark.
 
 ```sh
 python performance/openai_math.py --tift path/to/tift --all-files --runs 3
