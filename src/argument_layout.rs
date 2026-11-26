@@ -519,6 +519,7 @@ fn scan_punctuation(
 ) -> Option<Punctuation> {
     let mut result = Vec::new();
     let mut empty_comments = Vec::new();
+    let mut comment_run = 0..0;
     let mut cursor = body.start;
     while cursor < body.end {
         if let Some(range) = protected_at(cursor, protected) {
@@ -556,17 +557,10 @@ fn scan_punctuation(
                 }
                 // Removing a comment between a control word and a letter
                 // would merge them into a different command token.
-                let token_boundary =
-                    empty_comments
-                        .iter()
-                        .rev()
-                        .fold(cursor, |end, removed: &Range<usize>| {
-                            if removed.end == end {
-                                removed.start
-                            } else {
-                                end
-                            }
-                        });
+                if comment_run.end != cursor {
+                    comment_run.start = cursor;
+                }
+                comment_run.end = removed_end;
                 if source
                     .as_bytes()
                     .get(removed_end)
@@ -576,7 +570,7 @@ fn scan_punctuation(
                         .is_some_and(|offset| {
                             syntax::command_at(source, body.start + offset).is_some_and(
                                 |(name, end)| {
-                                    end == token_boundary
+                                    end == comment_run.start
                                         && name.bytes().next().is_some_and(|byte| {
                                             byte.is_ascii_alphabetic() || b"@_:".contains(&byte)
                                         })
@@ -708,20 +702,17 @@ fn format_group(
     newline: &str,
 ) -> Option<String> {
     let tab = config.config.indent.width;
-    let expand = if settings.mode == "auto" {
-        let line_start = source[..group.start].rfind('\n').map_or(0, |pos| pos + 1);
-        let after = source[group.end..]
-            .split('\n')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('\r');
-        let original = &source[line_start..group.end + after.len()];
-        settings
-            .width
-            .is_some_and(|width| original.lines().any(|line| column(line, tab) > width))
-    } else {
-        true
-    };
+    let expand = settings.mode != "auto"
+        || settings.width.is_some_and(|width| {
+            let line_start = source[..group.start].rfind('\n').map_or(0, |pos| pos + 1);
+            let after = source[group.end..]
+                .split('\n')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('\r');
+            let original = &source[line_start..group.end + after.len()];
+            original.lines().any(|line| column(line, tab) > width)
+        });
     let expanded = expand
         .then(|| {
             expand_group(
@@ -736,6 +727,9 @@ fn format_group(
         })
         .flatten();
     if settings.align_equals {
+        if expanded.is_none() && children.is_empty() {
+            return align_group_equals(&source[group], config, settings.width, 0);
+        }
         let mut text = expanded.unwrap_or_else(|| {
             let mut text = String::new();
             copy_children(&mut text, source, group, children);
@@ -756,10 +750,11 @@ fn align_group_equals(
     width: Option<usize>,
     depth: usize,
 ) -> Option<String> {
-    if depth >= 64 || source.len() < 2 {
+    if depth >= 64 || !source.contains('\n') || !source.contains('=') {
         return None;
     }
-    let protected = syntax::protected_ranges(source, &config.config).ok()?;
+    let protected =
+        syntax::protected_ranges_with_syntax(source, &config.config, &config.syntax).ok()?;
     let body = 1..source.len() - 1;
     let parsed = scan_punctuation(source, body.clone(), &protected, true)?;
     let mut entries = Vec::new();
@@ -805,13 +800,12 @@ fn align_group_equals(
         {
             edits.push((value_start..end, value));
         }
-        let line_start = source[..key_start]
-            .rfind('\n')
-            .map_or(0, |offset| offset + 1);
-        if !source[line_start..key_start]
-            .chars()
-            .all(|c| c == ' ' || c == '\t')
-        {
+        // The preceding comma or opening delimiter already occupies the line
+        // unless the trivia before this key contains a newline.
+        let Some((_, indent)) = source[entry.start..key_start].rsplit_once('\n') else {
+            continue;
+        };
+        if !indent.chars().all(|c| c == ' ' || c == '\t') {
             continue;
         }
         // Several entries on one physical line have no vertical assignment axis.
@@ -865,6 +859,9 @@ fn align_group_equals(
         if fits {
             edits.extend(padding);
         }
+    }
+    if edits.is_empty() {
+        return None;
     }
     edits.sort_by_key(|(range, _)| (range.start, range.end));
     let mut output = String::new();
@@ -1340,7 +1337,7 @@ fn normalize_load_arguments(
             }
             let body = argument.start + 1..argument.end - 1;
             let text = &source[body.clone()];
-            if text.contains(['%', '\\', '\r', '\n']) {
+            if !text.contains([' ', '\t']) || text.contains(['%', '\\', '\r', '\n']) {
                 continue;
             }
             let mut normalized = String::with_capacity(text.len());
@@ -1355,9 +1352,5 @@ fn normalize_load_arguments(
             }
         }
     }
-    let mut output = source.to_owned();
-    for (range, text) in edits.into_iter().rev() {
-        output.replace_range(range, &text);
-    }
-    Ok(output)
+    crate::layout::apply_edits(source, edits)
 }

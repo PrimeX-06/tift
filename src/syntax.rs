@@ -224,23 +224,24 @@ pub(crate) fn expansion_precedes(source: &str, start: usize) -> bool {
 
 fn control_after_escape(source: &str, name_start: usize) -> Option<(&str, usize)> {
     let bytes = source.as_bytes();
-    let next = *bytes.get(name_start)?;
-    let control_word = |byte: u8| byte.is_ascii_alphabetic() || matches!(byte, b'@' | b'_' | b':');
-    let mut end = name_start + 1;
-    let first = source[name_start..].chars().next()?;
-    if control_word(next) || first.is_alphabetic() {
-        end = name_start + first.len_utf8();
-        while let Some(character) = source[end..].chars().next()
-            && (character.is_alphabetic() || matches!(character, '@' | '_' | ':'))
-        {
-            end += character.len_utf8();
-        }
-        if bytes.get(end) == Some(&b'*') {
+    let mut end = name_start;
+    while let Some(&byte) = bytes.get(end) {
+        if byte.is_ascii_alphabetic() || matches!(byte, b'@' | b'_' | b':') {
             end += 1;
+        } else if !byte.is_ascii() {
+            let ch = source[end..].chars().next()?;
+            if !ch.is_alphabetic() {
+                break;
+            }
+            end += ch.len_utf8();
+        } else {
+            break;
         }
-    } else if !next.is_ascii() {
-        // Non-letter Unicode control symbols remain one scalar.
-        end = name_start + source[name_start..].chars().next()?.len_utf8();
+    }
+    if end == name_start {
+        end += source[name_start..].chars().next()?.len_utf8();
+    } else if bytes.get(end) == Some(&b'*') {
+        end += 1;
     }
     Some((&source[name_start..end], end))
 }
@@ -1088,6 +1089,9 @@ fn line_end(source: &str, pos: usize) -> usize {
 }
 
 fn untranslated_character_sequence(source: &str) -> Option<usize> {
+    if !source.contains("^^") {
+        return None;
+    }
     let mut cursor = 0;
     while cursor < source.len() {
         if source.as_bytes()[cursor] == b'%' {
