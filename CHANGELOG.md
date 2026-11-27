@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Speed up the first format of multi-file books by limiting declaration analysis to commands that can affect later files and reusing snapshots across ordinary chapters.
+- Preserve the boundary between the document and trailing notes after `\end{document}`, including terminators with spaces or comments. Keep embedded files and DocStrip code on separate lines from their closing delimiters.
+- Honor the parent document's XeTeX input encoding for unsaved editor buffers and report replacement-stage diagnostics at their original source positions.
+- Resolve an existing file with a comma in its name when following `\input` or `\include`, including names supplied by a macro.
+- Preserve cross-line groups, math and environments that use TeX `^^` character translations. Read encoding declarations in files that mix CR, LF and CRLF line endings.
+- Format independent files as their project dependencies become available. Reuse source, token and semantic indexes across layout stages.
+- Preserve short verbatim examples in documentation classes and listings, including delimiters adjacent to TeX character translations.
+- Preserve printed spaces in VDM listings, stored code examples, and macros that read verbatim text up to a caller-supplied delimiter.
+- Keep Xy-pic diagrams, multiline math subscripts, and tables with short verbatim text stable on repeated formatting.
+- Format the surrounding document when a mismatched pair of delimiters can be isolated. Diagnostics identify the preserved source range.
+- Preserve unused arguments of simple TeX and LaTeX macros without treating their contents as executable environments. This also covers `\missingfigure` after an explicit `\usepackage[disable]{todonotes}`.
+- Continue formatting after nested, balanced environment wrappers, including `holtpolt` math commands defined in local style files.
+- Keep the unused branch of a statically resolved `ifdraft` call verbatim. Resume formatting after balanced list wrappers such as `duckuments`, and restore outer macro definitions when `altverse`'s `\Vbreak` restarts a paragraph environment.
+- Traverse deeply nested project inputs without overflowing the thread stack. `--trace` reports project indexing work and per-file timings in inclusion order as each file finishes.
+
 ## 0.2.1
 
 - Read nested braces in xparse verbatim arguments and unbraced text-font arguments. Recognize balanced environment wrappers across file imports and explicit TeX group endings in wrapper definitions.

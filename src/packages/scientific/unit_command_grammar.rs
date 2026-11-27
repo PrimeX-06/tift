@@ -42,35 +42,30 @@ pub(super) fn context_specification(
     if name == "num" && context.possibly_has_package("siunitx") {
         return Some(CommandSpec::new("om", "UU", "om"));
     }
-    if context.has_package("SIunits") {
-        match name.trim_end_matches('*') {
-            "unit" => return Some(CommandSpec::new("mm", "UU", "mm")),
-            "power" => return Some(CommandSpec::new("mm", "UU", "mm")),
-            _ => (),
-        }
+    if matches!(name.trim_end_matches('*'), "unit" | "power") && context.has_package("SIunits") {
+        return Some(CommandSpec::new("mm", "UU", "mm"));
     }
-    if context.has_package("physunits")
-        && matches!(
-            name,
-            "V" | "Volt"
-                | "Coulomb"
-                | "Ohm"
-                | "Amp"
-                | "Farad"
-                | "Henry"
-                | "Tesla"
-                | "Gauss"
-                | "calorie"
-                | "Hz"
-                | "barP"
-                | "Pa"
-                | "Ba"
-                | "Torr"
-                | "Celsius"
-                | "Fahrenheit"
-                | "Rankine"
-                | "Kelvin"
-        )
+    if matches!(
+        name,
+        "V" | "Volt"
+            | "Coulomb"
+            | "Ohm"
+            | "Amp"
+            | "Farad"
+            | "Henry"
+            | "Tesla"
+            | "Gauss"
+            | "calorie"
+            | "Hz"
+            | "barP"
+            | "Pa"
+            | "Ba"
+            | "Torr"
+            | "Celsius"
+            | "Fahrenheit"
+            | "Rankine"
+            | "Kelvin"
+    ) && context.has_package("physunits")
     {
         return Some(CommandSpec::new("o", "U", "o"));
     }

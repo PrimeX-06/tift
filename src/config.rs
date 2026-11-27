@@ -889,7 +889,11 @@ pub struct PackageLoadEvent {
 pub struct ImportedCommand {
     pub arguments: Option<EnvironmentArguments>,
     pub literal_arguments: bool,
+    #[serde(default)]
+    pub literal_slots: u16,
     pub neutral_environment_wrapper: bool,
+    #[serde(default)]
+    pub composable_environment_wrapper: bool,
     pub global: bool,
 }
 

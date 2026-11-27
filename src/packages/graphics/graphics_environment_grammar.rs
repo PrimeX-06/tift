@@ -247,17 +247,19 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
     } {
         return Some(signature);
     }
-    let separated_star = !name.ends_with('*')
-        && source.as_bytes().get(crate::trivia::skip(source, end)) == Some(&b'*');
+    let separated_star = || {
+        !name.ends_with('*')
+            && source.as_bytes().get(crate::trivia::skip(source, end)) == Some(&b'*')
+    };
     Some(match name.trim_end_matches('*') {
-        "switchocg" | "showocg" | "hideocg" if separated_star => "momm",
+        "switchocg" | "showocg" | "hideocg" if separated_star() => "momm",
         "switchocg" | "showocg" | "hideocg" => "omm",
-        "actionsocg" if separated_star => "mommmm",
+        "actionsocg" if separated_star() => "mommmm",
         "actionsocg" => "ommmm",
         "toggleocgs" | "showocgs" | "hideocgs" => "omm",
         "setocgs" => "ommmm",
         "animategraphics" => "ommmm",
-        "newframe" if separated_star => "mo",
+        "newframe" if separated_star() => "mo",
         "newframe" => "o",
         "multiframe" => "mmm",
         _ => return None,

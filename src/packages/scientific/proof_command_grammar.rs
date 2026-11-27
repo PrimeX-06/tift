@@ -54,12 +54,10 @@ pub(super) fn context_ambiguous(
     context: &InvocationContext<'_>,
 ) -> Option<&'static str> {
     let name = name.trim_end_matches('*');
-    let proof_environment = name == "prooftree" || context.environment() == Some("prooftree");
-    (proof_environment
-        && matches!(
-            name,
-            "prooftree" | "set" | "hypo" | "infer" | "ellipsis" | "rewrite" | "delims" | "overlay"
-        )
+    (matches!(
+        name,
+        "prooftree" | "set" | "hypo" | "infer" | "ellipsis" | "rewrite" | "delims" | "overlay"
+    ) && (name == "prooftree" || context.environment() == Some("prooftree"))
         && (context.possibly_has_package("ebproof") || context.possibly_has_package("bussproofs"))
         && !(context.has_package("ebproof")
             && !context.possibly_has_package("bussproofs")
@@ -74,9 +72,6 @@ pub(super) fn context_specification(
     name: &str,
     context: &InvocationContext<'_>,
 ) -> Option<CommandSpec> {
-    if !ebproof_context(context) {
-        return None;
-    }
     let global = match name.trim_end_matches('*') {
         "set" => "ebproofset",
         "rewrite" => "ebproofrewrite",
@@ -87,7 +82,9 @@ pub(super) fn context_specification(
         "overlay" => "ebproofoverlay",
         _ => return None,
     };
-    specification(global)
+    ebproof_context(context)
+        .then(|| specification(global))
+        .flatten()
 }
 
 pub(super) fn header_signature(

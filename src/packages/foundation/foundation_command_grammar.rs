@@ -322,10 +322,9 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
     if matches!(name.trim_end_matches('*'), "lipsum" | "lipsumexp") {
         return Some("o");
     }
-    let separated = separated_star(source, name, end);
     Some(match name.trim_end_matches('*') {
         "citet" | "citep" | "citeauthor" | "citeyear" => {
-            if separated {
+            if separated_star(source, name, end) {
                 "moom"
             } else {
                 "oom"
@@ -336,7 +335,6 @@ pub(crate) fn command_signature(source: &str, name: &str, end: usize) -> Option<
         "@ifpackagewith" | "@ifclasswith" => "mmmm",
         "apptocmd" | "pretocmd" | "xapptocmd" | "xpretocmd" => "ommmm",
         "appto" | "preto" => "mm",
-        "ifpatchable" if separated => "mmmm",
         "ifpatchable" if name.ends_with('*') => "mmm",
         "ifpatchable" => "mmmm",
         // etoolbox.sty:130ff: one tested token/name, then two branch arguments.

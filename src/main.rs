@@ -4,8 +4,8 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() {
-    std::process::exit(tift_cli::run());
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(tift_cli::run() as u8)
 }
 
 #[path = "cli.rs"]

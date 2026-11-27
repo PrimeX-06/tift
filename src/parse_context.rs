@@ -41,6 +41,7 @@ fn position_independent_grammar(config: &CompiledConfig) -> bool {
 pub(crate) struct ParseContext<'a> {
     config: &'a CompiledConfig,
     parsed: Option<ParsedText>,
+    initial: Option<Rc<AnalysisMemo>>,
 }
 
 pub(crate) struct ParsedText {
@@ -55,6 +56,20 @@ pub(crate) struct ParsedText {
 }
 
 impl ParsedText {
+    fn from_analysis(metadata: Rc<AnalysisMemo>) -> Self {
+        let model = metadata.existing_model().expect("semantic snapshot");
+        Self {
+            document: model.document().clone(),
+            protected: model.protected_ranges().to_vec(),
+            tokens: None,
+            blocks: None,
+            metadata,
+            environment_ranges: OnceCell::new(),
+            text_readers: OnceCell::new(),
+            expl3_protected: None,
+        }
+    }
+
     pub(crate) fn analysis<'a>(&'a self, config: &'a crate::Config) -> SourceAnalysis<'a> {
         SourceAnalysis::with_memo(
             self.document.as_str(),
@@ -87,31 +102,26 @@ impl<'a> ParseContext<'a> {
         model: Option<crate::source_model::SourceModel>,
     ) -> Self {
         let parsed = model.map(|mut model| {
-            let document = model.document().clone();
-            let protected = model.protected_ranges().to_vec();
-            let (tokens, blocks) = model
-                .structure
-                .take()
-                .map_or((None, None), |(tokens, blocks)| {
-                    (Some(tokens), Some(blocks))
-                });
-            ParsedText {
-                document,
-                protected,
-                tokens,
-                blocks,
-                metadata: Rc::new(AnalysisMemo::with_model(model)),
-                environment_ranges: OnceCell::new(),
-                text_readers: OnceCell::new(),
-                expl3_protected: None,
+            let structure = model.structure.take();
+            let mut parsed = ParsedText::from_analysis(Rc::new(AnalysisMemo::with_model(model)));
+            if let Some((tokens, blocks)) = structure {
+                parsed.tokens = Some(tokens);
+                parsed.blocks = Some(blocks);
             }
+            parsed
         });
-        Self { config, parsed }
+        let initial = parsed.as_ref().map(|parsed| Rc::clone(&parsed.metadata));
+        Self {
+            config,
+            parsed,
+            initial,
+        }
     }
     pub(crate) fn new(config: &'a CompiledConfig) -> Self {
         Self {
             config,
             parsed: None,
+            initial: None,
         }
     }
 
@@ -270,25 +280,27 @@ impl<'a> ParseContext<'a> {
             .as_ref()
             .is_none_or(|parsed| !parsed.document.matches(source))
         {
-            let document = SourceDocument::new(source);
-            if !self.project_plain_text(&document) {
-                let model = crate::source_model::SourceModel::rescan_document(
-                    document.clone(),
-                    self.config,
-                    self.parsed
-                        .as_ref()
-                        .and_then(|parsed| parsed.metadata.existing_model()),
-                )?;
-                self.parsed = Some(ParsedText {
-                    document,
-                    protected: model.protected_ranges().to_vec(),
-                    tokens: None,
-                    blocks: None,
-                    metadata: Rc::new(AnalysisMemo::with_model(model)),
-                    environment_ranges: OnceCell::new(),
-                    text_readers: OnceCell::new(),
-                    expl3_protected: None,
-                });
+            if let Some(metadata) = self.initial.as_ref().filter(|metadata| {
+                metadata
+                    .existing_model()
+                    .is_some_and(|model| model.document().matches(source))
+            }) {
+                self.parsed = Some(ParsedText::from_analysis(Rc::clone(metadata)));
+            } else {
+                let document = SourceDocument::new(source);
+                if !self.project_plain_text(&document) {
+                    let model = crate::source_model::SourceModel::rescan_document(
+                        document.clone(),
+                        self.config,
+                        self.parsed
+                            .as_ref()
+                            .and_then(|parsed| parsed.metadata.existing_model()),
+                    )?;
+                    let mut parsed =
+                        ParsedText::from_analysis(Rc::new(AnalysisMemo::with_model(model)));
+                    parsed.document = document;
+                    self.parsed = Some(parsed);
+                }
             }
         }
         let parsed = self.parsed.as_mut().expect("current source snapshot");

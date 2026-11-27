@@ -1011,8 +1011,8 @@ fn expand_group(
 }
 
 pub(crate) fn is_active(source: &str, config: &CompiledConfig) -> bool {
-    load_arguments_present(source, config)
-        || width_layout_is_active(config)
+    width_layout_is_active(config)
+        || load_arguments_present(source, config)
         || declaration_lists::is_active(source, config)
 }
 
@@ -1087,14 +1087,24 @@ pub(crate) fn format_arguments_with_context(
         .collect();
     let selected_name =
         |name: &str| selected.contains(name) || selected.contains(name.trim_end_matches('*'));
-    // This is only a work gate. A raw spelling match is sufficient here and
-    // avoids parsing every control sequence before the shared snapshot is
-    // built. The full pass below still validates comments, literals and
-    // command boundaries before producing edits.
+    let mut initials = [false; 256];
+    let mut empty_prefix = false;
+    for name in &selected {
+        if let Some(&first) = name.trim_end_matches('*').as_bytes().first() {
+            initials[usize::from(first)] = true;
+        } else {
+            empty_prefix = true;
+        }
+    }
     if !memchr::memchr_iter(b'\\', source.as_bytes()).any(|at| {
-        selected
-            .iter()
-            .any(|name| source[at + 1..].starts_with(name.trim_end_matches('*')))
+        empty_prefix
+            || source
+                .as_bytes()
+                .get(at + 1)
+                .is_some_and(|&first| initials[usize::from(first)])
+                && selected
+                    .iter()
+                    .any(|name| source[at + 1..].starts_with(name.trim_end_matches('*')))
     }) {
         return Ok(source.into());
     }

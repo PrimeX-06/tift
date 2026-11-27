@@ -25,7 +25,7 @@ struct Command {
 macro_rules! commands {
     ($( $($name:literal)|+ => ($shape:literal, $data:expr, $modifier:ident) ),+ $(,)?) => {
         fn fixed_command(name: &str) -> Option<Command> {
-            Some(match name.trim_end_matches('*') {
+            Some(match crate::syntax::unstarred(name) {
                 $( $($name)|+ => Command {
                     shape: $shape, data: $data, modifier: Modifier::$modifier,
                 }, )+
@@ -364,20 +364,18 @@ fn signature(source: &str, name: &str, cursor: usize, command: Command) -> Optio
 }
 
 fn contextual_command(name: &str, context: &super::InvocationContext<'_>) -> Option<Command> {
-    if context.has_package("multibbl") {
-        let (shape, data) = match name {
-            "cite" => ("omm", 0b110),
-            "bibliography" => ("mmm", 0b011),
-            "bibliographystyle" => ("mm", 0b11),
-            _ => ("", 0),
-        };
-        if !shape.is_empty() {
-            return Some(Command {
-                shape,
-                data,
-                modifier: Modifier::None,
-            });
-        }
+    if let Some((shape, data)) = match name {
+        "cite" => Some(("omm", 0b110)),
+        "bibliography" => Some(("mmm", 0b011)),
+        "bibliographystyle" => Some(("mm", 0b11)),
+        _ => None,
+    } && context.has_package("multibbl")
+    {
+        return Some(Command {
+            shape,
+            data,
+            modifier: Modifier::None,
+        });
     }
     if matches!(name, "CodeLinkAnchor" | "CodeLinkRef") && context.has_package("xlistings") {
         return Some(Command {

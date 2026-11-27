@@ -15,6 +15,7 @@ pub mod layout;
 mod lexical_index;
 pub mod literal_expansion;
 pub mod math_layout;
+mod name_filter;
 #[path = "packages/package_support_registry.rs"]
 mod packages;
 mod parse_context;

@@ -1,5 +1,7 @@
 //! Lossless token partitions over an immutable source snapshot.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::{Deref, Range};
 
 use crate::source_document::SourceDocument;
@@ -24,6 +26,51 @@ pub struct SourceToken {
     pub span: Range<usize>,
 }
 
+#[derive(Default)]
+pub(crate) struct PrefixGroupPairs {
+    scanned: usize,
+    open: Vec<usize>,
+    pairs: HashMap<usize, usize>,
+}
+
+impl PrefixGroupPairs {
+    pub(crate) fn retain_prefix(&mut self, keep: usize) {
+        if self.scanned > keep {
+            self.scanned = 0;
+            self.open.clear();
+            self.pairs.clear();
+        }
+    }
+
+    pub(crate) fn closing_group(&mut self, tokens: &[SourceToken], start: usize) -> Option<usize> {
+        if tokens.get(start)?.kind != SourceTokenKind::OpenGroup {
+            return None;
+        }
+        if start < self.scanned
+            && let Some(&end) = self.pairs.get(&start)
+        {
+            return Some(end);
+        }
+        for (index, token) in tokens.iter().enumerate().skip(self.scanned) {
+            match token.kind {
+                SourceTokenKind::OpenGroup => self.open.push(index),
+                SourceTokenKind::CloseGroup => {
+                    if let Some(open) = self.open.pop() {
+                        self.pairs.insert(open, index);
+                        if open == start {
+                            self.scanned = index + 1;
+                            return Some(index);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        self.scanned = tokens.len();
+        None
+    }
+}
+
 /// One token in TeX's character-translated input, with its exact raw spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedToken {
@@ -43,7 +90,7 @@ impl SourceToken {
 /// position. Later passes can rewind their cursor over the buffered prefix.
 pub(crate) struct RawTokenStream<'a> {
     reader: SourceTokens<'a>,
-    tokens: Vec<SourceToken>,
+    tokens: Cow<'a, [SourceToken]>,
 }
 
 impl<'a> RawTokenStream<'a> {
@@ -53,12 +100,25 @@ impl<'a> RawTokenStream<'a> {
             reader.position = source.len();
             index.into_tokens()
         });
-        Self { reader, tokens }
+        Self {
+            reader,
+            tokens: Cow::Owned(tokens),
+        }
+    }
+
+    pub(crate) fn buffered(source: &'a str, tokens: &'a [SourceToken]) -> Self {
+        let mut reader = SourceTokens::new(source, &[]);
+        reader.position = source.len();
+        Self {
+            reader,
+            tokens: Cow::Borrowed(tokens),
+        }
     }
 
     pub(crate) fn control_at(&mut self, at: usize, cursor: &mut usize) -> Option<(&'a str, usize)> {
         while self.reader.position <= at {
-            self.tokens.push(self.reader.next()?);
+            let token = self.reader.next()?;
+            self.tokens.to_mut().push(token);
         }
         while self
             .tokens
@@ -74,14 +134,16 @@ impl<'a> RawTokenStream<'a> {
     }
 
     pub(crate) fn complete(&mut self) -> &[SourceToken] {
-        self.tokens.extend(self.reader.by_ref());
+        if self.reader.position < self.reader.source.len() {
+            self.tokens.to_mut().extend(self.reader.by_ref());
+        }
         &self.tokens
     }
 
     pub(crate) fn finish(mut self) -> LexicalIndex {
         self.complete();
         LexicalIndex {
-            tokens: self.tokens,
+            tokens: self.tokens.into_owned(),
             protected: Box::default(),
         }
     }
@@ -110,32 +172,7 @@ impl LexicalIndex {
             return self;
         }
         let mut tokens = Vec::with_capacity(self.tokens.len());
-        let mut raw = self.tokens.iter().peekable();
-        let mut reader = SourceTokens::new(source, ranges);
-        while reader.position < source.len() {
-            let pos = reader.position;
-            while raw.peek().is_some_and(|t| t.span.end <= pos) {
-                raw.next();
-            }
-            while ranges
-                .get(reader.protected_index)
-                .is_some_and(|r| r.end <= pos)
-            {
-                reader.protected_index += 1;
-            }
-            let limit = ranges
-                .get(reader.protected_index)
-                .map_or(source.len(), |r| r.start);
-            if let Some(token) = raw
-                .peek()
-                .filter(|t| t.span.start == pos && t.span.end <= limit)
-            {
-                tokens.push((*token).clone());
-                reader.position = token.span.end;
-            } else {
-                tokens.push(reader.next().expect("remaining source"));
-            }
-        }
+        project_tail(source, ranges, &self.tokens, &mut tokens);
         Self {
             tokens,
             protected: ranges.into(),
@@ -256,6 +293,224 @@ impl LexicalIndex {
     }
 }
 
+fn project_tail(
+    source: &str,
+    ranges: &[Range<usize>],
+    raw: &[SourceToken],
+    tokens: &mut Vec<SourceToken>,
+) {
+    let position = tokens.last().map_or(0, |token| token.span.end);
+    let mut reader = SourceTokens {
+        source,
+        ranges,
+        position,
+        protected_index: ranges.partition_point(|range| range.end <= position),
+    };
+    let mut raw_index = raw.partition_point(|token| token.span.end <= position);
+    while reader.position < source.len() {
+        let pos = reader.position;
+        raw_index += raw[raw_index..].partition_point(|token| token.span.end <= pos);
+        while ranges
+            .get(reader.protected_index)
+            .is_some_and(|range| range.end <= pos)
+        {
+            reader.protected_index += 1;
+        }
+        let limit = ranges
+            .get(reader.protected_index)
+            .map_or(source.len(), |range| range.start);
+        let count = if raw
+            .get(raw_index)
+            .is_some_and(|token| token.span.start == pos)
+        {
+            raw[raw_index..].partition_point(|token| token.span.end <= limit)
+        } else {
+            0
+        };
+        if count > 0 {
+            tokens.extend_from_slice(&raw[raw_index..raw_index + count]);
+            raw_index += count;
+            reader.position = raw[raw_index - 1].span.end;
+        } else {
+            tokens.push(reader.next().expect("remaining source"));
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AppendProtectedTokens {
+    tokens: Vec<SourceToken>,
+    ranges: Vec<Range<usize>>,
+}
+
+impl AppendProtectedTokens {
+    pub(crate) fn update(
+        &mut self,
+        source: &str,
+        ranges: &[Range<usize>],
+    ) -> (&[SourceToken], usize, usize) {
+        let end = self.tokens.last().map_or(0, |token| token.span.end);
+        assert!(
+            source.len() >= end,
+            "project alias source must retain its prefix"
+        );
+        let common = self
+            .ranges
+            .iter()
+            .zip(ranges)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let old = self.ranges.get(common);
+        let new = ranges.get(common);
+        if source.len() == end && old.is_none() && new.is_none() {
+            return (&self.tokens, self.tokens.len(), 0);
+        }
+        let change = old
+            .into_iter()
+            .chain(new)
+            .fold(end, |at, range| at.min(range.start));
+        let mut keep = self
+            .tokens
+            .partition_point(|token| token.span.end <= change);
+        if let Some(token) = self.tokens[..keep]
+            .last()
+            .filter(|token| token.span.end == change)
+            && let Some(&next) = source.as_bytes().get(change)
+            && match token.kind {
+                SourceTokenKind::Control => token.span.len() == 1 || !text_delimiter(next),
+                SourceTokenKind::Comment => next != b'\n',
+                SourceTokenKind::Space => matches!(next, b' ' | b'\t'),
+                SourceTokenKind::Text => {
+                    source.as_bytes()[token.span.start] != b'=' && !text_delimiter(next)
+                }
+                SourceTokenKind::Newline => next == b'\n' && source.as_bytes()[change - 1] == b'\r',
+                _ => false,
+            }
+        {
+            keep -= 1;
+        }
+        self.tokens.truncate(keep);
+        let position = self.tokens.last().map_or(0, |token| token.span.end);
+        self.tokens.extend(SourceTokens {
+            source,
+            ranges,
+            position,
+            protected_index: ranges.partition_point(|range| range.end <= position),
+        });
+        self.ranges.truncate(common);
+        self.ranges.extend_from_slice(&ranges[common..]);
+        (&self.tokens, keep, source.len() - position)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AppendLexicalIndex {
+    raw: Vec<SourceToken>,
+    protected: Vec<Range<usize>>,
+    projected: Vec<SourceToken>,
+}
+
+impl AppendLexicalIndex {
+    pub(crate) fn raw(&self) -> &[SourceToken] {
+        &self.raw
+    }
+
+    pub(crate) fn append_raw(&mut self, source: &str) -> (usize, usize) {
+        let end = self.raw.last().map_or(0, |token| token.span.end);
+        if source.len() == end {
+            return (end, 0);
+        }
+        assert!(
+            source.len() > end,
+            "project export source must retain its prefix"
+        );
+        let mut reader = SourceTokens::new(source, &[]);
+        reader.position = end;
+        let mut restart = end;
+        let mut scanned_from = end;
+        if let Some(last) = self.raw.last_mut() {
+            let next = source.as_bytes()[end];
+            match last.kind {
+                SourceTokenKind::Comment if next != b'\n' => {
+                    restart = last.span.start;
+                    reader.position = source[end..].find('\n').map_or(source.len(), |at| end + at);
+                    last.span.end = reader.position;
+                }
+                SourceTokenKind::Space if matches!(next, b' ' | b'\t') => {
+                    restart = last.span.start;
+                    last.span.end = reader.next().unwrap().span.end;
+                }
+                SourceTokenKind::Text
+                    if source.as_bytes()[last.span.start] != b'=' && !text_delimiter(next) =>
+                {
+                    restart = last.span.start;
+                    last.span.end = reader.next().unwrap().span.end;
+                }
+                SourceTokenKind::Control => {
+                    restart = last.span.start;
+                    scanned_from = restart;
+                    reader.position = restart;
+                    self.raw.pop();
+                }
+                SourceTokenKind::Newline
+                    if next == b'\n' && source.as_bytes()[end - 1] == b'\r' =>
+                {
+                    restart = last.span.start;
+                    reader.position += 1;
+                    last.span.end = reader.position;
+                }
+                _ => (),
+            }
+        }
+        self.raw.extend(reader);
+        (restart, source.len() - scanned_from)
+    }
+
+    pub(crate) fn project(
+        &mut self,
+        source: &str,
+        ranges: &[Range<usize>],
+        restart: usize,
+    ) -> (&[SourceToken], usize) {
+        if ranges.is_empty() {
+            let restart = if self.protected.is_empty() {
+                restart
+            } else {
+                0
+            };
+            self.protected.clear();
+            self.projected.clear();
+            return (
+                &self.raw,
+                self.raw.partition_point(|token| token.span.end <= restart),
+            );
+        }
+        let common = self
+            .protected
+            .iter()
+            .zip(ranges)
+            .take_while(|(old, new)| old == new)
+            .count();
+        if restart == source.len() && common == ranges.len() && common == self.protected.len() {
+            return (&self.projected, self.projected.len());
+        }
+        let change = self
+            .protected
+            .get(common)
+            .into_iter()
+            .chain(ranges.get(common))
+            .fold(restart, |at, range| at.min(range.start));
+        let keep = self
+            .projected
+            .partition_point(|token| token.span.end < change);
+        self.projected.truncate(keep);
+        self.protected.truncate(common);
+        self.protected.extend_from_slice(&ranges[common..]);
+        project_tail(source, ranges, &self.raw, &mut self.projected);
+        (&self.projected, keep)
+    }
+}
+
 impl Deref for LexicalIndex {
     type Target = [SourceToken];
 
@@ -270,6 +525,13 @@ pub(crate) struct SourceTokens<'a> {
     ranges: &'a [Range<usize>],
     pub(crate) position: usize,
     protected_index: usize,
+}
+
+fn text_delimiter(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\\' | b'%' | b'{' | b'}' | b'\r' | b'\n' | b' ' | b'\t' | b'='
+    )
 }
 
 impl<'a> SourceTokens<'a> {
@@ -359,12 +621,7 @@ impl Iterator for SourceTokens<'_> {
                 }
                 _ => {
                     pos += 1;
-                    while pos < limit
-                        && !matches!(
-                            source.as_bytes()[pos],
-                            b'\\' | b'%' | b'{' | b'}' | b'\r' | b'\n' | b' ' | b'\t' | b'='
-                        )
-                    {
+                    while pos < limit && !text_delimiter(source.as_bytes()[pos]) {
                         pos += 1;
                     }
                     SourceTokenKind::Text

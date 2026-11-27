@@ -61,6 +61,7 @@ pub(super) enum ConditionalMeaning {
 #[derive(Default)]
 pub(super) struct ConditionalBindings {
     scopes: Vec<ConditionalBindingScope>,
+    names: crate::name_filter::NameFilter,
     depth: usize,
     global: bool,
 }
@@ -77,11 +78,12 @@ impl ConditionalBindings {
 
     pub(super) fn meaning(&self, name: &str, config: &Config) -> ConditionalMeaning {
         let name = canonical_condition_control(name);
-        if let Some(meaning) = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.values.get(name))
+        if self.names.may_contain(name)
+            && let Some(meaning) = self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.values.get(name))
         {
             return *meaning;
         }
@@ -101,10 +103,12 @@ impl ConditionalBindings {
     }
 
     pub(super) fn assigned(&self, name: &str) -> bool {
-        self.scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.values.contains_key(name))
+        self.names.may_contain(name)
+            && self
+                .scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.values.contains_key(name))
     }
 
     pub(super) fn enter(&mut self) {
@@ -123,6 +127,7 @@ impl ConditionalBindings {
     }
 
     pub(super) fn assign(&mut self, name: &str, meaning: ConditionalMeaning, global: bool) {
+        self.names.insert(name);
         let depth = if global { 0 } else { self.depth };
         let scope = if global {
             for scope in &mut self.scopes {
@@ -168,7 +173,7 @@ impl ConditionalBindings {
         config: &Config,
         uncertain: bool,
     ) {
-        let base = name.trim_end_matches('*');
+        let base = super::unstarred(name);
         if base == "global" {
             self.global = true;
             return;
@@ -517,11 +522,10 @@ pub(super) fn literal_numeric_condition(
     end: usize,
     bindings: &ConditionalBindings,
 ) -> Option<(ConditionalMeaning, usize)> {
-    if bindings.assigned(name) {
-        return None;
-    }
     let dimensions = matches!(name, "ifdim" | "ifabsdim" | "ifpdfabsdim");
-    if !dimensions && !matches!(name, "ifnum" | "ifabsnum" | "ifpdfabsnum" | "ifodd") {
+    if !dimensions && !matches!(name, "ifnum" | "ifabsnum" | "ifpdfabsnum" | "ifodd")
+        || bindings.assigned(name)
+    {
         return None;
     }
     let read = |start| {

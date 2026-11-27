@@ -40,8 +40,13 @@ impl CommandSpec {
 
 macro_rules! specifications {
     ($( $($name:literal)|+ => ($shape:literal, $domains:literal, $prefix:literal) ),+ $(,)?) => {
+        macro_rules! command_names {
+            () => { $( $($name)|+ )|+ };
+        }
+        pub(super) use command_names;
+
         pub(super) fn specification(name: &str) -> Option<super::CommandSpec> {
-            Some(match name.trim_end_matches('*') {
+            Some(match crate::syntax::unstarred(name) {
                 $( $($name)|+ => super::CommandSpec::new($shape, $domains, $prefix), )+
                 _ => return None,
             })
@@ -86,10 +91,11 @@ use unit_command_grammar as units;
 macro_rules! domains {
     ($($module:ident),+ $(,)?) => {
         fn specification(name: &str) -> Option<CommandSpec> {
-            $( if let Some(specification) = $module::specification(name) {
-                return Some(specification);
-            } )+
-            None
+            let name = crate::syntax::unstarred(name);
+            match name {
+                $( $module::command_names!() => $module::specification(name), )+
+                _ => None,
+            }
         }
 
         pub(crate) fn add_command_rules(commands: &mut BTreeMap<String, CommandRule>) {
@@ -125,10 +131,6 @@ pub(crate) fn is_math_environment(name: &str) -> bool {
 
 pub(crate) fn environment_for_command(name: &str) -> Option<&str> {
     arrows::environment_for_command(name)
-}
-
-pub(crate) fn command_signature(_source: &str, name: &str, _cursor: usize) -> Option<&'static str> {
-    specification(name).map(|specification| specification.shape)
 }
 
 pub(crate) fn math_signature(name: &str) -> Option<math::Signature> {

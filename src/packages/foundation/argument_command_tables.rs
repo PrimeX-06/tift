@@ -3,7 +3,7 @@
 macro_rules! argument_commands {
     ($( $($name:literal)|+ => ($shape:literal, $data:literal) ),+ $(,)?) => {
         pub(super) fn specification(name: &str) -> Option<(&'static str, &'static str)> {
-            Some(match name.trim_end_matches('*') {
+            Some(match crate::syntax::unstarred(name) {
                 $( $($name)|+ => ($shape, $data), )+
                 _ => return None,
             })

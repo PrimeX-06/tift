@@ -308,17 +308,66 @@ impl Signature {
         Some(ranges)
     }
 
-    pub(crate) fn literal_ranges(
-        &self,
-        source: &str,
-        body: Range<usize>,
-    ) -> Option<Vec<Range<usize>>> {
+    pub(crate) fn literal_ranges(&self, source: &str, body: Range<usize>) -> Vec<Range<usize>> {
+        if let [slot] = self.slots.as_ref()
+            && matches!(slot.kind, Kind::Mandatory)
+        {
+            let start = if slot.skip_space {
+                trivia::skip_until(source, body.start, body.end)
+            } else {
+                body.start
+            };
+            if source.as_bytes().get(start) != Some(&b'\\') {
+                return Vec::new();
+            }
+        }
         let mut ranges = Vec::new();
-        self.scan(source, body, |argument, literal| {
+        let end = self.scan(source, body, |argument, literal| {
             if literal {
                 ranges.push(argument.range);
             }
-        })?;
+        });
+        if end.is_none() {
+            ranges.clear();
+        }
+        ranges
+    }
+
+    pub(crate) fn masked_ranges(
+        &self,
+        source: &str,
+        start: usize,
+        mask: u16,
+    ) -> Option<Vec<Range<usize>>> {
+        let mut ranges = Vec::new();
+        let mut previous = start;
+        for argument in self.slot_ranges(source, start..source.len())? {
+            let range = argument.range;
+            let gap = &source[previous..range.start];
+            let operand = &source[range.clone()];
+            if gap
+                .split_inclusive('\n')
+                .skip(1)
+                .any(|line| line.ends_with('\n') && line.trim().is_empty())
+                || gap.contains("^^")
+                || source[range.start..].starts_with("^^")
+                || range == argument.body
+                    && operand.strip_prefix('\\').is_some_and(|name| {
+                        name.chars().count() > 1
+                            && !name.bytes().all(|byte| byte.is_ascii_alphabetic())
+                    })
+                || source.as_bytes()[range.start] == b'['
+                    && argument.body.start == range.start + 1
+                    && source[argument.body.clone()].contains(']')
+                    && until_end(source, argument.body.start, range.end, "]") != Some(range.end)
+            {
+                return None;
+            }
+            previous = range.end;
+            if mask & (1 << argument.slot) != 0 {
+                ranges.push(range);
+            }
+        }
         Some(ranges)
     }
 

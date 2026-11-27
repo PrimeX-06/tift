@@ -51,9 +51,17 @@ pub(crate) fn foreach_binding(
 
 /// Literal argument grammars at the scanner's current TeX scope. An unknown
 /// declaration shadows an earlier grammar until its defining scope closes.
+#[derive(Default)]
 pub(super) struct SignatureBindings {
-    scopes: Vec<[std::collections::HashSet<String>; 2]>,
+    depth: usize,
+    scopes: Vec<SignatureScope>,
+    names: [crate::name_filter::NameFilter; 2],
     values: [std::collections::HashMap<String, Vec<ScopedSignature>>; 2],
+}
+
+struct SignatureScope {
+    depth: usize,
+    names: std::collections::HashSet<(usize, String)>,
 }
 
 struct ScopedSignature {
@@ -61,6 +69,7 @@ struct ScopedSignature {
     binding: Option<BoundSignature>,
     inline_code: Option<crate::code_package_syntax::GeneratedInlineKind>,
     delimited: Option<DelimitedReader>,
+    restart: Option<Box<crate::source_model::Replacement>>,
 }
 
 struct BoundSignature {
@@ -70,56 +79,40 @@ struct BoundSignature {
     literal_slots: u16,
 }
 
-impl Default for SignatureBindings {
-    fn default() -> Self {
-        Self {
-            scopes: vec![Default::default()],
-            values: Default::default(),
-        }
-    }
-}
-
 impl SignatureBindings {
     pub(super) fn enter(&mut self) {
-        self.scopes.push(Default::default());
+        self.depth += 1;
     }
 
     pub(super) fn leave(&mut self) {
-        if self.scopes.len() > 1 {
-            let depth = self.scopes.len() - 1;
-            let names = self.scopes.pop().expect("local argument scope");
-            for (index, names) in names.into_iter().enumerate() {
-                for name in names {
-                    if let Some(values) = self.values[index].get_mut(&name) {
-                        if values.last().is_some_and(|value| value.depth == depth) {
-                            values.pop();
-                        }
-                        if values.is_empty() {
-                            self.values[index].remove(&name);
-                        }
+        if let Some(scope) = self.scopes.pop_if(|scope| scope.depth == self.depth) {
+            for (index, name) in scope.names {
+                if let Some(values) = self.values[index].get_mut(&name) {
+                    if values.last().is_some_and(|value| value.depth == self.depth) {
+                        values.pop();
+                    }
+                    if values.is_empty() {
+                        self.values[index].remove(&name);
                     }
                 }
             }
         }
+        self.depth = self.depth.saturating_sub(1);
     }
 
     pub(super) fn get(&self, environment: bool, name: &str) -> Option<&xparse::Signature> {
-        self.values[usize::from(environment)]
-            .get(name)?
-            .last()?
+        self.lookup(environment, name)?
             .binding
             .as_ref()
             .map(|binding| &binding.syntax)
     }
 
     pub(super) fn math_signature(&self, name: &str) -> Option<crate::packages::math::Signature> {
-        self.values[0].get(name)?.last()?.binding.as_ref()?.math
+        self.lookup(false, name)?.binding.as_ref()?.math
     }
 
     pub(super) fn literal(&self, name: &str) -> bool {
-        self.values[0]
-            .get(name)
-            .and_then(|values| values.last())
+        self.lookup(false, name)
             .and_then(|value| value.binding.as_ref())
             .is_some_and(|binding| binding.literal)
     }
@@ -155,9 +148,7 @@ impl SignatureBindings {
     }
 
     pub(super) fn literal_slots(&self, name: &str) -> u16 {
-        self.values[0]
-            .get(name)
-            .and_then(|values| values.last())
+        self.lookup(false, name)
             .and_then(|value| value.binding.as_ref())
             .map_or(0, |binding| binding.literal_slots)
     }
@@ -184,20 +175,27 @@ impl SignatureBindings {
             .and_then(|value| value.binding.as_mut())
         {
             binding.literal = command.literal_arguments;
+            binding.literal_slots = command.literal_slots;
         }
     }
 
     pub(super) fn contains(&self, environment: bool, name: &str) -> bool {
-        self.values[usize::from(environment)].contains_key(name)
+        self.lookup(environment, name).is_some()
+    }
+
+    #[inline]
+    fn lookup(&self, environment: bool, name: &str) -> Option<&ScopedSignature> {
+        let index = usize::from(environment);
+        if !self.names[index].may_contain(name) {
+            return None;
+        }
+        self.values[index].get(name)?.last()
     }
 
     pub(super) fn copied_verb(&self, name: &str) -> bool {
-        self.values[0]
-            .get(name)
-            .and_then(|values| values.last())
-            .map_or(name == "verb", |value| {
-                matches!(value.delimited, Some(DelimitedReader::CopiedVerb))
-            })
+        self.lookup(false, name).map_or(name == "verb", |value| {
+            matches!(value.delimited, Some(DelimitedReader::CopiedVerb))
+        })
     }
 
     pub(super) fn mark_copied_verb(&mut self, name: &str) {
@@ -213,6 +211,14 @@ impl SignatureBindings {
         let Some(binding) = self.values[0].get_mut(name).and_then(|v| v.last_mut()) else {
             return;
         };
+        if body.contains(r"\end") || body.trim_start().starts_with('\\') {
+            binding.restart = binding
+                .binding
+                .as_ref()
+                .and_then(|b| b.syntax.compact())
+                .and_then(|shape| crate::source_model::Replacement::reader_restart(&shape, body))
+                .map(Box::new);
+        }
         if !body.contains("##1#")
             && !body.contains(r"\begingroup")
             && !body.contains(r"\expandafter")
@@ -227,6 +233,46 @@ impl SignatureBindings {
         binding.delimited = DelimitedReader::from_body(body, &shape);
     }
 
+    pub(super) fn restart_meaning(
+        &self,
+        name: &str,
+        outer: bool,
+    ) -> Option<&crate::source_model::Replacement> {
+        let environment = name.strip_prefix("environment:");
+        let values =
+            self.values[usize::from(environment.is_some())].get(environment.unwrap_or(name))?;
+        let mut entries = values.iter().rev();
+        let value = entries.next()?;
+        let value = if outer && value.depth == self.depth {
+            entries.next()?
+        } else {
+            value
+        };
+        Some(
+            value
+                .restart
+                .as_deref()
+                .unwrap_or(&crate::source_model::Replacement::Unknown),
+        )
+    }
+
+    pub(super) fn copy_restart(&self, name: &str) -> Option<Box<crate::source_model::Replacement>> {
+        self.values[0].get(name)?.last()?.restart.clone()
+    }
+
+    pub(super) fn set_copied_restart(
+        &mut self,
+        name: &str,
+        restart: Option<Box<crate::source_model::Replacement>>,
+    ) {
+        if let Some(value) = self.values[0]
+            .get_mut(name)
+            .and_then(|entries| entries.last_mut())
+        {
+            value.restart = restart;
+        }
+    }
+
     pub(super) fn delimited_end<'a>(
         &'a self,
         source: &str,
@@ -237,7 +283,7 @@ impl SignatureBindings {
         let mut raw = false;
         let mut remaining = self.values[0].len();
         while remaining > 0 {
-            let reader = self.values[0].get(name)?.last()?.delimited.as_ref()?;
+            let reader = self.lookup(false, name)?.delimited.as_ref()?;
             match reader {
                 DelimitedReader::CopiedVerb => return super::inline_end(source, "verb", at),
                 DelimitedReader::PercentGroupForward(target) => {
@@ -302,7 +348,7 @@ impl SignatureBindings {
         &self,
         name: &str,
     ) -> Option<crate::code_package_syntax::GeneratedInlineKind> {
-        self.values[0].get(name)?.last()?.inline_code
+        self.lookup(false, name)?.inline_code
     }
 
     pub(super) fn assign_inline_code(
@@ -328,7 +374,8 @@ impl SignatureBindings {
         global: bool,
     ) {
         let index = usize::from(environment);
-        let depth = if global { 0 } else { self.scopes.len() - 1 };
+        self.names[index].insert(&name);
+        let depth = if global { 0 } else { self.depth };
         let values = self.values[index].entry(name.clone()).or_default();
         let binding = signature.map(|syntax| BoundSignature {
             syntax,
@@ -343,15 +390,29 @@ impl SignatureBindings {
             value.binding = binding;
             value.inline_code = None;
             value.delimited = None;
+            value.restart = None;
         } else {
             values.push(ScopedSignature {
                 depth,
                 binding,
                 inline_code: None,
                 delimited: None,
+                restart: None,
             });
+            if depth != 0 {
+                if self.scopes.last().is_none_or(|scope| scope.depth != depth) {
+                    self.scopes.push(SignatureScope {
+                        depth,
+                        names: Default::default(),
+                    });
+                }
+                self.scopes
+                    .last_mut()
+                    .expect("local argument scope")
+                    .names
+                    .insert((index, name));
+            }
         }
-        self.scopes[depth][index].insert(name);
     }
 }
 

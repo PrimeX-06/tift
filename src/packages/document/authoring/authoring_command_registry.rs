@@ -13,8 +13,14 @@ macro_rules! commands {
     };
 }
 
+#[path = "ifdraft_branch.rs"]
+mod ifdraft_branch;
+pub(crate) use ifdraft_branch::Ifdraft;
 #[path = "review_annotation_grammar.rs"]
 mod review_annotation_grammar;
+pub(crate) use review::{
+    disabled_missingfigure_end, explicitly_disables_todonotes, missingfigure_binding_uncertain,
+};
 use review_annotation_grammar as review;
 #[path = "theorem_environment_grammar.rs"]
 mod theorem_environment_grammar;

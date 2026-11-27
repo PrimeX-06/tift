@@ -1,9 +1,10 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -14,8 +15,16 @@ use tift::{CompiledConfig, Config, FileKind};
 use super::config_io::absolute;
 use super::project_cache::ProjectCache;
 use super::source_encoding::SourceFile;
+#[path = "project_telemetry.rs"]
+mod telemetry;
+use telemetry::{ProjectMetrics, ProjectReports, ProjectTrace};
+
+#[path = "project_context/protection_run.rs"]
+mod protection_run;
+use protection_run::ProtectionRun;
 
 const LARGE_PROJECT_PREFIX: usize = 32 * 1024;
+const MAX_INPUT_DEPTH: usize = 128;
 
 enum StoredSource {
     Decoded(Arc<SourceFile>),
@@ -53,7 +62,15 @@ type ImportSlot = OnceLock<Result<Arc<ImportSource>, String>>;
 struct ImportSource {
     text: Arc<String>,
     candidates: Vec<Input>,
-    loaders: HashMap<usize, (String, usize)>,
+    loaders: OnceLock<HashMap<usize, (String, usize)>>,
+}
+
+impl ImportSource {
+    fn loader_at(&self, start: usize) -> Option<&(String, usize)> {
+        self.loaders
+            .get_or_init(|| tift::source_model::SourceModel::loader_occurrences(&self.text))
+            .get(&start)
+    }
 }
 
 impl Sources {
@@ -93,15 +110,10 @@ impl Sources {
                 None => Arc::clone(&self.read(path)?.text),
             };
             let candidates: Vec<_> = input_candidates(&text).collect();
-            let loaders = if candidates.is_empty() {
-                HashMap::new()
-            } else {
-                tift::source_model::SourceModel::loader_occurrences(&text)
-            };
             Ok(Arc::new(ImportSource {
                 text,
                 candidates,
-                loaders,
+                loaders: OnceLock::new(),
             }))
         })
         .clone()
@@ -129,13 +141,20 @@ pub(super) enum ProjectDependency {
 pub(super) struct ProjectSnapshot {
     sources: Arc<Sources>,
     cache_enabled: bool,
+    reports: Option<Box<ProjectReports>>,
 }
 
 impl ProjectSnapshot {
-    pub(super) fn new(cache_enabled: bool) -> Self {
+    pub(super) fn new(cache_enabled: bool, trace: bool) -> Self {
         Self {
             cache_enabled,
+            reports: trace.then(Box::default),
             ..Self::default()
+        }
+    }
+    pub(super) fn report(&self) {
+        if let Some(reports) = &self.reports {
+            reports.report();
         }
     }
     pub(super) fn read(&self, path: &Path) -> Result<Arc<SourceFile>, String> {
@@ -183,35 +202,90 @@ impl ProjectSnapshot {
     pub(super) fn build(
         &self,
         dependency: &ProjectDependency,
-        mut base: Arc<CompiledConfig>,
+        base: Arc<CompiledConfig>,
         selected: HashSet<PathBuf>,
     ) -> Result<PreparedProject, String> {
+        self.build_inner(dependency, base, selected, None)
+    }
+
+    pub(super) fn build_streaming(
+        &self,
+        dependency: &ProjectDependency,
+        base: Arc<CompiledConfig>,
+        selected: HashSet<PathBuf>,
+        ready: &mut dyn FnMut(&Path, Arc<CompiledConfig>),
+    ) -> Result<PreparedProject, String> {
+        self.build_inner(dependency, base, selected, Some(ready))
+    }
+
+    fn build_inner(
+        &self,
+        dependency: &ProjectDependency,
+        mut base: Arc<CompiledConfig>,
+        selected: HashSet<PathBuf>,
+        mut ready: Option<&mut FileReady<'_>>,
+    ) -> Result<PreparedProject, String> {
         let mut context = self.context();
+        let compiled_states = CompiledStates::default();
         let graph = match dependency {
             ProjectDependency::Root(root) => {
                 let mut graph = InputGraph {
                     selected,
+                    metrics: self.reports.as_ref().map(|_| ProjectMetrics::default()),
+                    trace: self.reports.as_ref().map(|_| ProjectTrace::new()),
                     ..Default::default()
                 };
                 if self.cache_enabled && base.config.cache.enabled {
                     graph.cache_root = Some(root.clone());
                 }
                 let source = self.sources.import(root, None)?;
-                context.expand_inputs(
-                    root,
-                    source,
-                    root,
-                    &base.config,
-                    &mut HashSet::new(),
-                    &mut graph,
-                )?;
-                if base.config.cache.enabled {
-                    graph.fingerprint = Some(blake3::hash(graph.source.as_bytes()));
+                let expand = |schedule: Option<&dyn Fn(Arc<ProtectionRun>)>| {
+                    let result = context.expand_inputs(
+                        root,
+                        source,
+                        &base.config,
+                        &mut graph,
+                        schedule,
+                        &mut |path, state| {
+                            if let Some(ready) = ready.as_mut()
+                                && let Some(options) = &state.options
+                                && let Ok(config) = compiled_states.resolve(
+                                    &base,
+                                    options.syntax.clone(),
+                                    options.protect.clone(),
+                                    Some(state),
+                                )
+                            {
+                                ready(path, config);
+                            }
+                        },
+                    );
+                    if let Some(run) = &graph.protection_run {
+                        run.cancel();
+                    }
+                    result
+                };
+                if rayon::current_thread_index().is_some() && rayon::current_num_threads() >= 3 {
+                    rayon::in_place_scope_fifo(|scope| {
+                        expand(Some(&|run| scope.spawn_fifo(move |_| run.fill())))
+                    })?;
+                } else {
+                    expand(None)?;
                 }
+                let fingerprint = (self.cache_enabled && base.config.cache.enabled)
+                    .then(|| graph.full_hash.of(&graph.source));
                 if let Some(cache) = graph.cache.take() {
                     cache.flush();
                 }
-                Some(graph)
+                if let Some(reports) = &self.reports {
+                    reports.finish(root, &mut graph);
+                }
+                Some(PreparedGraph {
+                    source: graph.source,
+                    files: graph.files,
+                    preamble_end: graph.preamble_end,
+                    fingerprint,
+                })
             }
             ProjectDependency::Siblings(directory) => {
                 base = context.sibling_lists(directory, base)?;
@@ -222,7 +296,8 @@ impl ProjectSnapshot {
         Ok(PreparedProject {
             base,
             graph,
-            compiled_states: Mutex::default(),
+            compiled_states,
+            trace: self.reports.is_some(),
         })
     }
 
@@ -241,17 +316,55 @@ impl ProjectSnapshot {
             .slot(&path)
             .set(Ok(StoredSource::Decoded(Arc::clone(input))));
         let dependency = self.dependency(&path, &input.text, &config, inputs)?;
-        self.build(&dependency, config, HashSet::from([path.clone()]))?
-            .for_source(&path, &input.text)
+        let prepared = self.build(&dependency, config, HashSet::from([path.clone()]))?;
+        self.report();
+        prepared.for_source(&path, &input.text)
     }
 }
 
 type CompiledStateSlot = Arc<OnceLock<Result<Arc<CompiledConfig>, String>>>;
+type FileReady<'a> = dyn FnMut(&Path, Arc<CompiledConfig>) + 'a;
+
+#[derive(Default)]
+struct CompiledStates(Mutex<HashMap<(SyntaxConfig, ProtectConfig), CompiledStateSlot>>);
+
+impl CompiledStates {
+    fn resolve(
+        &self,
+        base: &Arc<CompiledConfig>,
+        mut syntax: SyntaxConfig,
+        protect: ProtectConfig,
+        file: Option<&FileState>,
+    ) -> Result<Arc<CompiledConfig>, String> {
+        if let Some(file) = file {
+            file.apply_imports(&mut syntax, &base.config.syntax);
+        }
+        if syntax == base.config.syntax && protect == base.config.protect {
+            return Ok(Arc::clone(base));
+        }
+        let key = (syntax.clone(), protect.clone());
+        let slot = Arc::clone(self.0.lock().unwrap().entry(key).or_default());
+        slot.get_or_init(|| {
+            base.with_project_syntax(syntax, protect)
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+    }
+}
 
 pub(super) struct PreparedProject {
     base: Arc<CompiledConfig>,
-    graph: Option<InputGraph>,
-    compiled_states: Mutex<HashMap<(SyntaxConfig, ProtectConfig), CompiledStateSlot>>,
+    graph: Option<PreparedGraph>,
+    compiled_states: CompiledStates,
+    trace: bool,
+}
+
+struct PreparedGraph {
+    source: SourceTape,
+    files: HashMap<PathBuf, FileState>,
+    preamble_end: Option<usize>,
+    fingerprint: Option<blake3::Hash>,
 }
 
 #[derive(Default)]
@@ -288,20 +401,68 @@ fn preceding_xetex_encoding(prefix: &str) -> Option<&str> {
 }
 
 #[derive(Default)]
+struct SourceTape {
+    full: String,
+    compact: Option<String>,
+    compacted: Vec<(usize, usize)>,
+}
+
+impl std::ops::Deref for SourceTape {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.full
+    }
+}
+
+impl SourceTape {
+    fn inference(&self) -> &str {
+        self.compact.as_deref().unwrap_or(&self.full)
+    }
+
+    fn inference_mut(&mut self) -> &mut String {
+        self.compact.as_mut().unwrap_or(&mut self.full)
+    }
+
+    fn append(&mut self, source: &str) {
+        self.full.push_str(source);
+        if let Some(compact) = &mut self.compact {
+            compact.push_str(source);
+        }
+    }
+
+    fn append_compacted(&mut self, source: &str) {
+        let compact = self.compact.get_or_insert_with(|| self.full.clone());
+        compact.push('\n');
+        self.full.push_str(source);
+        self.compacted.push((self.full.len(), compact.len()));
+    }
+
+    fn inference_boundary(&self, end: usize) -> usize {
+        let count = self.compacted.partition_point(|(full, _)| *full <= end);
+        match self.compacted[..count].last() {
+            Some(&(full, compact)) => compact + (end - full),
+            None => end,
+        }
+    }
+}
+
+#[derive(Default)]
 struct InputGraph {
     selected: HashSet<PathBuf>,
+    trace: Option<Box<ProjectTrace>>,
     cache_root: Option<PathBuf>,
     cache: Option<ProjectCache>,
     full_hash: PrefixHash,
     inference_hash: PrefixHash,
     index_history: blake3::Hasher,
     deferred_scans: Vec<usize>,
-    source: String,
-    fingerprint: Option<blake3::Hash>,
+    source: SourceTape,
     declaration_index: syntax::DeclarationIndex,
-    // Keep the full source for positions, restoration and error diagnostics.
-    // Independently neutral spans need only one newline in later inference.
-    inference_source: String,
+    alias_index: tift::source_model::ProjectAliasIndex,
+    protection_run: Option<Arc<ProtectionRun>>,
+    export_index: tift::source_model::ProjectExportIndex,
+    inferred_exports: Option<(usize, DeclarationSnapshot)>,
     // Literal binding targets, including definitions with unknown signatures.
     // Their calls may invalidate later dynamic names and must stay in history.
     binding_targets: HashSet<String>,
@@ -310,13 +471,7 @@ struct InputGraph {
     pending_snapshot: Option<(usize, Arc<DeclarationSnapshot>)>,
     export_boundary_end: usize,
 
-    file_ends: HashMap<PathBuf, usize>,
-    file_inference_ends: HashMap<PathBuf, usize>,
-    file_options: HashMap<PathBuf, Arc<Config>>,
-    alias_events: HashMap<PathBuf, Vec<tift::config::EnvironmentAliasEvent>>,
-    argument_events: HashMap<PathBuf, Vec<tift::config::EnvironmentArgumentEvent>>,
-    package_events: HashMap<PathBuf, Vec<tift::config::PackageLoadEvent>>,
-    command_events: HashMap<PathBuf, Vec<tift::config::CommandImportEvent>>,
+    files: HashMap<PathBuf, FileState>,
     preamble_end: Option<usize>,
     revision: u64,
     last_options: Option<DeclarationMemo>,
@@ -324,6 +479,82 @@ struct InputGraph {
     // historical policy refusal can retain the conservative false answer;
     // incomplete source must keep checking when later inputs complete it.
     boundary_policy_refused: bool,
+    metrics: Option<ProjectMetrics>,
+}
+
+struct FileState {
+    end: usize,
+    options: Option<Arc<Config>>,
+    entry: Arc<DeclarationSnapshot>,
+    imports: Vec<LoaderChange>,
+}
+
+struct LoaderChange {
+    at: usize,
+    loader: Option<(String, usize)>,
+    delta: DeclarationSnapshot,
+}
+
+fn changed_bindings<T: Clone + PartialEq>(
+    before: &BTreeMap<String, Option<T>>,
+    after: &BTreeMap<String, Option<T>>,
+) -> BTreeMap<String, Option<T>> {
+    after
+        .iter()
+        .filter(|(name, value)| before.get(*name) != Some(value))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .chain(
+            before
+                .keys()
+                .filter(|name| !after.contains_key(*name))
+                .map(|name| (name.clone(), None)),
+        )
+        .collect()
+}
+
+impl FileState {
+    fn apply_imports(&self, syntax: &mut SyntaxConfig, base: &SyntaxConfig) {
+        syntax.commands.clone_from(&base.commands);
+        syntax.inferred_environment_aliases.clear();
+        syntax.environment_alias_events.clear();
+        syntax.environment_argument_events.clear();
+        syntax.package_load_events.clear();
+        syntax.command_import_events.clear();
+        let updates = self
+            .imports
+            .iter()
+            .map(|change| (change.at, change.loader.clone(), &change.delta));
+        for (at, loader, delta) in std::iter::once((0, None, self.entry.as_ref())).chain(updates) {
+            syntax
+                .environment_alias_events
+                .push(tift::config::EnvironmentAliasEvent {
+                    at,
+                    loader: loader.clone(),
+                    aliases: delta.0.clone(),
+                });
+            syntax
+                .environment_argument_events
+                .push(tift::config::EnvironmentArgumentEvent {
+                    at,
+                    loader: loader.clone(),
+                    arguments: delta.1.clone(),
+                });
+            syntax
+                .package_load_events
+                .push(tift::config::PackageLoadEvent {
+                    at,
+                    loader: loader.clone(),
+                    packages: delta.2.clone(),
+                });
+            syntax
+                .command_import_events
+                .push(tift::config::CommandImportEvent {
+                    at,
+                    loader,
+                    commands: delta.3.clone(),
+                });
+        }
+    }
 }
 
 #[derive(Default)]
@@ -375,6 +606,13 @@ struct DeclarationMemo {
     independent_append_safe: bool,
     reader_settled: bool,
     compiled: Option<Arc<syntax::CompiledSyntax>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationBoundary {
+    Current,
+    BeforeSeparator,
+    RootEnd,
 }
 
 struct LiteralInputState {
@@ -433,30 +671,123 @@ struct ParsedInputs {
     protected_end: usize,
 }
 
+type ChildInput = (PathBuf, Result<Arc<ImportSource>, String>);
+
+struct PendingLoader {
+    children: std::vec::IntoIter<ChildInput>,
+    before: Option<Arc<DeclarationSnapshot>>,
+}
+
+struct InputFrame {
+    path: PathBuf,
+    file: Arc<ImportSource>,
+    capture: bool,
+    cursor: usize,
+    next: usize,
+    loaders: LoaderRun,
+    pending: Option<PendingLoader>,
+    entry: Arc<DeclarationSnapshot>,
+    imports: Vec<LoaderChange>,
+    before_separator: bool,
+}
+
 #[derive(Default)]
 struct LoaderRun {
     options: Option<Arc<Config>>,
     end: usize,
     verified: bool,
     document_start: Option<usize>,
+    ahead: bool,
 }
 
 impl LoaderRun {
+    fn supports_batch(options: &Config) -> bool {
+        options.syntax.special.is_empty()
+            && options.syntax.command_pattern.is_none()
+            && options.syntax.environment_pattern.is_none()
+            && options.syntax.condition_pattern.is_none()
+            && options.syntax.item_pattern.is_none()
+            && options.syntax.argument_between.is_none()
+    }
+
+    fn verify(candidates: &[Input], parsed: ParsedInputs) -> Option<Option<usize>> {
+        (parsed.protected_end <= candidates.first()?.span.start
+            && parsed
+                .inputs
+                .iter()
+                .rev()
+                .take(candidates.len())
+                .map(|item| &item.span)
+                .eq(candidates.iter().rev().map(|item| &item.span)))
+        .then_some(parsed.document_start)
+    }
+
+    fn same_options(&self, options: &Arc<Config>) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|prior| Arc::ptr_eq(prior, options))
+    }
+
+    fn snapshot_before_next(
+        &mut self,
+        file: &ImportSource,
+        next: usize,
+        graph: &mut InputGraph,
+        config: &Config,
+    ) -> Arc<DeclarationSnapshot> {
+        let Some(memo) = &graph.last_options else {
+            return graph.declaration_snapshot(config);
+        };
+        if next >= self.end
+            || memo.revision != graph.revision
+            || self.same_options(&memo.options)
+            || graph.declarations.is_some()
+            || graph
+                .pending_snapshot
+                .as_ref()
+                .is_some_and(|(end, _)| *end == graph.source.len())
+            || !Self::supports_batch(&memo.options)
+            || rayon::current_thread_index().is_none()
+            || rayon::current_num_threads() < 2
+        {
+            return graph.declaration_snapshot(config);
+        }
+        let Some(compiled) = memo.compiled.clone() else {
+            return graph.declaration_snapshot(config);
+        };
+        let options = Arc::clone(&memo.options);
+        let candidates = &file.candidates[next..self.end];
+        let prefix = &file.text[..file.candidates[self.end - 1].span.end];
+        let (snapshot, verified) = rayon::join(
+            || graph.declaration_snapshot(config),
+            || {
+                Self::verify(
+                    candidates,
+                    literal_inputs_with_syntax(prefix, &options, &compiled).ok()?,
+                )
+            },
+        );
+        if let Some(document_start) = verified {
+            self.options = Some(options);
+            self.document_start = document_start;
+            self.verified = true;
+            self.ahead = true;
+        }
+        snapshot
+    }
+
     fn locate(
         &mut self,
-        graph: &InputGraph,
+        graph: &mut InputGraph,
         file: &ImportSource,
         index: usize,
         options: &Arc<Config>,
     ) -> Option<Option<usize>> {
         let input = &file.candidates[index];
         let source = file.text.as_str();
-        let cached = index < self.end
-            && self
-                .options
-                .as_ref()
-                .is_some_and(|prior| Arc::ptr_eq(prior, options));
+        let cached = index < self.end && self.same_options(options);
         if !cached {
+            self.ahead = false;
             let mut end = index;
             let mut cursor = input.span.start;
             for candidate in &file.candidates[index..] {
@@ -486,30 +817,20 @@ impl LoaderRun {
             self.options = Some(Arc::clone(options));
             self.verified = false;
             if end > index + 1
-                && options.syntax.special.is_empty()
-                && options.syntax.command_pattern.is_none()
-                && options.syntax.environment_pattern.is_none()
-                && options.syntax.condition_pattern.is_none()
-                && options.syntax.item_pattern.is_none()
-                && options.syntax.argument_between.is_none()
+                && Self::supports_batch(options)
                 && let Ok(parsed) = graph.literal_inputs(&source[..cursor])
-                && parsed.protected_end <= input.span.start
-                && parsed
-                    .inputs
-                    .iter()
-                    .rev()
-                    .take(end - index)
-                    .map(|item| &item.span)
-                    .eq(file.candidates[index..end]
-                        .iter()
-                        .rev()
-                        .map(|item| &item.span))
+                && let Some(document_start) = Self::verify(&file.candidates[index..end], parsed)
             {
                 self.verified = true;
-                self.document_start = parsed.document_start;
+                self.document_start = document_start;
             }
         }
         if self.verified {
+            if std::mem::take(&mut self.ahead)
+                && let Some(metrics) = &mut graph.metrics
+            {
+                metrics.loader_ahead_hits += 1;
+            }
             return Some(self.document_start);
         }
         let parsed = graph.literal_inputs(&source[..input.span.end]).ok()?;
@@ -556,10 +877,6 @@ impl ProjectInputs {
 
 type DeclarationSnapshot = tift::source_model::ProjectExports;
 
-fn declaration_snapshot(source: &str, config: &Config) -> DeclarationSnapshot {
-    tift::source_model::SourceModel::project_exports(source, config)
-}
-
 impl InputGraph {
     fn checkpoint(&mut self, kind: u8, suffix: &str, config: &Config) -> Option<String> {
         if self.source.len() < LARGE_PROJECT_PREFIX {
@@ -573,7 +890,11 @@ impl InputGraph {
         if kind == 0 {
             return Some(cache.key(kind, &[full]));
         }
-        let inferred = self.inference_hash.of(&self.inference_source);
+        let inferred = self
+            .source
+            .compact
+            .as_ref()
+            .map_or(full, |source| self.inference_hash.of(source));
         Some(cache.key(
             kind,
             &[
@@ -586,11 +907,20 @@ impl InputGraph {
     }
 
     fn restore_index(&mut self, config: &Config) {
-        for end in self.deferred_scans.drain(..) {
+        for end in std::mem::take(&mut self.deferred_scans) {
+            let started = self.metrics.as_ref().map(|_| Instant::now());
             let _ = syntax::infer_declaration_config_indexed(
-                &self.inference_source[..end],
+                &self.source.inference()[..end],
                 config,
                 &mut self.declaration_index,
+            );
+            let work = self.declaration_index.scan_work();
+            let protection_bytes = self.declaration_index.protection_scan_bytes();
+            self.record_declaration_work(
+                end,
+                started.map(|start| start.elapsed()),
+                protection_bytes,
+                work,
             );
         }
     }
@@ -605,19 +935,63 @@ impl InputGraph {
             return Arc::clone(snapshot);
         }
         let key = self.checkpoint(0, "", config);
-        let (snapshot, boundary) = key
-            .as_ref()
-            .and_then(|key| self.cache.as_ref()?.get(key))
-            .unwrap_or_else(|| {
-                let state = (
-                    declaration_snapshot(&self.source, config),
-                    syntax::project_export_boundary(&self.source[self.export_boundary_end..]),
-                );
-                if let Some(key) = key {
-                    self.cache.as_mut().unwrap().put(key, &state);
+        let cached = key.as_ref().and_then(|key| self.cache.as_ref()?.get(key));
+        if cached.is_some()
+            && let Some(metrics) = &mut self.metrics
+        {
+            metrics.export_cache_hits += 1;
+        }
+        let (snapshot, boundary) = if let Some(state) = cached {
+            state
+        } else {
+            let started = self.metrics.as_ref().map(|_| Instant::now());
+            let exports = match self.inferred_exports.take() {
+                Some((end, exports)) if end == self.source.len() => exports,
+                _ => {
+                    let protection = if self.source.compact.is_none() {
+                        self.declaration_index.protected_prefix(&self.source)
+                    } else {
+                        None
+                    };
+                    let ahead = protection
+                        .is_none()
+                        .then(|| self.protection_run.as_ref()?.at(&self.source))
+                        .flatten();
+                    let protection = protection.or(ahead);
+                    let exports = self.export_index.snapshot(&self.source, config, protection);
+                    if let (Some(metrics), Some(started)) = (&mut self.metrics, started) {
+                        metrics.export_calls += 1;
+                        metrics.export_ahead_hits += usize::from(ahead.is_some());
+                        metrics.export_input_bytes += self.source.len();
+                        metrics.export_lexed_bytes += self.export_index.last_lexed_bytes();
+                        if protection.is_none() {
+                            metrics.export_protection_input_bytes += self.source.len();
+                        }
+                        metrics.export_elapsed += started.elapsed();
+                        eprintln!(
+                            "trace: project-export: end={}, raw-read={}, protection={}, elapsed={:.3} ms",
+                            self.source.len(),
+                            self.export_index.last_lexed_bytes(),
+                            if protection.is_some() {
+                                "shared"
+                            } else {
+                                "full"
+                            },
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    exports
                 }
-                state
-            });
+            };
+            let state = (
+                exports,
+                syntax::project_export_boundary(&self.source[self.export_boundary_end..]),
+            );
+            if let Some(key) = key {
+                self.cache.as_mut().unwrap().put(key, &state);
+            }
+            state
+        };
         let snapshot = Arc::new(snapshot);
         if boundary {
             if self.source.ends_with('\n') {
@@ -638,7 +1012,7 @@ impl InputGraph {
         options: &Arc<Config>,
     ) -> Option<String> {
         let original_length = self.source.len();
-        self.source.push_str(prefix);
+        self.source.full.push_str(prefix);
         let end = self.source.len();
         let previous = self.literal_inputs_index.take();
         let result = (|| {
@@ -675,26 +1049,60 @@ impl InputGraph {
             });
             expanded
         })();
-        self.source.truncate(original_length);
+        self.source.full.truncate(original_length);
         result.filter(|name| !name.is_empty() && !name.contains(['\\', '{', '}', '%', '#']))
     }
 
     fn append(&mut self, source: &str) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.append_calls += 1;
+            metrics.appended_bytes += source.len();
+        }
         self.record_binding_targets(source);
-        self.source.push_str(source);
-        self.inference_source.push_str(source);
+        self.source.append(source);
         self.revision = self.revision.wrapping_add(1);
     }
 
+    fn record_declaration_work(
+        &mut self,
+        input_bytes: usize,
+        elapsed: Option<Duration>,
+        protection_scan_bytes: usize,
+        (scan_bytes, incremental): (usize, bool),
+    ) {
+        let (Some(metrics), Some(elapsed)) = (&mut self.metrics, elapsed) else {
+            return;
+        };
+        metrics.declaration_calls += 1;
+        metrics.declaration_input_bytes += input_bytes;
+        metrics.declaration_scan_bytes += scan_bytes;
+        metrics.protection_scan_bytes += protection_scan_bytes;
+        metrics.declaration_incremental_calls += usize::from(incremental);
+        metrics.declaration_full_scans += usize::from(!incremental && scan_bytes > 0);
+        metrics.declaration_elapsed += elapsed;
+        eprintln!(
+            "trace: project-declarations: end={input_bytes}, reader-start={}, protection-bytes={protection_scan_bytes}, elapsed={:.3} ms",
+            input_bytes - scan_bytes.min(input_bytes),
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
     fn append_segment(&mut self, source: &str, neutral: bool) {
+        if self.declarations.is_none() {
+            self.append(source);
+            return;
+        }
         let whitespace = source.bytes().all(|byte| byte.is_ascii_whitespace());
         let stable = neutral && (whitespace || self.compaction_preserves_bindings(source));
         if !source.is_empty() && !stable {
             self.declarations = None;
         }
-        if stable && self.declarations.is_some() && source.len() >= 256 {
-            self.source.push_str(source);
-            self.inference_source.push('\n');
+        if stable && source.len() >= 256 {
+            if let Some(metrics) = &mut self.metrics {
+                metrics.append_calls += 1;
+                metrics.appended_bytes += source.len();
+            }
+            self.source.append_compacted(source);
             self.revision = self.revision.wrapping_add(1);
         } else {
             self.append(source);
@@ -866,35 +1274,139 @@ impl InputGraph {
     }
 
     fn infer(&mut self, path: &Path, config: &Config) -> Result<Arc<Config>, String> {
+        self.infer_boundary(path, config, DeclarationBoundary::Current)
+    }
+
+    fn infer_boundary(
+        &mut self,
+        path: &Path,
+        config: &Config,
+        location: DeclarationBoundary,
+    ) -> Result<Arc<Config>, String> {
         if let Some(memo) = &self.last_options
             && memo.revision == self.revision
         {
             return Ok(Arc::clone(&memo.options));
         }
 
-        let key = self.checkpoint(if self.boundary_policy_refused { 2 } else { 1 }, "", config);
+        let key_kind = match (location, self.boundary_policy_refused) {
+            (DeclarationBoundary::RootEnd, false) => 4,
+            (DeclarationBoundary::RootEnd, true) => 5,
+            (_, false) => 1,
+            (_, true) => 2,
+        };
+        let key = self.checkpoint(key_kind, "", config);
         if self.cache.is_some() || self.cache_root.is_some() {
             self.index_history
-                .update(&(self.inference_source.len() as u64).to_le_bytes());
+                .update(&(self.source.inference().len() as u64).to_le_bytes());
         }
         let cached: Option<(InferredSyntax, bool, bool, bool, bool)> =
             key.as_ref().and_then(|key| self.cache.as_ref()?.get(key));
+        if cached.is_some()
+            && let Some(metrics) = &mut self.metrics
+        {
+            metrics.declaration_cache_hits += 1;
+        }
         let (inferred, independent_append_safe, safe, refused, reader_settled) =
             if let Some((options, append, safe, refused, reader)) = cached {
-                self.deferred_scans.push(self.inference_source.len());
+                self.deferred_scans.push(self.source.inference().len());
                 (options.apply(config), append, safe, refused, reader)
             } else {
                 self.restore_index(config);
-                let result = syntax::infer_declaration_config_indexed(
-                    &self.inference_source,
-                    config,
-                    &mut self.declaration_index,
+                let started = self.metrics.as_ref().map(|_| Instant::now());
+                let mut reader_elapsed = None;
+                let result = if location == DeclarationBoundary::RootEnd {
+                    self.declaration_index
+                        .infer_without_exported_aliases(self.source.inference(), config)
+                } else if location == DeclarationBoundary::BeforeSeparator
+                    && self.declarations.is_none()
+                    && self.source.len() >= LARGE_PROJECT_PREFIX
+                    && rayon::current_thread_index().is_some()
+                    && rayon::current_num_threads() > 1
+                    && !self
+                        .cache
+                        .as_ref()
+                        .is_some_and(ProjectCache::has_saved_entries)
+                {
+                    let end = self.source.len();
+                    self.source.full.push('\n');
+                    let inferred_source = self
+                        .source
+                        .compact
+                        .as_deref()
+                        .unwrap_or(&self.source[..end]);
+                    let (result, (exports, export_elapsed, ahead)) = rayon::join(
+                        || {
+                            let result = self.declaration_index.infer_with_alias_index(
+                                inferred_source,
+                                config,
+                                &mut self.alias_index,
+                            );
+                            reader_elapsed = started.map(|start| start.elapsed());
+                            result
+                        },
+                        || {
+                            let started = self.metrics.as_ref().map(|_| Instant::now());
+                            let protection = self
+                                .protection_run
+                                .as_ref()
+                                .and_then(|run| run.at(&self.source));
+                            let exports =
+                                self.export_index.snapshot(&self.source, config, protection);
+                            (
+                                exports,
+                                started.map(|start| start.elapsed()),
+                                protection.is_some(),
+                            )
+                        },
+                    );
+                    self.inferred_exports = Some((self.source.len(), exports));
+                    if let (Some(metrics), Some(elapsed)) = (&mut self.metrics, export_elapsed) {
+                        metrics.export_calls += 1;
+                        metrics.export_input_bytes += self.source.len();
+                        metrics.export_ahead_hits += usize::from(ahead);
+                        metrics.export_protection_input_bytes +=
+                            usize::from(!ahead) * self.source.len();
+                        metrics.export_lexed_bytes += self.export_index.last_lexed_bytes();
+                        metrics.export_elapsed += elapsed;
+                    }
+                    self.source.full.truncate(end);
+                    result
+                } else if self.source.compact.is_none() {
+                    let mut exports = None;
+                    let result = self.declaration_index.infer_with_export_index(
+                        &self.source,
+                        config,
+                        &mut self.export_index,
+                        &mut exports,
+                    );
+                    if let Some(exports) = exports {
+                        self.inferred_exports = Some((self.source.len(), exports));
+                        if let Some(metrics) = &mut self.metrics {
+                            metrics.export_lexed_bytes += self.export_index.last_lexed_bytes();
+                        }
+                    }
+                    result
+                } else {
+                    syntax::infer_declaration_config_indexed(
+                        self.source.inference(),
+                        config,
+                        &mut self.declaration_index,
+                    )
+                };
+                let work = self.declaration_index.scan_work();
+                let protection_bytes = self.declaration_index.protection_scan_bytes();
+                self.record_declaration_work(
+                    self.source.inference().len(),
+                    reader_elapsed.or_else(|| started.map(|start| start.elapsed())),
+                    protection_bytes,
+                    work,
                 );
                 // Re-run failures against the full source so error positions and the
                 // established diagnostic remain exact after neutral text compaction.
                 let (inferred, independent_append_safe, inferred_boundary) = result
                     .or_else(|error| {
-                        if self.inference_source.len() != self.source.len() {
+                        if self.source.compact.is_some() {
                             syntax::infer_declaration_config_with_reuse(&self.source, config)
                         } else {
                             Err(error)
@@ -906,7 +1418,7 @@ impl InputGraph {
 
                 let boundary = if self.boundary_policy_refused {
                     syntax::DeclarationReuseBoundary::PolicyRefused
-                } else if self.inference_source.len() == self.source.len() {
+                } else if self.source.compact.is_none() {
                     inferred_boundary
                 } else {
                     syntax::declaration_reuse_boundary_status(&self.source, config)
@@ -960,6 +1472,9 @@ impl InputGraph {
         path: &Path,
         config: &Config,
     ) -> Result<(Arc<Config>, bool), String> {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.prefix_calls += 1;
+        }
         if let Some(memo) = &self.last_options
             && memo.revision == self.revision
         {
@@ -969,6 +1484,11 @@ impl InputGraph {
                 return Ok((Arc::clone(&memo.options), neutral));
             }
         }
+        let preview_started = self.metrics.as_ref().map(|_| Instant::now());
+        if let Some(metrics) = &mut self.metrics {
+            metrics.prefix_preview_calls += 1;
+            metrics.prefix_input_bytes += suffix.len();
+        }
         // Preview the next input's prefix without copying the cumulative graph.
         // The memo is untouched, and truncation restores its immutable revision.
         let key = self.checkpoint(3, suffix, config);
@@ -976,37 +1496,43 @@ impl InputGraph {
             .as_ref()
             .and_then(|key| self.cache.as_ref()?.get::<InferredSyntax>(key))
         {
+            if let (Some(started), Some(metrics)) = (preview_started, &mut self.metrics) {
+                metrics.prefix_elapsed += started.elapsed();
+            }
             return Ok((Arc::new(options.apply(config)), false));
         }
         self.restore_index(config);
-        let length = self.inference_source.len();
-        self.inference_source.push_str(suffix);
+        let length = self.source.inference().len();
+        self.source.inference_mut().push_str(suffix);
 
         let mut preview_index = self.declaration_index.clone();
         let inferred = syntax::infer_declaration_config_indexed(
-            &self.inference_source,
+            self.source.inference(),
             config,
             &mut preview_index,
         )
         .map(|(options, _, _)| options)
         .or_else(|error| {
-            if length != self.source.len() {
+            if self.source.compact.is_some() {
                 let full_length = self.source.len();
-                self.source.push_str(suffix);
+                self.source.full.push_str(suffix);
                 let result = syntax::infer_declaration_config(&self.source, config);
-                self.source.truncate(full_length);
+                self.source.full.truncate(full_length);
                 result
             } else {
                 Err(error)
             }
         });
 
-        self.inference_source.truncate(length);
+        self.source.inference_mut().truncate(length);
         if let (Some(key), Ok(options)) = (key, &inferred) {
             self.cache
                 .as_mut()
                 .unwrap()
                 .put(key, &InferredSyntax::from_config(options));
+        }
+        if let (Some(started), Some(metrics)) = (preview_started, &mut self.metrics) {
+            metrics.prefix_elapsed += started.elapsed();
         }
         inferred
             .map(|options| (Arc::new(options), false))
@@ -1149,48 +1675,98 @@ impl ProjectContext {
 
     fn expand_inputs(
         &mut self,
-        path: &Path,
-        input_source: Arc<ImportSource>,
         root: &Path,
+        input_source: Arc<ImportSource>,
         config: &Config,
-        stack: &mut HashSet<PathBuf>,
         graph: &mut InputGraph,
+        schedule: Option<&dyn Fn(Arc<ProtectionRun>)>,
+        ready: &mut dyn FnMut(&Path, &FileState),
     ) -> Result<(), String> {
-        if stack.len() >= 128 || !stack.insert(path.to_path_buf()) {
-            return Ok(());
+        let mut active = HashSet::from([root.to_path_buf()]);
+        let mut stack = vec![InputFrame::new(
+            root.to_path_buf(),
+            input_source,
+            false,
+            config,
+            graph,
+        )];
+        while let Some(frame) = stack.last_mut() {
+            if let Some(pending) = &mut frame.pending {
+                if let Some((child, input)) = pending.children.next() {
+                    let before_separator = frame.capture && pending.children.len() == 0;
+                    active.insert(child.clone());
+                    stack.push(InputFrame::new(
+                        child,
+                        input?,
+                        before_separator,
+                        config,
+                        graph,
+                    ));
+                } else {
+                    let before = frame.pending.take().unwrap().before;
+                    frame.finish_loader(before, config, graph);
+                }
+            } else if let Some(pending) =
+                self.next_loader(frame, root, config, &active, graph, schedule)?
+            {
+                frame.pending = Some(pending);
+            } else {
+                let frame = stack.pop().unwrap();
+                active.remove(&frame.path);
+                frame.finish(root, config, graph, ready)?;
+            }
         }
-        let source = input_source.text.as_str();
-        let loader_occurrences = &input_source.loaders;
-        let capture = graph.selected.contains(path) && !graph.file_ends.contains_key(path);
+        Ok(())
+    }
+}
+
+impl InputFrame {
+    fn new(
+        path: PathBuf,
+        file: Arc<ImportSource>,
+        before_separator: bool,
+        config: &Config,
+        graph: &mut InputGraph,
+    ) -> Self {
+        graph.trace_enter();
+        let capture = graph.selected.contains(&path) && !graph.files.contains_key(&path);
         let entry = if capture || graph.source.len() < LARGE_PROJECT_PREFIX {
             graph.declaration_snapshot(config)
         } else {
             Arc::default()
         };
-        let (entry_aliases, entry_arguments, entry_packages, entry_commands) = entry.as_ref();
-        let mut command_events = vec![tift::config::CommandImportEvent {
-            at: 0,
-            loader: None,
-            commands: entry_commands.clone(),
-        }];
-        let mut alias_events = vec![tift::config::EnvironmentAliasEvent {
-            at: 0,
-            loader: None,
-            aliases: entry_aliases.clone(),
-        }];
-        let mut argument_events = vec![tift::config::EnvironmentArgumentEvent {
-            at: 0,
-            loader: None,
-            arguments: entry_arguments.clone(),
-        }];
-        let mut package_events = vec![tift::config::PackageLoadEvent {
-            at: 0,
-            loader: None,
-            packages: entry_packages.clone(),
-        }];
-        let mut cursor = 0;
-        let mut loaders = LoaderRun::default();
-        for (index, input) in input_source.candidates.iter().enumerate() {
+        Self {
+            path,
+            file,
+            capture,
+            cursor: 0,
+            next: 0,
+            loaders: LoaderRun::default(),
+            pending: None,
+            entry,
+            imports: Vec::new(),
+            before_separator,
+        }
+    }
+}
+
+impl ProjectContext {
+    fn next_loader(
+        &mut self,
+        frame: &mut InputFrame,
+        root: &Path,
+        config: &Config,
+        active: &HashSet<PathBuf>,
+        graph: &mut InputGraph,
+        schedule: Option<&dyn Fn(Arc<ProtectionRun>)>,
+    ) -> Result<Option<PendingLoader>, String> {
+        let path = frame.path.as_path();
+        let input_source = &frame.file;
+        let source = input_source.text.as_str();
+        let cursor = frame.cursor;
+        while let Some(input) = input_source.candidates.get(frame.next) {
+            let index = frame.next;
+            frame.next += 1;
             let command = syntax::command_at(source, input.span.start)
                 .expect("input command")
                 .0;
@@ -1218,13 +1794,38 @@ impl ProjectContext {
             // environments whose definitions have not been imported yet.
             let options = graph.infer(path, config)?;
             let plain = input.plain_file(source, command);
-            let Some(document_start) = loaders.locate(graph, &input_source, index, &options) else {
+            let Some(document_start) = frame.loaders.locate(graph, input_source, index, &options)
+            else {
                 continue;
             };
             let (inferred, reusable_prefix) =
                 graph.prepare_prefix(&source[cursor..input.span.start], path, config)?;
             if inferred.syntax.commands.contains_key(command) {
                 continue;
+            }
+            if let Some(schedule) = schedule
+                && path == root
+                && frame.capture
+                && frame.loaders.verified
+                && frame.loaders.end >= index + 3
+                && graph.protection_run.is_none()
+                && graph.source.len() >= LARGE_PROJECT_PREFIX
+                && !graph
+                    .cache
+                    .as_ref()
+                    .is_some_and(ProjectCache::has_saved_entries)
+                && let Some(run) = ProtectionRun::from_cached_leaves(
+                    &graph.source,
+                    input_source,
+                    cursor,
+                    &input_source.candidates[index..frame.loaders.end],
+                    path,
+                    &self.sources,
+                    config,
+                )
+            {
+                schedule(Arc::clone(&run));
+                graph.protection_run = Some(run);
             }
             let children = if dynamic {
                 let name = graph.expand_input_name(
@@ -1248,7 +1849,7 @@ impl ProjectContext {
                     document_start.map(|start| graph.source.len() + start.saturating_sub(cursor));
             }
             graph.append_segment(&source[cursor..input.span.start], reusable_prefix);
-            let before = if capture || graph.source.len() < LARGE_PROJECT_PREFIX {
+            let before = if frame.capture || graph.source.len() < LARGE_PROJECT_PREFIX {
                 Some(graph.declaration_snapshot(config))
             } else {
                 graph.declarations.clone()
@@ -1263,10 +1864,10 @@ impl ProjectContext {
                         .as_ref()
                         .is_some_and(|snapshot| !snapshot.3.contains_key(command)),
             );
-            if stack.len() < 128 {
+            let ready = if active.len() < MAX_INPUT_DEPTH {
                 let children: Vec<_> = children
                     .into_iter()
-                    .filter(|child| !stack.contains(child))
+                    .filter(|child| !active.contains(child))
                     .collect();
                 let codec = preceding_xetex_encoding(&source[..input.span.start]);
                 // A multi-file loader exposes all child inputs at once. Only
@@ -1285,74 +1886,76 @@ impl ProjectContext {
                     });
                     (child, input)
                 };
-                let ready: Vec<_> = if children.len() > 1 && rayon::current_thread_index().is_some()
-                {
+                if children.len() > 1 && rayon::current_thread_index().is_some() {
                     children.into_par_iter().map(read).collect()
                 } else {
                     children.into_iter().map(read).collect()
-                };
-                for (child, input) in ready {
-                    self.expand_inputs(&child, input?, root, config, stack, graph)?;
                 }
-            }
-            graph.append_line("");
-            cursor = input.span.end;
-            if !capture && graph.source.len() >= LARGE_PROJECT_PREFIX {
-                continue;
-            }
-            let Some(before) = before else {
-                continue;
+            } else {
+                Vec::new()
             };
-            let after = graph.declaration_snapshot(config);
-            if Arc::ptr_eq(&before, &after) {
-                continue;
-            }
-            let (before_aliases, before_arguments, before_packages, before_commands) =
-                before.as_ref();
-            let (after_aliases, after_arguments, after_packages, after_commands) = after.as_ref();
-            let commands = after_commands
-                .iter()
-                .filter(|(name, command)| before_commands.get(*name) != Some(command))
-                .map(|(name, command)| (name.clone(), command.clone()))
-                .collect();
-            command_events.push(tift::config::CommandImportEvent {
-                at: input.span.end,
-                loader: loader_occurrences.get(&input.span.start).cloned(),
-                commands,
-            });
-            let changes = before_aliases
-                .keys()
-                .chain(after_aliases.keys())
-                .filter(|name| before_aliases.get(*name) != after_aliases.get(*name))
-                .map(|name| (name.clone(), after_aliases.get(name).cloned().flatten()))
-                .collect();
-            alias_events.push(tift::config::EnvironmentAliasEvent {
-                at: input.span.end,
-                loader: loader_occurrences.get(&input.span.start).cloned(),
-                aliases: changes,
-            });
-            let changes = before_arguments
-                .keys()
-                .chain(after_arguments.keys())
-                .filter(|name| before_arguments.get(*name) != after_arguments.get(*name))
-                .map(|name| (name.clone(), after_arguments.get(name).cloned().flatten()))
-                .collect();
-            argument_events.push(tift::config::EnvironmentArgumentEvent {
-                at: input.span.end,
-                loader: loader_occurrences.get(&input.span.start).cloned(),
-                arguments: changes,
-            });
-            let packages = after_packages
-                .iter()
-                .filter(|(name, state)| before_packages.get(*name) != Some(state))
-                .map(|(name, state)| (name.clone(), *state))
-                .collect();
-            package_events.push(tift::config::PackageLoadEvent {
-                at: input.span.end,
-                loader: loader_occurrences.get(&input.span.start).cloned(),
-                packages,
-            });
+            return Ok(Some(PendingLoader {
+                children: ready.into_iter(),
+                before,
+            }));
         }
+        Ok(None)
+    }
+}
+
+impl InputFrame {
+    fn finish_loader(
+        &mut self,
+        before: Option<Arc<DeclarationSnapshot>>,
+        config: &Config,
+        graph: &mut InputGraph,
+    ) {
+        let input = &self.file.candidates[self.next - 1];
+        graph.append_line("");
+        self.cursor = input.span.end;
+        if !self.capture && graph.source.len() >= LARGE_PROJECT_PREFIX {
+            return;
+        }
+        let Some(before) = before else {
+            return;
+        };
+        let after = self
+            .loaders
+            .snapshot_before_next(&self.file, self.next, graph, config);
+        if !self.capture || Arc::ptr_eq(&before, &after) {
+            return;
+        }
+        let (before_aliases, before_arguments, before_packages, before_commands) = before.as_ref();
+        let (after_aliases, after_arguments, after_packages, after_commands) = after.as_ref();
+        let commands = after_commands
+            .iter()
+            .filter(|(name, command)| before_commands.get(*name) != Some(command))
+            .map(|(name, command)| (name.clone(), command.clone()))
+            .collect();
+        let aliases = changed_bindings(before_aliases, after_aliases);
+        let arguments = changed_bindings(before_arguments, after_arguments);
+        let packages = after_packages
+            .iter()
+            .filter(|(name, state)| before_packages.get(*name) != Some(state))
+            .map(|(name, state)| (name.clone(), *state))
+            .collect();
+        self.imports.push(LoaderChange {
+            at: input.span.end,
+            loader: self.file.loader_at(input.span.start).cloned(),
+            delta: (aliases, arguments, packages, commands),
+        });
+    }
+
+    fn finish(
+        self,
+        root: &Path,
+        config: &Config,
+        graph: &mut InputGraph,
+        ready: &mut dyn FnMut(&Path, &FileState),
+    ) -> Result<(), String> {
+        let path = self.path.as_path();
+        let source = self.file.text.as_str();
+        let cursor = self.cursor;
         if path == root && graph.preamble_end.is_none() && source.contains("document") {
             graph.infer(path, config)?;
             graph.preamble_end = graph
@@ -1362,43 +1965,44 @@ impl ProjectContext {
                 .map(|start| graph.source.len() + start.saturating_sub(cursor));
         }
         graph.append_line(&source[cursor..]);
-        if !graph.file_ends.contains_key(path) {
-            graph
-                .command_events
-                .insert(path.to_path_buf(), command_events);
-            graph.alias_events.insert(path.to_path_buf(), alias_events);
-            graph
-                .argument_events
-                .insert(path.to_path_buf(), argument_events);
-            graph
-                .package_events
-                .insert(path.to_path_buf(), package_events);
+        if !graph.files.contains_key(path) {
             // Retain the exact first-inclusion state. Incomplete file tails
             // keep lazy restoration; a later source may complete their reader.
-            if capture || path != root {
-                let _ = graph.infer(path, config);
+            if self.capture || path != root {
+                let location = if path == root {
+                    DeclarationBoundary::RootEnd
+                } else if self.before_separator {
+                    DeclarationBoundary::BeforeSeparator
+                } else {
+                    DeclarationBoundary::Current
+                };
+                let _ = graph.infer_boundary(path, config, location);
             }
-            graph
-                .file_ends
-                .insert(path.to_path_buf(), graph.source.len());
-            graph
-                .file_inference_ends
-                .insert(path.to_path_buf(), graph.inference_source.len());
             // Retain only a memo that already describes this exact first
             // inclusion. Invalidated suffixes keep lazy full inference, so a
             // chapter can still complete declarations from preceding inputs.
-            if let Some(memo) = &graph.last_options
-                && memo.revision == graph.revision
-            {
-                graph
-                    .file_options
-                    .insert(path.to_path_buf(), Arc::clone(&memo.options));
+            let memo = graph
+                .last_options
+                .as_ref()
+                .filter(|memo| memo.revision == graph.revision);
+            let options = memo.map(|memo| Arc::clone(&memo.options));
+            let state = FileState {
+                end: graph.source.len(),
+                options,
+                entry: self.entry,
+                imports: self.imports,
+            };
+            if self.capture && memo.is_some_and(|memo| memo.reader_settled || memo.safe) {
+                ready(path, &state);
             }
+            graph.files.insert(path.to_owned(), state);
         }
-        stack.remove(path);
+        graph.trace_exit(path, source.len());
         Ok(())
     }
+}
 
+impl ProjectContext {
     fn loader_paths(
         &mut self,
         names: &str,
@@ -1519,9 +2123,9 @@ impl ProjectContext {
                 ]
                 .iter()
                 .any(|word| text.contains(word)))
-            .then(|| Arc::clone(text))
+            .then(|| syntax::ListEnvironmentDependencies::from_source(text, &config))
         };
-        let sources: Vec<_> = if rayon::current_thread_index().is_some() && paths.len() > 1 {
+        let dependencies: Vec<_> = if rayon::current_thread_index().is_some() && paths.len() > 1 {
             paths.into_par_iter().filter_map(declarations).collect()
         } else {
             paths.into_iter().filter_map(declarations).collect()
@@ -1529,12 +2133,8 @@ impl ProjectContext {
         let mut known = config.config.syntax.list_environments.clone();
         loop {
             let before = known.len();
-            for source in &sources {
-                known.extend(syntax::infer_list_environments_with_config(
-                    source,
-                    &known,
-                    &config.config,
-                ));
+            for file in &dependencies {
+                known.extend(file.resolve(&known));
             }
             if known.len() == before {
                 break;
@@ -1553,9 +2153,26 @@ impl ProjectContext {
 }
 
 impl PreparedProject {
+    pub(super) fn input_graph(&self) -> Option<blake3::Hash> {
+        self.graph.as_ref().and_then(|graph| graph.fingerprint)
+    }
+
     /// Expand imports once in TeX execution order, then use the frozen
     /// declarations of each file independently.
     pub(super) fn for_source(&self, path: &Path, source: &str) -> Result<PreparedSource, String> {
+        let started = self.trace.then(Instant::now);
+        let result = self.prepare_source(path, source);
+        if let Some(started) = started {
+            eprintln!(
+                "trace: {}: project-config: elapsed={:.3} ms",
+                path.display(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        result
+    }
+
+    fn prepare_source(&self, path: &Path, source: &str) -> Result<PreparedSource, String> {
         let config = &self.base;
         let Some(graph) = &self.graph else {
             return Ok(PreparedSource {
@@ -1563,25 +2180,24 @@ impl PreparedProject {
                 input_graph: None,
             });
         };
-        let options = if let Some(options) = graph.file_options.get(path) {
-            Arc::clone(options)
-        } else if let Some(end) = graph.file_ends.get(path) {
-            let inference_end = graph.file_inference_ends[path];
-
-            Arc::new(
-                syntax::infer_declaration_config(
-                    &graph.inference_source[..inference_end],
-                    &config.config,
-                )
-                .or_else(|error| {
-                    if inference_end != *end {
-                        syntax::infer_declaration_config(&graph.source[..*end], &config.config)
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| format!("{}: project declarations: {error}", path.display()))?,
+        let file = graph.files.get(path);
+        let (syntax, protect) = if let Some(options) = file.and_then(|file| file.options.as_ref()) {
+            (options.syntax.clone(), options.protect.clone())
+        } else if let Some(file) = file {
+            let inference_end = graph.source.inference_boundary(file.end);
+            let options = syntax::infer_declaration_config(
+                &graph.source.inference()[..inference_end],
+                &config.config,
             )
+            .or_else(|error| {
+                if inference_end != file.end {
+                    syntax::infer_declaration_config(&graph.source[..file.end], &config.config)
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| format!("{}: project declarations: {error}", path.display()))?;
+            (options.syntax, options.protect)
         } else {
             // A not-yet-included chapter can use the explicit root's
             // preamble without importing unrelated chapters.
@@ -1590,46 +2206,16 @@ impl PreparedProject {
             declarations.push('\n');
             declarations.push_str(source);
 
-            Arc::new(
-                syntax::infer_declaration_config(&declarations, &config.config).map_err(
-                    |error| format!("{}: project declarations: {error}", path.display()),
-                )?,
-            )
+            let options = syntax::infer_declaration_config(&declarations, &config.config)
+                .map_err(|error| format!("{}: project declarations: {error}", path.display()))?;
+            (options.syntax, options.protect)
         };
-        let mut options = options.as_ref().clone();
-        if let Some(events) = graph.alias_events.get(path) {
-            options.syntax.inferred_environment_aliases.clear();
-            options.syntax.environment_alias_events = events.clone();
-        }
-        if let Some(events) = graph.argument_events.get(path) {
-            options.syntax.environment_argument_events = events.clone();
-        }
-        if let Some(events) = graph.package_events.get(path) {
-            options.syntax.package_load_events = events.clone();
-        }
-        if let Some(events) = graph.command_events.get(path) {
-            // Executed source bindings are applied at their loader and
-            // restored with TeX scope. Retain explicit user rules here.
-            options.syntax.commands = config.config.syntax.commands.clone();
-            options.syntax.command_import_events = events.clone();
-        }
-        let config =
-            if options.syntax == config.config.syntax && options.protect == config.config.protect {
-                Arc::clone(config)
-            } else {
-                let key = (options.syntax.clone(), options.protect.clone());
-                let slot = Arc::clone(self.compiled_states.lock().unwrap().entry(key).or_default());
-                slot.get_or_init(|| {
-                    config
-                        .with_project_syntax(options.syntax, options.protect)
-                        .map(Arc::new)
-                        .map_err(|error| error.to_string())
-                })
-                .clone()?
-            };
+        let config = self
+            .compiled_states
+            .resolve(config, syntax, protect, file)?;
         Ok(PreparedSource {
             config,
-            input_graph: graph.fingerprint,
+            input_graph: self.input_graph(),
         })
     }
 }

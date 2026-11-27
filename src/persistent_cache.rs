@@ -1,6 +1,6 @@
 //! Best-effort CLI result storage. Project configuration is prepared afresh
 //! before lookup; in-process analysis reuse is independent of this storage.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,15 +14,14 @@ const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct PersistentCache {
-    configs: HashMap<usize, Options>,
+    configs: Mutex<HashMap<usize, Arc<Options>>>,
     groups: HashMap<(blake3::Hash, blake3::Hash), Arc<Group>>,
+    default_directory: OnceLock<Option<PathBuf>>,
 }
 
 struct Options {
     _config: Arc<CompiledConfig>,
-    fingerprint: blake3::Hash,
-    directory: PathBuf,
-    directory_id: blake3::Hash,
+    fingerprint: OnceLock<Option<blake3::Hash>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,20 +32,26 @@ pub enum Status {
 }
 
 pub struct Request {
-    group: Arc<Group>,
-    slot: String,
+    slot: Slot,
     key: String,
+}
+
+pub struct Slot {
+    group: Arc<Group>,
+    name: String,
+    kind: u8,
+}
+
+impl Slot {
+    pub fn may_hit(&self) -> bool {
+        self.group.entries().contains_key(&self.name)
+    }
 }
 
 struct Group {
     path: PathBuf,
-    data: Mutex<GroupData>,
-}
-
-#[derive(Default)]
-struct GroupData {
-    entries: BTreeMap<String, Entry>,
-    pending: BTreeSet<String>,
+    entries: OnceLock<BTreeMap<String, Entry>>,
+    pending: Mutex<BTreeMap<String, Entry>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,25 +87,65 @@ struct StoredDiagnostic {
 }
 
 impl PersistentCache {
-    pub fn request(
-        &mut self,
-        path: &Path,
-        source: &str,
-        kind: FileKind,
-        config: &Arc<CompiledConfig>,
-        input_graph: Option<blake3::Hash>,
-    ) -> Option<Request> {
+    pub fn slot(&mut self, path: &Path, kind: FileKind, config: &CompiledConfig) -> Option<Slot> {
         if !config.config.cache.enabled {
             return None;
         }
+        let directory = config.config.cache.directory.as_deref().or_else(|| {
+            self.default_directory
+                .get_or_init(default_directory)
+                .as_deref()
+        })?;
+        let kind = match kind {
+            FileKind::Tex => 0,
+            FileKind::Style => 1,
+            FileKind::Class => 2,
+            FileKind::Bibtex => 3,
+            FileKind::Dtx => 4,
+            FileKind::Ins => 5,
+            FileKind::Tikz => 6,
+            FileKind::Bst => 7,
+        };
+        let mut slot = blake3::Hasher::new();
+        field(&mut slot, path.as_os_str().as_encoded_bytes());
+        slot.update(&[kind]);
+        let parent = path.parent().unwrap_or(path);
+        let group_name = blake3::hash(parent.as_os_str().as_encoded_bytes());
+        let directory_id = blake3::hash(directory.as_os_str().as_encoded_bytes());
+        let group = self
+            .groups
+            .entry((directory_id, group_name))
+            .or_insert_with(|| {
+                Arc::new(Group {
+                    path: directory
+                        .join("v2")
+                        .join(format!("{}.json", group_name.to_hex())),
+                    entries: OnceLock::new(),
+                    pending: Mutex::default(),
+                })
+            });
+        Some(Slot {
+            group: Arc::clone(group),
+            name: slot.finalize().to_hex().to_string(),
+            kind,
+        })
+    }
+
+    fn config_fingerprint(&self, config: &Arc<CompiledConfig>) -> Option<blake3::Hash> {
         let identity = Arc::as_ptr(config) as usize;
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.configs.entry(identity) {
-            let directory = config
-                .config
-                .cache
-                .directory
-                .clone()
-                .or_else(default_directory)?;
+        let options = Arc::clone(
+            self.configs
+                .lock()
+                .ok()?
+                .entry(identity)
+                .or_insert_with(|| {
+                    Arc::new(Options {
+                        _config: Arc::clone(config),
+                        fingerprint: OnceLock::new(),
+                    })
+                }),
+        );
+        *options.fingerprint.get_or_init(|| {
             let mut options = config.config.clone();
             options.cache = Default::default();
             let mut fingerprint = blake3::Hasher::new();
@@ -132,57 +177,30 @@ impl PersistentCache {
             serde_json::to_writer(&mut fingerprint, &options.syntax.package_load_events).ok()?;
             fingerprint.update(b"project-command-import-events");
             serde_json::to_writer(&mut fingerprint, &options.syntax.command_import_events).ok()?;
-            entry.insert(Options {
-                _config: Arc::clone(config),
-                fingerprint: fingerprint.finalize(),
-                directory_id: blake3::hash(directory.as_os_str().as_encoded_bytes()),
-                directory,
-            });
-        }
-        let options = self.configs.get(&identity).expect("prepared cache options");
+            Some(fingerprint.finalize())
+        })
+    }
+
+    pub fn request(
+        &self,
+        slot: Slot,
+        source: &str,
+        config: &Arc<CompiledConfig>,
+        input_graph: Option<blake3::Hash>,
+    ) -> Option<Request> {
         let engine = engine_hash()?;
-        let kind = match kind {
-            FileKind::Tex => 0,
-            FileKind::Style => 1,
-            FileKind::Class => 2,
-            FileKind::Bibtex => 3,
-            FileKind::Dtx => 4,
-            FileKind::Ins => 5,
-            FileKind::Tikz => 6,
-            FileKind::Bst => 7,
-        };
         let mut hash = blake3::Hasher::new();
         hash.update(b"tift-result-cache-v3");
         hash.update(engine.as_bytes());
-        hash.update(options.fingerprint.as_bytes());
-        hash.update(&[kind]);
+        hash.update(self.config_fingerprint(config)?.as_bytes());
+        hash.update(&[slot.kind]);
         field(
             &mut hash,
             input_graph.as_ref().map_or(&[], |graph| graph.as_bytes()),
         );
         field(&mut hash, source.as_bytes());
         let key = hash.finalize().to_hex().to_string();
-        let mut slot = blake3::Hasher::new();
-        field(&mut slot, path.as_os_str().as_encoded_bytes());
-        slot.update(&[kind]);
-        let slot = slot.finalize().to_hex().to_string();
-        let parent = path.parent().unwrap_or(path);
-        let group_name = blake3::hash(parent.as_os_str().as_encoded_bytes());
-        let group = self
-            .groups
-            .entry((options.directory_id, group_name))
-            .or_insert_with(|| {
-                let group_path = options
-                    .directory
-                    .join("v2")
-                    .join(format!("{}.json", group_name.to_hex()));
-                Arc::new(Group::open(group_path))
-            });
-        Some(Request {
-            group: Arc::clone(group),
-            slot,
-            key,
-        })
+        Some(Request { slot, key })
     }
 
     pub fn flush(&self) {
@@ -194,19 +212,12 @@ impl PersistentCache {
 
 impl Request {
     pub fn load(&self, source: &str) -> Option<FormatOutput> {
-        let entry = {
-            let data = self.group.data.lock().ok()?;
-            let entry = data.entries.get(&self.slot)?;
-            if entry.schema != SCHEMA || entry.key != self.key {
-                return None;
-            }
-            entry.clone()
-        };
-        if entry.checksum != entry.checksum() {
+        let entry = self.slot.group.entries().get(&self.slot.name)?;
+        if entry.schema != SCHEMA || entry.key != self.key || entry.checksum != entry.checksum() {
             return None;
         }
         let mut diagnostics = Vec::with_capacity(entry.diagnostics.len());
-        for diagnostic in entry.diagnostics {
+        for diagnostic in &entry.diagnostics {
             if diagnostic.severity != 0
                 || diagnostic.start > diagnostic.end
                 || diagnostic.end > source.len()
@@ -217,12 +228,12 @@ impl Request {
             }
             diagnostics.push(Diagnostic {
                 severity: Severity::Warning,
-                message: diagnostic.message,
+                message: diagnostic.message.clone(),
                 span: diagnostic.start..diagnostic.end,
             });
         }
         Some(FormatOutput {
-            text: entry.text,
+            text: entry.text.clone(),
             diagnostics,
         })
     }
@@ -253,30 +264,23 @@ impl Request {
             checksum: String::new(),
         };
         entry.checksum = entry.checksum();
-        if let Ok(mut data) = self.group.data.lock() {
-            data.entries.insert(self.slot.clone(), entry);
-            data.pending.insert(self.slot.clone());
+        if let Ok(mut pending) = self.slot.group.pending.lock() {
+            pending.insert(self.slot.name.clone(), entry);
         }
     }
 }
 
 impl Group {
-    fn open(path: PathBuf) -> Self {
-        let entries = read_group(&path).unwrap_or_default();
-        Self {
-            path,
-            data: Mutex::new(GroupData {
-                entries,
-                pending: BTreeSet::new(),
-            }),
-        }
+    fn entries(&self) -> &BTreeMap<String, Entry> {
+        self.entries
+            .get_or_init(|| read_group(&self.path).unwrap_or_default())
     }
 
     fn flush(&self) {
-        let Ok(mut data) = self.data.lock() else {
+        let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        if data.pending.is_empty() {
+        if pending.is_empty() {
             return;
         }
         let Some(parent) = self.path.parent() else {
@@ -305,21 +309,16 @@ impl Group {
         if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
             return;
         }
-        // Merge the latest disk state under the lock. Only this process's
-        // pending slots replace another writer's entries; other slots move
-        // into the merged map without cloning their formatted text.
         let mut merged = read_group(&self.path).unwrap_or_default();
-        for (slot, entry) in std::mem::take(&mut data.entries) {
-            if data.pending.contains(&slot) {
-                merged.insert(slot, entry);
-            } else {
-                merged.entry(slot).or_insert(entry);
+        merged.append(&mut pending);
+        for (slot, entry) in self.entries() {
+            if !merged.contains_key(slot) {
+                merged.insert(slot.clone(), entry.clone());
             }
         }
-        data.entries = merged;
         let file = GroupWrite {
             schema: SCHEMA,
-            entries: &data.entries,
+            entries: &merged,
         };
         let Ok(mut temporary) = tempfile::NamedTempFile::new_in(parent) else {
             return;
@@ -336,9 +335,7 @@ impl Group {
         {
             return;
         }
-        if temporary.persist(&self.path).is_ok() {
-            data.pending.clear();
-        }
+        let _ = temporary.persist(&self.path);
     }
 }
 

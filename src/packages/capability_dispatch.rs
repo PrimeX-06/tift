@@ -193,8 +193,6 @@ macro_rules! providers {
                 commands: (0, math_command),
             }
             Scientific {
-                headers: (18, scientific::header_signature),
-                commands: (14, scientific::command_signature),
                 data_ends: (10, scientific::command_header_end),
                 metadata: (10, scientific::is_metadata_command),
                 adders: (16, scientific::add_command_rules),

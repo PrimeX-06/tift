@@ -377,32 +377,6 @@ pub(crate) fn collapse_prose_spaces(
     let declared_commands = analysis.declared_commands();
     let declared_environments = analysis.declared_environments();
     let mut opaque = parsed.protected.clone();
-    // A setter stored in a macro, alias or hook can execute after its source
-    // range ends. Only use a setter's existing protection when the scanner
-    // identified it as the operation opening that range.
-    if source.match_indices('\\').any(|(at, _)| {
-        crate::syntax::command_at(source, at).is_some_and(|(name, _)| {
-            matches!(
-                name,
-                "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
-            ) || crate::packages::code::catcode_value(name).is_some()
-        }) && !crate::syntax::is_escaped(source, at)
-            && containing(at, &opaque).is_none_or(|range| {
-                let prefix = source[range.start..at].trim();
-                let standalone_group = matches!(prefix, "{" | "\\begingroup" | "\\bgroup")
-                    && source[..range.start]
-                        .rsplit('\n')
-                        .next()
-                        .is_some_and(|line| line.trim().is_empty());
-                !prefix.is_empty() && !standalone_group
-            })
-            && {
-                let line_start = source[..at].rfind('\n').map_or(0, |index| index + 1);
-                comment_start(source, line_start..at, &opaque).is_none()
-            }
-    }) {
-        return Ok(source.into());
-    }
     let mut body = 0..source.len();
     if needs_environments {
         let Ok(environments) = parsed.environment_ranges(&config.config) else {
@@ -423,30 +397,85 @@ pub(crate) fn collapse_prose_spaces(
             }
         }
     }
-    add_inline_atoms(source, &mut opaque, &config.config, declared_commands, true);
+    merge_ranges(&mut opaque);
+    let candidates = prose_space_candidates(source, body, &opaque);
+    if candidates.is_empty() {
+        return Ok(source.into());
+    }
+    add_inline_atoms_to_merged(source, &mut opaque, &config.config, declared_commands, true);
 
     let mut edits = EditPlan::new();
-    let mut start = body.start;
-    for line in source[body].split_inclusive('\n') {
-        let end = start + line.len();
-        let leading = line.len() - line.trim_start_matches([' ', '\t']).len();
-        let content = &line[leading..];
-        let content = content.trim_end_matches([' ', '\t', '\r', '\n']);
-        let start_content = start + leading;
-        let end_content = start_content + content.len();
-        let end_prose =
-            comment_start(source, start_content..end_content, &opaque).unwrap_or(end_content);
-        if !contains_definition(content) {
-            for spaces in crate::trivia::repeated_spaces(&source[start_content..end_prose]) {
-                let spaces = start_content + spaces.start..start_content + spaces.end;
-                if !intersects(spaces.clone(), &opaque) {
-                    edits.replace(spaces.start + 1..spaces.end, "");
-                }
+    for line in candidates.chunk_by(|left, right| left.0 == right.0) {
+        let end = line.last().unwrap().1.end;
+        let end_prose = comment_start(source, line[0].0..end, &opaque).unwrap_or(end);
+        for (_, spaces) in line
+            .iter()
+            .take_while(|(_, spaces)| spaces.end <= end_prose)
+        {
+            if !intersects(spaces.clone(), &opaque) {
+                edits.replace(spaces.start + 1..spaces.end, "");
             }
         }
-        start = end;
+    }
+    if !edits.is_empty() && has_deferred_space_setter(source, &parsed.protected) {
+        return Ok(source.into());
     }
     edits.apply_ordered(source)
+}
+
+fn has_deferred_space_setter(source: &str, protected: &[Range<usize>]) -> bool {
+    // A setter stored in a macro, alias or hook can execute after its source
+    // range ends. Only use a setter's existing protection when the scanner
+    // identified it as the operation opening that range.
+    source.match_indices('\\').any(|(at, _)| {
+        crate::syntax::command_at(source, at).is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+            ) || crate::packages::code::catcode_value(name).is_some()
+        }) && !crate::syntax::is_escaped(source, at)
+            && containing(at, protected).is_none_or(|range| {
+                let prefix = source[range.start..at].trim();
+                let standalone_group = matches!(prefix, "{" | "\\begingroup" | "\\bgroup")
+                    && source[..range.start]
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|line| line.trim().is_empty());
+                !prefix.is_empty() && !standalone_group
+            })
+            && {
+                let line_start = source[..at].rfind('\n').map_or(0, |index| index + 1);
+                comment_start(source, line_start..at, protected).is_none()
+            }
+    })
+}
+
+fn prose_space_candidates(
+    source: &str,
+    body: Range<usize>,
+    opaque: &[Range<usize>],
+) -> Vec<(usize, Range<usize>)> {
+    let mut candidates = Vec::new();
+    let mut start = body.start;
+    for line in source[body].split_inclusive('\n') {
+        start += line.len();
+        let content = line.trim_start_matches([' ', '\t']);
+        let start_content = start - content.len();
+        let content = content.trim_end_matches([' ', '\t', '\r', '\n']);
+        if containing(start_content, opaque)
+            .is_some_and(|range| range.end >= start_content + content.len())
+        {
+            continue;
+        }
+        let mut spaces = crate::trivia::repeated_spaces(content)
+            .map(|range| start_content + range.start..start_content + range.end)
+            .filter(|range| !intersects(range.clone(), opaque))
+            .peekable();
+        if spaces.peek().is_some() && !contains_definition(content) {
+            candidates.extend(spaces.map(|range| (start_content, range)));
+        }
+    }
+    candidates
 }
 
 pub fn format_text(
@@ -526,7 +555,8 @@ fn format_text_with_arguments(
                 .map(|block| block.begin.start..block.end.end),
         );
     }
-    add_inline_atoms(
+    merge_ranges(&mut opaque);
+    add_inline_atoms_to_merged(
         source,
         &mut opaque,
         &config.config,
@@ -1473,7 +1503,7 @@ fn wrap_text_argument(
 ) -> String {
     let original = &source[body.clone()];
     let mut atoms = Vec::new();
-    add_inline_atoms(original, &mut atoms, &config.config, declared, false);
+    add_inline_atoms_to_merged(original, &mut atoms, &config.config, declared, false);
     if atoms
         .iter()
         .any(|range| original[range.clone()].contains('\n'))
@@ -2935,14 +2965,13 @@ fn math_end(source: &str, start: usize, delimiter: &str, protected: &[Range<usiz
     source.len()
 }
 
-fn add_inline_atoms(
+fn add_inline_atoms_to_merged(
     source: &str,
     ranges: &mut Vec<Range<usize>>,
     config: &crate::Config,
     declared_commands: &std::collections::HashSet<String>,
     expose_text_arguments: bool,
 ) {
-    merge_ranges(ranges);
     let protected = ranges.clone();
     let mut position = 0;
     let mut optional_argument = false;

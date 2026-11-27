@@ -1,6 +1,9 @@
 //! Source-ordered package and environment context shared by syntax consumers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+
+use super::authoring::Ifdraft;
 
 pub(crate) fn input_package_at(source: &str, end: usize) -> Option<(&'static str, usize)> {
     let cursor = crate::trivia::skip(source, end);
@@ -13,9 +16,13 @@ pub(crate) fn input_package_at(source: &str, end: usize) -> Option<(&'static str
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextIndex {
     packages: HashMap<String, Vec<PackageState>>,
+    package_filter: crate::name_filter::NameFilter,
     environments: Vec<(usize, Option<String>)>,
     stack: Vec<String>,
     imports: HashMap<usize, BTreeMap<String, bool>>,
+    todonotes_disabled: bool,
+    ifdraft: Option<Ifdraft>,
+    local_loader_seen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -36,19 +43,35 @@ impl InvocationContext<'_> {
     }
 
     pub(crate) fn package_position(&self, name: &str) -> Option<usize> {
+        if !self.index.package_filter.may_contain(name) {
+            return None;
+        }
         let events = self.index.packages.get(name)?;
+        if let Some(last) = events.last().filter(|last| last.at <= self.at) {
+            return last.definite;
+        }
         let end = events.partition_point(|event| event.at <= self.at);
         end.checked_sub(1).and_then(|index| events[index].definite)
     }
 
     pub(crate) fn possibly_has_package(&self, name: &str) -> bool {
-        self.index
-            .packages
-            .get(name)
-            .is_some_and(|events| events.first().is_some_and(|event| event.at <= self.at))
+        self.index.package_filter.may_contain(name)
+            && self
+                .index
+                .packages
+                .get(name)
+                .is_some_and(|events| events.first().is_some_and(|event| event.at <= self.at))
     }
 
     pub(crate) fn environment(&self) -> Option<&str> {
+        if let Some((_, name)) = self
+            .index
+            .environments
+            .last()
+            .filter(|(at, _)| *at <= self.at)
+        {
+            return name.as_deref();
+        }
         let end = self
             .index
             .environments
@@ -117,6 +140,7 @@ impl ContextIndex {
                         .extend(event.packages.clone());
                 }
             } else {
+                context.local_loader_seen |= !event.packages.is_empty();
                 context.inject(0, &event.packages);
             }
         }
@@ -144,6 +168,7 @@ impl ContextIndex {
         if name == "tex-live-zh-cn" {
             self.load("tex-live", at, certain);
         }
+        self.package_filter.insert(name);
         let events = self.packages.entry(name.into()).or_default();
         let definite = if certain {
             Some(at)
@@ -186,10 +211,36 @@ impl ContextIndex {
         end: usize,
         certain: bool,
     ) {
-        if let Some(packages) = self.imports.remove(&start) {
+        self.observe_reader(source, name, start..end, certain, false, || false);
+    }
+
+    pub(crate) fn observe_reader(
+        &mut self,
+        source: &str,
+        name: &str,
+        command: std::ops::Range<usize>,
+        certain: bool,
+        top_level: bool,
+        original_binding: impl FnOnce() -> bool,
+    ) -> Option<usize> {
+        let std::ops::Range { start, end } = command;
+        let imported = self.imports.remove(&start);
+        let local_loader = imported.is_some();
+        self.local_loader_seen |= local_loader;
+        if let Some(packages) = imported {
             for (package, loaded) in packages {
                 self.load(&package, start, certain && loaded);
             }
+        }
+        if name == "missingfigure" {
+            return (self.todonotes_disabled && original_binding())
+                .then(|| super::authoring::disabled_missingfigure_end(source, end))
+                .flatten();
+        }
+        if self.todonotes_disabled
+            && super::authoring::missingfigure_binding_uncertain(source, name, end)
+        {
+            self.todonotes_disabled = false;
         }
         if name == "input"
             && let Some((package, at)) = input_package_at(source, end)
@@ -208,15 +259,32 @@ impl ContextIndex {
             let mut cursor = crate::trivia::skip(source, end);
             let mut options = "";
             if source.as_bytes().get(cursor) == Some(&b'[') {
-                let Some(finish) = crate::syntax::balanced_end(source, cursor, b'[', b']') else {
-                    return;
-                };
+                let finish = crate::syntax::balanced_end(source, cursor, b'[', b']')?;
                 options = &source[cursor + 1..finish - 1];
                 cursor = crate::trivia::skip(source, finish);
             }
-            let Some(finish) = crate::syntax::balanced_end(source, cursor, b'{', b'}') else {
-                return;
-            };
+            let finish = crate::syntax::balanced_end(source, cursor, b'{', b'}')?;
+            let package = source[cursor + 1..finish - 1].trim_ascii();
+            if certain
+                && top_level
+                && !local_loader
+                && matches!(name, "usepackage" | "RequirePackage")
+                && matches!(package, "ifdraft" | "todonotes")
+                && !self.packages.contains_key(package)
+                && original_binding()
+            {
+                if package == "ifdraft"
+                    && !self.local_loader_seen
+                    && !source[start..finish].contains("^^")
+                {
+                    self.ifdraft = Ifdraft::load(&source[..start], options, finish);
+                } else if package == "todonotes"
+                    && super::authoring::explicitly_disables_todonotes(options)
+                {
+                    self.todonotes_disabled = !source[..start].contains("missingfigure")
+                        && !source[..start].contains("\\csname");
+                }
+            }
             for package in source[cursor + 1..finish - 1].split(',').map(str::trim) {
                 if !package.is_empty()
                     && package
@@ -249,5 +317,18 @@ impl ContextIndex {
                 self.environments.push((start, self.stack.last().cloned()));
             }
         }
+        None
+    }
+
+    pub(crate) fn ifdraft_branch(
+        &mut self,
+        source: &str,
+        name: &str,
+        command: Range<usize>,
+    ) -> Option<(Range<usize>, usize)> {
+        let mut state = self.ifdraft.take()?;
+        let result = state.branch(source, name, command)?;
+        self.ifdraft = Some(state);
+        Some(result)
     }
 }

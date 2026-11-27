@@ -44,7 +44,7 @@ mimalloc = { version = "0.1", default-features = false }
 wasm-bindgen = "0.2.130"
 
 [profile.release]
-lto = false
+lto = "thin"
 codegen-units = 1
 
 [profile.playground]
