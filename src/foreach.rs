@@ -80,27 +80,22 @@ fn header_list(
     None
 }
 
-pub(crate) fn format_lists(
+pub(crate) fn list_edits(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
-) -> Result<String, FormatError> {
+) -> Result<crate::edit_plan::RuleEdits, FormatError> {
     use crate::argument_layout::ForeachListMode;
     use unicode_width::UnicodeWidthStr;
     if !source.contains("\\foreach") {
-        return Ok(source.into());
+        return Ok(Default::default());
     }
     let parsed = parsing.snapshot(source, true, false)?;
-    let analysis = SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    if analysis.declared_commands()?.contains("foreach")
+    let analysis = parsed.analysis(&config.config);
+    if analysis.declared_commands().contains("foreach")
         || config.config.syntax.commands.contains_key("foreach")
     {
-        return Ok(source.into());
+        return Ok(Default::default());
     }
     let settings = &config.config.arguments;
     let width = settings.line_width.unwrap_or(config.config.wrap.columns);
@@ -109,7 +104,7 @@ pub(crate) fn format_lists(
     } else {
         "\n"
     };
-    let mut edits = Vec::new();
+    let mut plan = crate::edit_plan::RuleEdits::default();
     for token in parsed.tokens.as_deref().expect("foreach tokens") {
         if token.kind != TokenKind::Command
             || syntax::is_protected(token.span.start, &parsed.protected)
@@ -122,6 +117,10 @@ pub(crate) fn format_lists(
         else {
             continue;
         };
+        let line = source[..token.span.start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        plan.reads.push(line..list.end);
         if source.as_bytes().get(list.start) != Some(&b'{')
             || parsed
                 .protected
@@ -130,9 +129,6 @@ pub(crate) fn format_lists(
         {
             continue;
         }
-        let line = source[..token.span.start]
-            .rfind('\n')
-            .map_or(0, |at| at + 1);
         if settings.foreach_lists == ForeachListMode::Auto
             && !source[line..list.end]
                 .lines()
@@ -186,9 +182,9 @@ pub(crate) fn format_lists(
             &prefix,
         );
         output.push('}');
-        edits.push((list, output));
+        plan.edits.replace(list, output);
     }
-    crate::layout::apply_edits(source, edits)
+    Ok(plan)
 }
 
 fn list_boundary(output: &mut String, gap: &str, newline: &str, indent: &str) {
@@ -510,16 +506,16 @@ pub(crate) fn add_blocks<N: BlockName>(
     config: &CompiledConfig,
     protected: &[Range<usize>],
     analysis: &SourceAnalysis<'_>,
-) -> Result<(), FormatError> {
+) {
     if !config.config.syntax.foreach
         || !source.contains("\\foreach")
         || config.config.syntax.commands.contains_key("foreach")
     {
-        return Ok(());
+        return;
     }
-    let declared = analysis.declared_commands()?;
+    let declared = analysis.declared_commands();
     if declared.contains("foreach") {
-        return Ok(());
+        return;
     }
     let scopes = ScopeIndex::new(blocks, source.len());
     let mut scanner = PathScanner {
@@ -527,7 +523,7 @@ pub(crate) fn add_blocks<N: BlockName>(
         tokens,
         blocks,
         config,
-        declared: &declared,
+        declared,
         protected,
         scopes: &scopes,
         paths: Vec::new(),
@@ -604,5 +600,4 @@ pub(crate) fn add_blocks<N: BlockName>(
             }
         }
     }
-    Ok(())
 }

@@ -394,57 +394,39 @@ pub(crate) fn literal_argument_ranges(
     config: &CompiledConfig,
     protected: &[Range<usize>],
     declared: &std::collections::HashSet<String>,
+    tokens: &[crate::lexical_index::SourceToken],
 ) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
-    let mut cursor = 0;
-    while cursor < source.len() {
-        if let Some(range) = protected_at(cursor, &ranges) {
-            cursor = range.end;
+    for token in tokens {
+        let Some((name, end)) = token.control(source) else {
+            continue;
+        };
+        let base = name.trim_end_matches('*');
+        let signature = match base {
+            "url" | "nolinkurl" | "path" | "hyperbaseurl" | "input" | "include" | "includeonly"
+            | "bibliography" => "m",
+            "href" | "hyperimage" => "omm",
+            "includegraphics" => crate::document_environments::command_signature(base)
+                .expect("includegraphics signature"),
+            "addbibresource" | "addglobalbib" => "om",
+            _ => continue,
+        };
+        if declared.contains(base)
+            || config.config.syntax.commands.contains_key(base)
+            || protected_at(token.span.start, protected).is_some()
+            || protected_at(token.span.start, &ranges).is_some()
+        {
             continue;
         }
-        if let Some(range) = protected_at(cursor, protected) {
-            cursor = range.end;
-            continue;
-        }
-        if source.as_bytes()[cursor] == b'%' {
-            cursor = comment_end(source, cursor, source.len());
-            continue;
-        }
-        if let Some((name, end)) = syntax::command_at(source, cursor) {
-            let base = name.trim_end_matches('*');
-            if !declared.contains(base) && !config.config.syntax.commands.contains_key(base) {
-                let signature = match base {
-                    "url" | "nolinkurl" | "path" | "hyperbaseurl" | "input" | "include"
-                    | "includeonly" | "bibliography" => Some("m"),
-                    "href" | "hyperimage" => Some("omm"),
-                    "includegraphics" => crate::document_environments::command_signature(base),
-                    "addbibresource" | "addglobalbib" => Some("om"),
-                    _ => None,
-                };
-                if let Some(signature) = signature
-                    && let Some(groups) = signature_groups(source, end, signature, protected)
-                    && let Some(group) = groups
-                        .into_iter()
-                        .find(|range| source.as_bytes()[range.start] == b'{')
-                {
-                    let index = ranges
-                        .binary_search_by_key(&group.start, |range| range.start)
-                        .unwrap_or_else(|index| index);
-                    ranges.insert(index, group);
-                    // Metadata before the literal argument can contain
-                    // other literal commands; visit it before skipping
-                    // the recorded data span.
-                    cursor = end;
-                    continue;
-                }
-            }
-            cursor = end;
-        } else {
-            cursor += source[cursor..]
-                .chars()
-                .next()
-                .expect("source character")
-                .len_utf8();
+        if let Some(groups) = signature_groups(source, end, signature, protected)
+            && let Some(group) = groups
+                .into_iter()
+                .find(|range| source.as_bytes()[range.start] == b'{')
+        {
+            // Nested commands in optional metadata can precede a previously
+            // recorded literal argument.
+            let index = ranges.partition_point(|range| range.start < group.start);
+            ranges.insert(index, group);
         }
     }
     ranges
@@ -481,6 +463,11 @@ fn math_end(source: &str, start: usize, limit: usize, protected: &[Range<usize>]
     };
     let mut cursor = start + opening.len();
     while cursor < limit {
+        cursor += memchr::memchr2(
+            closing.as_bytes()[0],
+            b'%',
+            &source.as_bytes()[cursor..limit],
+        )?;
         if let Some(range) = protected_at(cursor, protected) {
             cursor = range.end.min(limit);
             continue;
@@ -491,7 +478,7 @@ fn math_end(source: &str, start: usize, limit: usize, protected: &[Range<usize>]
         if source.as_bytes()[cursor] == b'%' && !syntax::is_escaped(source, cursor) {
             cursor = comment_end(source, cursor, limit);
         } else {
-            cursor += source[cursor..].chars().next()?.len_utf8();
+            cursor += 1;
         }
     }
     None
@@ -694,24 +681,39 @@ fn copy_children(
 
 fn format_group(
     source: &str,
-    group: Range<usize>,
-    settings: &Settings<'_>,
+    candidate: &Candidate<'_>,
     config: &CompiledConfig,
     protected: &[Range<usize>],
     children: &[Replacement<'_>],
     newline: &str,
+    measured_line: &mut Option<(Range<usize>, usize)>,
 ) -> Option<String> {
-    let tab = config.config.indent.width;
+    let group = candidate.group.clone();
+    let settings = &candidate.settings;
     let expand = settings.mode != "auto"
         || settings.width.is_some_and(|width| {
+            // Sibling or nested arguments on a line share its original width,
+            // even when the commands have different expansion thresholds.
+            if let Some((line, columns)) = measured_line.as_ref()
+                && line.start <= group.start
+                && group.end <= line.end
+            {
+                return *columns > width;
+            }
             let line_start = source[..group.start].rfind('\n').map_or(0, |pos| pos + 1);
             let after = source[group.end..]
                 .split('\n')
                 .next()
                 .unwrap_or("")
                 .trim_end_matches('\r');
-            let original = &source[line_start..group.end + after.len()];
-            original.lines().any(|line| column(line, tab) > width)
+            let lines = line_start..group.end + after.len();
+            let tab = config.config.indent.width;
+            if source[group.clone()].contains('\n') {
+                return source[lines].lines().any(|line| column(line, tab) > width);
+            }
+            let columns = column(&source[lines.clone()], tab);
+            *measured_line = Some((lines, columns));
+            columns > width
         });
     let expanded = expand
         .then(|| {
@@ -766,7 +768,7 @@ fn align_group_equals(
         }
     }
     entries.push(start..body.end);
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut assignments = Vec::new();
     let tab = config.config.indent.width;
     for entry in entries {
@@ -798,7 +800,7 @@ fn align_group_equals(
                 align_group_equals(&source[value_start..end], config, width, depth + 1)
             && value != source[value_start..end]
         {
-            edits.push((value_start..end, value));
+            edits.replace(value_start..end, value);
         }
         // The preceding comma or opening delimiter already occupies the line
         // unless the trivia before this key contains a newline.
@@ -857,22 +859,15 @@ fn align_group_equals(
             padding.push((equal + 1..after, after_value.to_owned()));
         }
         if fits {
-            edits.extend(padding);
+            for (range, text) in padding {
+                edits.replace(range, text);
+            }
         }
     }
     if edits.is_empty() {
         return None;
     }
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut output = String::new();
-    let mut copied = 0;
-    for (range, value) in edits {
-        output.push_str(&source[copied..range.start]);
-        output.push_str(&value);
-        copied = range.end;
-    }
-    output.push_str(&source[copied..]);
-    Some(output)
+    edits.apply_first_wins(source).ok()
 }
 
 fn expand_group(
@@ -1092,54 +1087,85 @@ pub(crate) fn format_arguments_with_context(
         .collect();
     let selected_name =
         |name: &str| selected.contains(name) || selected.contains(name.trim_end_matches('*'));
-    if !memchr::memchr_iter(b'\\', source.as_bytes())
-        .any(|at| syntax::command_at(source, at).is_some_and(|(name, _)| selected_name(name)))
-    {
+    // This is only a work gate. A raw spelling match is sufficient here and
+    // avoids parsing every control sequence before the shared snapshot is
+    // built. The full pass below still validates comments, literals and
+    // command boundaries before producing edits.
+    if !memchr::memchr_iter(b'\\', source.as_bytes()).any(|at| {
+        selected
+            .iter()
+            .any(|name| source[at + 1..].starts_with(name.trim_end_matches('*')))
+    }) {
         return Ok(source.into());
     }
     let parsed = parsing.snapshot(source, false, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let declared = analysis.declared_commands()?;
+    let analysis = parsed.analysis(&config.config);
+    let declared = analysis.declared_commands();
+    let lexical_tokens = analysis.model().tokens();
     let mut protected = parsed.protected.clone();
-    let literal = literal_argument_ranges(source, config, &protected, &declared);
+    let literal = literal_argument_ranges(source, config, &protected, declared, lexical_tokens);
     merge_ranges(&mut protected, literal);
     let mut candidates: Vec<Candidate<'_>> = Vec::new();
     let mut roots = Vec::new();
     let mut parents: Vec<usize> = Vec::new();
     let mut cursor = 0;
-    while cursor < source.len() {
+    let mut token_index = 0;
+    while token_index < lexical_tokens.len() {
+        let mut skipped_arguments = false;
         while parents
             .last()
             .is_some_and(|&i| cursor >= candidates[i].group.end - 1)
         {
             let parent = parents.pop().expect("enclosing argument");
             cursor = cursor.max(candidates[parent].resume);
+            skipped_arguments = true;
         }
-        if cursor >= source.len() {
-            break;
+        if skipped_arguments {
+            token_index = lexical_tokens.partition_point(|token| token.span.end <= cursor);
+            if token_index >= lexical_tokens.len() {
+                break;
+            }
         }
+        let token = &lexical_tokens[token_index];
+        cursor = cursor.max(token.span.start);
         if let Some(range) = protected_at(cursor, &protected) {
             cursor = range.end;
+            token_index = lexical_tokens.partition_point(|token| token.span.end <= cursor);
             continue;
         }
-        if source.as_bytes()[cursor] == b'%' {
-            cursor = comment_end(source, cursor, source.len());
-            continue;
-        }
-        if (source.as_bytes()[cursor] == b'$'
-            || source[cursor..].starts_with("\\(")
-            || source[cursor..].starts_with("\\["))
-            && let Some(end) = math_end(source, cursor, source.len(), &protected)
+        if token.kind == crate::lexical_index::SourceTokenKind::Opaque
+            || token.kind == crate::lexical_index::SourceTokenKind::Comment
         {
-            cursor = end;
+            cursor = token.span.end;
+            token_index += 1;
             continue;
         }
-        if let Some((name, end)) = syntax::command_at(source, cursor) {
+        if token.kind == crate::lexical_index::SourceTokenKind::Text {
+            let text_end = token.span.end;
+            if let Some(relative) = source[cursor..text_end].find('$') {
+                let math_start = cursor + relative;
+                if let Some(end) = math_end(source, math_start, source.len(), &protected) {
+                    cursor = end;
+                    token_index = lexical_tokens.partition_point(|token| token.span.end <= cursor);
+                } else {
+                    cursor = math_start + 1;
+                }
+            } else {
+                cursor = text_end;
+                token_index += 1;
+            }
+            continue;
+        }
+        if token.kind == crate::lexical_index::SourceTokenKind::Control
+            && let Some((name, command_end)) = token.control(source)
+        {
+            if matches!(name, "(" | "[")
+                && let Some(math_end) = math_end(source, cursor, source.len(), &protected)
+            {
+                cursor = math_end;
+                token_index = lexical_tokens.partition_point(|token| token.span.end <= cursor);
+                continue;
+            }
             if let Some(settings) = selected_name(name)
                 .then(|| settings(name, config))
                 .flatten()
@@ -1154,26 +1180,35 @@ pub(crate) fn format_arguments_with_context(
                         .and_then(|rule| rule.arguments)
                         .is_some_and(|count| settings.argument >= count)
                 {
-                    cursor = end;
+                    cursor = command_end;
+                    token_index += 1;
                     continue;
                 }
                 let optional = syntax_rule.is_none_or(|rule| rule.optional_arguments);
                 let selected = if let Some(index) = settings.optional_argument {
-                    optional_group(source, name, end, index, config, &declared, &protected)
+                    optional_group(
+                        source,
+                        name,
+                        command_end,
+                        index,
+                        config,
+                        declared,
+                        &protected,
+                    )
                 } else {
-                    argument_group(source, end, settings.argument, optional, &protected).map(
-                        |group| {
+                    argument_group(source, command_end, settings.argument, optional, &protected)
+                        .map(|group| {
                             let resume = group.end;
                             (group, resume)
-                        },
-                    )
+                        })
                 };
                 if let Some((group, resume)) = selected {
                     if parents
                         .last()
                         .is_some_and(|&parent| resume > candidates[parent].group.end - 1)
                     {
-                        cursor = end;
+                        cursor = command_end;
+                        token_index += 1;
                         continue;
                     }
                     // The tree is traversed iteratively. Extremely deep
@@ -1181,6 +1216,8 @@ pub(crate) fn format_arguments_with_context(
                     // of building unbounded intermediate formatted strings.
                     if parents.len() >= 128 {
                         cursor = group.end;
+                        token_index =
+                            lexical_tokens.partition_point(|token| token.span.end <= cursor);
                         continue;
                     }
                     let index = candidates.len();
@@ -1190,6 +1227,7 @@ pub(crate) fn format_arguments_with_context(
                         roots.push(index);
                     }
                     cursor = group.start + 1;
+                    token_index = lexical_tokens.partition_point(|token| token.span.end <= cursor);
                     candidates.push(Candidate {
                         group,
                         settings,
@@ -1200,13 +1238,11 @@ pub(crate) fn format_arguments_with_context(
                     continue;
                 }
             }
-            cursor = end;
+            cursor = command_end;
+            token_index += 1;
         } else {
-            cursor += source[cursor..]
-                .chars()
-                .next()
-                .expect("source character")
-                .len_utf8();
+            cursor = token.span.end;
+            token_index += 1;
         }
     }
     let mut rendered: Vec<Option<String>> = (0..candidates.len()).map(|_| None).collect();
@@ -1215,6 +1251,7 @@ pub(crate) fn format_arguments_with_context(
     } else {
         "\n"
     };
+    let mut measured_line = None;
     for index in (0..candidates.len()).rev() {
         let candidate = &candidates[index];
         let children: Vec<_> = candidate
@@ -1229,12 +1266,12 @@ pub(crate) fn format_arguments_with_context(
             .collect();
         let mut result = format_group(
             source,
-            candidate.group.clone(),
-            &candidate.settings,
+            candidate,
             config,
             &protected,
             &children,
             newline,
+            &mut measured_line,
         );
         if result.is_none() && !children.is_empty() {
             let mut text = String::new();
@@ -1243,26 +1280,18 @@ pub(crate) fn format_arguments_with_context(
         }
         rendered[index] = result.filter(|text| text != &source[candidate.group.clone()]);
     }
-    let mut output = String::with_capacity(source.len());
-    let mut copied = 0;
-    let mut changed = false;
-    let mut changed_groups = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     for index in roots {
-        if let Some(text) = &rendered[index] {
+        if let Some(text) = rendered[index].take() {
             let group = &candidates[index].group;
-            output.push_str(&source[copied..group.start]);
-            let start = output.len();
-            output.push_str(text);
-            changed_groups.push(start..output.len());
-            copied = group.end;
-            changed = true;
+            edits.replace(group.clone(), text);
         }
     }
-    output.push_str(&source[copied..]);
-    if changed {
-        crate::layout::indent_after_arguments(&output, config, kind, parsing, &changed_groups)
-    } else {
+    let (output, changed_groups) = edits.apply_ordered_with_ranges(source)?;
+    if changed_groups.is_empty() {
         Ok(output)
+    } else {
+        crate::layout::indent_after_arguments(&output, config, kind, parsing, &changed_groups)
     }
 }
 
@@ -1287,18 +1316,17 @@ fn normalize_load_arguments(
     parsing: &mut crate::parse_context::ParseContext<'_>,
 ) -> Result<String, FormatError> {
     let parsed = parsing.snapshot(source, true, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let mut edits = Vec::new();
+    let analysis = parsed.analysis(&config.config);
+    let mut edits = crate::edit_plan::EditPlan::new();
     for token in parsed.tokens.as_deref().expect("loader tokens") {
         if token.kind != syntax::TokenKind::Command {
             continue;
         }
-        let Some((name, after)) = syntax::command_at(source, token.span.start) else {
+        let Some((name, after)) = analysis
+            .model()
+            .control_at(token.span.start)
+            .or_else(|| syntax::command_at(source, token.span.start))
+        else {
             continue;
         };
         if !LOADERS.contains(&name)
@@ -1348,9 +1376,9 @@ fn normalize_load_arguments(
                 normalized.push_str(comma);
             }
             if normalized != text {
-                edits.push((body, normalized));
+                edits.replace(body, normalized);
             }
         }
     }
-    crate::layout::apply_edits(source, edits)
+    edits.apply_first_wins(source)
 }

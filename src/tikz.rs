@@ -2,12 +2,12 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::CompiledConfig;
 use crate::block_storage::{BlockName, StructuralBlock as Block};
 use crate::config::BreakMode;
 use crate::source_analysis::SourceAnalysis;
 use crate::syntax::{self, BlockKind, Token, TokenKind};
 use crate::tikz_scan::{comment_end, group_end, node_body, path_command};
-use crate::{CompiledConfig, FormatError};
 
 fn math_end(source: &str, start: usize, limit: usize) -> Option<usize> {
     let double = source.as_bytes().get(start + 1) == Some(&b'$');
@@ -457,7 +457,7 @@ pub(crate) fn add_blocks<N: BlockName>(
     config: &CompiledConfig,
     protected: &[Range<usize>],
     analysis: &SourceAnalysis<'_>,
-) -> Result<(), FormatError> {
+) {
     if !source.contains("\\tikz")
         && !tokens.iter().any(|token| {
             token.kind == TokenKind::Command
@@ -465,10 +465,10 @@ pub(crate) fn add_blocks<N: BlockName>(
                     .is_some_and(|(name, _)| path_command(name))
         })
     {
-        return Ok(());
+        return;
     }
-    let declared = analysis.declared_commands()?;
-    let declared_envs = analysis.declared_environments()?;
+    let declared = analysis.declared_commands();
+    let declared_envs = analysis.declared_environments();
     let mut starts = Vec::new();
     let mut ends = Vec::new();
     for block in blocks.iter().filter(|block| {
@@ -517,7 +517,7 @@ pub(crate) fn add_blocks<N: BlockName>(
         source,
         tokens,
         protected,
-        declared: &declared,
+        declared,
         config,
         starts,
         ends,
@@ -536,7 +536,6 @@ pub(crate) fn add_blocks<N: BlockName>(
         block.name != "tikz-child"
             || !existing_children.contains(&(block.begin.start, block.end.end))
     }));
-    Ok(())
 }
 
 /// Only commit breaks after the entire list is recognized. Error tuples and

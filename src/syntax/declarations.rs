@@ -542,7 +542,7 @@ fn infer_declaration_config_impl(
     let output = if !declarations_changed && let Some(output) = cached_output {
         output
     } else {
-        declaration_config_from_state(source, config, &selected, &ambiguous)?
+        declaration_config_from_state(source, config, &selected, &ambiguous, &protected)?
     };
     if let Some(index) = index {
         index.source_len = source.len();
@@ -570,6 +570,7 @@ fn declaration_config_from_state(
     config: &Config,
     selected: &HashMap<(bool, String), ContextDeclaration>,
     ambiguous: &HashSet<(bool, String)>,
+    ranges: &[Range<usize>],
 ) -> Result<Config, FormatError> {
     let mut declarations: Vec<_> = selected.values().collect();
     declarations.sort_by(|left, right| {
@@ -703,14 +704,14 @@ fn declaration_config_from_state(
     }
     // The same source-ordered binding index supplies aliases to imported files.
     // Explicit configuration wins over source declarations.
-    let ranges = protected_ranges(source, config)?;
-    let model = crate::source_model::SourceModel::with_ranges(source, config, &ranges);
-    for (name, alias) in model.exported_aliases() {
+    for (name, alias) in
+        crate::source_model::SourceModel::aliases_with_ranges(source, config, ranges)
+    {
         output
             .syntax
             .inferred_environment_aliases
-            .entry(name.clone())
-            .or_insert_with(|| alias.clone());
+            .entry(name)
+            .or_insert(alias);
     }
     Ok(output)
 }

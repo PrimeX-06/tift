@@ -60,6 +60,9 @@ pub struct DetailTrace {
     pub output_lines: Range<usize>,
     pub input_bytes: Range<usize>,
     pub output_bytes: Range<usize>,
+    /// The input region traced back to the original file. A region created
+    /// by a configuration replacement points to the original match.
+    pub original_bytes: Range<usize>,
     /// Exact removed/replaced text, including original line endings.
     pub before: String,
     /// Exact inserted/replacement text, including new line endings.
@@ -246,6 +249,7 @@ pub fn stage_changes(
             output_lines: new_lines.start + 1..new_lines.end + 1,
             before: before[input_bytes.clone()].into(),
             after: after[output_bytes.clone()].into(),
+            original_bytes: input_bytes.clone(),
             input_bytes,
             output_bytes,
             context: block.map(context),
@@ -253,4 +257,62 @@ pub fn stage_changes(
         });
     }
     result
+}
+
+#[derive(Default)]
+pub(crate) struct DetailJournal {
+    pub(crate) records: Vec<DetailTrace>,
+    pub(crate) history: crate::edit_plan::EditHistory,
+}
+
+impl DetailJournal {
+    pub(crate) fn record(
+        &mut self,
+        name: &'static str,
+        before: &str,
+        after: &str,
+        config: &CompiledConfig,
+        exact: Option<crate::edit_plan::EditHistory>,
+    ) {
+        let mut changes = stage_changes(name, before, after, config);
+        let mut mappings = Vec::new();
+        for change in &mut changes {
+            change.original_bytes = self.history.original_range(change.input_bytes.clone());
+            if exact.is_none() {
+                // Refine changed lines only. Equal islands keep their original
+                // coordinates when a later reader addresses one of them.
+                let old: Vec<_> = change
+                    .before
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .chain([change.before.len()])
+                    .collect();
+                let new: Vec<_> = change
+                    .after
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .chain([change.after.len()])
+                    .collect();
+                for op in TextDiff::from_chars(&change.before, &change.after).ops() {
+                    if op.tag() == similar::DiffTag::Equal {
+                        continue;
+                    }
+                    let a = op.old_range();
+                    let b = op.new_range();
+                    mappings.push((
+                        change.input_bytes.start + old[a.start]
+                            ..change.input_bytes.start + old[a.end],
+                        change.output_bytes.start + new[b.start]
+                            ..change.output_bytes.start + new[b.end],
+                    ));
+                }
+            }
+        }
+        if let Some(history) = exact {
+            self.history.append(history);
+        } else {
+            self.history.record(mappings);
+        }
+        self.records.extend(changes);
+    }
 }

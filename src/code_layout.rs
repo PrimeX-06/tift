@@ -9,6 +9,7 @@ pub(crate) mod expl3;
 mod printer;
 mod scanner;
 
+use crate::edit_plan::EditPlan;
 use crate::{CompiledConfig, FileKind, FormatError, syntax};
 
 #[derive(Clone, Copy)]
@@ -41,11 +42,23 @@ impl Default for CodeConfig {
 
 pub(crate) fn activity(source: &str, config: &CompiledConfig) -> Activity {
     Activity {
-        algorithm2e: config.config.code.algorithm2e
-            && source.contains("\\begin")
-            && (source.contains("algorithm") || source.contains("algocf")),
+        algorithm2e: config.config.code.algorithm2e && has_algorithm_environment(source),
         expl3: config.config.code.expl3 && has_expl3_marker(source),
     }
+}
+
+fn has_algorithm_environment(source: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find("\\begin") {
+        let start = cursor + relative;
+        if syntax::env_at(source, start)
+            .is_some_and(|(name, is_begin, _)| is_begin && algorithm_environment(name))
+        {
+            return true;
+        }
+        cursor = start + "\\begin".len();
+    }
+    false
 }
 
 pub(crate) fn has_expl3_marker(source: &str) -> bool {
@@ -359,66 +372,62 @@ impl Opaque {
         // restoration order for a reordered result, whose inserted line ends
         // can affect another marker's indentation boundary.
         if positions.windows(2).any(|pair| pair[0].2 >= pair[1].2) {
-            let mut normalized = formatted.to_owned();
-            for &(start, end, index) in positions.iter().rev() {
-                normalized.replace_range(start..end, &self.entries[index].0);
+            let mut edits = EditPlan::new();
+            for &(start, end, index) in &positions {
+                edits.replace(start..end, self.entries[index].0.as_str());
             }
+            let normalized = edits.apply_ordered(formatted).ok()?;
             return self.restore_reordered(&normalized);
         }
-        let mut output = String::with_capacity(formatted.len());
+        let mut edits = EditPlan::new();
+        let mut replacement = String::new();
+        let mut edit_start = 0;
         let mut cursor = 0;
         let mut line_start = 0;
         for (position, mut end, index) in positions {
             let (_, original, starts_line, newline_before) = &self.entries[index];
-            append_tracking_line(&mut output, &formatted[cursor..position], &mut line_start);
-            if *starts_line
-                && output[line_start..]
-                    .bytes()
-                    .all(|byte| matches!(byte, b' ' | b'\t'))
-            {
-                output.truncate(line_start);
-            }
-            if original.trim_end_matches([' ', '\t']).ends_with('\n') {
-                if formatted[end..].starts_with("\r\n") {
-                    end += 2;
-                } else if formatted[end..].starts_with('\n') {
-                    end += 1;
+            let gap = &formatted[cursor..position];
+            // A printer newline in the gap ends any dependency on previously
+            // restored indentation. Earlier edits can now be applied independently.
+            if let Some(newline) = gap.rfind('\n') {
+                if cursor != 0 {
+                    edits.replace(edit_start..cursor, std::mem::take(&mut replacement));
                 }
-                if !original.ends_with('\n') {
-                    while matches!(formatted.as_bytes().get(end), Some(b' ' | b'\t')) {
-                        end += 1;
-                    }
-                }
-            }
-            // A marker that starts after a printer newline can represent a
-            // range whose original bytes start with that same newline. Keep
-            // one boundary so repeated formatting does not grow blank lines.
-            let original = if original.starts_with("\r\n")
-                && !newline_before
-                && line_start > 0
-                && output[line_start..]
-                    .bytes()
-                    .all(|byte| byte == b' ' || byte == b'\t')
-            {
-                output.truncate(line_start);
-                &original[2..]
-            } else if original.starts_with('\n')
-                && !newline_before
-                && line_start > 0
-                && output[line_start..]
-                    .bytes()
-                    .all(|byte| byte == b' ' || byte == b'\t')
-            {
-                output.truncate(line_start);
-                &original[1..]
+                edit_start = cursor + newline + 1;
+                line_start = 0;
+                replacement.push_str(&formatted[edit_start..position]);
             } else {
-                original
-            };
-            append_tracking_line(&mut output, original, &mut line_start);
+                replacement.push_str(gap);
+            }
+            end = opaque_marker_end(formatted, end, original);
+            let mut original = original.as_str();
+            if replacement[line_start..]
+                .bytes()
+                .all(|b| matches!(b, b' ' | b'\t'))
+            {
+                // The printer and a restored range can supply the same line
+                // ending. Keep the printer's ending, including its CRLF spelling.
+                let after_newline = edit_start > 0 || line_start > 0;
+                if !newline_before
+                    && after_newline
+                    && let Some(body) = original
+                        .strip_prefix("\r\n")
+                        .or_else(|| original.strip_prefix('\n'))
+                {
+                    replacement.truncate(line_start);
+                    original = body;
+                } else if *starts_line {
+                    replacement.truncate(line_start);
+                }
+            }
+            if let Some(newline) = original.rfind('\n') {
+                line_start = replacement.len() + newline + 1;
+            }
+            replacement.push_str(original);
             cursor = end;
         }
-        output.push_str(&formatted[cursor..]);
-        Some(output)
+        edits.replace(edit_start..cursor, replacement);
+        edits.apply_ordered(formatted).ok()
     }
 
     fn restore_reordered(&self, formatted: &str) -> Option<String> {
@@ -437,19 +446,7 @@ impl Opaque {
                     start = line_start;
                 }
             }
-            let mut end = position + marker.len();
-            if original.trim_end_matches([' ', '\t']).ends_with('\n') {
-                if output[end..].starts_with("\r\n") {
-                    end += 2;
-                } else if output[end..].starts_with('\n') {
-                    end += 1;
-                }
-                if !original.ends_with('\n') {
-                    while matches!(output.as_bytes().get(end), Some(b' ' | b'\t')) {
-                        end += 1;
-                    }
-                }
-            }
+            let end = opaque_marker_end(&output, position + marker.len(), original);
             output.replace_range(start..end, original);
         }
         Some(output)
@@ -474,11 +471,20 @@ fn opaque_marker_index(suffix: &str, count: usize) -> Option<usize> {
     (index < count).then_some(index)
 }
 
-fn append_tracking_line(output: &mut String, text: &str, line_start: &mut usize) {
-    if let Some(newline) = text.rfind('\n') {
-        *line_start = output.len() + newline + 1;
+fn opaque_marker_end(formatted: &str, mut end: usize, original: &str) -> usize {
+    if original.trim_end_matches([' ', '\t']).ends_with('\n') {
+        if formatted[end..].starts_with("\r\n") {
+            end += 2;
+        } else if formatted[end..].starts_with('\n') {
+            end += 1;
+        }
+        if !original.ends_with('\n') {
+            while matches!(formatted.as_bytes().get(end), Some(b' ' | b'\t')) {
+                end += 1;
+            }
+        }
     }
-    output.push_str(text);
+    end
 }
 
 pub(crate) fn protected_ranges(
@@ -621,12 +627,7 @@ pub(crate) fn format_code_with_context(
                 .metadata
                 .exposed_model(source, &config.config, &protected)
         });
-        let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-            source,
-            &config.config,
-            &parsed.protected,
-            std::rc::Rc::clone(&parsed.metadata),
-        );
+        let analysis = parsed.analysis(&config.config);
         let model = exposed_model.as_deref().unwrap_or_else(|| analysis.model());
         let mut stored = model
             .stored_argument_ranges()
@@ -707,12 +708,7 @@ pub(crate) fn format_code_with_context(
         );
         if !fragments.is_empty() {
             let analysis = if matches!(declaration_protection, Cow::Borrowed(_)) {
-                crate::source_analysis::SourceAnalysis::with_memo(
-                    source,
-                    &config.config,
-                    &declaration_protection,
-                    std::rc::Rc::clone(&parsed.metadata),
-                )
+                parsed.analysis(&config.config)
             } else {
                 crate::source_analysis::SourceAnalysis::new(
                     source,
@@ -720,7 +716,7 @@ pub(crate) fn format_code_with_context(
                     &declaration_protection,
                 )
             };
-            let declared = analysis.declared_commands()?;
+            let declared = analysis.declared_commands();
             if [
                 "For", "ForEach", "ForAll", "While", "If", "ElseIf", "Else", "eIf", "Repeat",
                 "KwIn", "KwOut",
@@ -910,7 +906,7 @@ pub(crate) fn format_code_with_context(
         Vec::new()
     };
     let mut math_recheck = false;
-    let mut output = String::with_capacity(source.len());
+    let mut edits = EditPlan::new();
     let mut cursor = 0;
     for (fragment, expl3) in fragments {
         let fragment_protection = overlapping_ranges(&protected, &fragment);
@@ -954,18 +950,16 @@ pub(crate) fn format_code_with_context(
         let Some(formatted) = opaque.restore(&formatted) else {
             continue;
         };
-        if formatted != original {
-            math_recheck |= !overlapping_ranges(&recheck_ranges, &fragment).is_empty();
-        }
         // A successfully printed enclosing fragment owns its nested fragments
         // even when its bytes already match the printer's output.
-        output.push_str(&source[cursor..fragment.start]);
-        output.push_str(&formatted);
         cursor = fragment.end;
+        if formatted != original {
+            math_recheck |= !overlapping_ranges(&recheck_ranges, &fragment).is_empty();
+            edits.replace(fragment, formatted);
+        }
     }
-    output.push_str(&source[cursor..]);
     Ok(CodeOutput {
-        text: output,
+        text: edits.apply_ordered(source)?,
         math_recheck,
     })
 }

@@ -44,7 +44,9 @@ pub(crate) fn literate_fragment_end(source: &str, name: &str, end: usize) -> Opt
 pub(crate) fn context_verbatim(name: &str, context: &super::InvocationContext<'_>) -> bool {
     // skdoc.cls records fragments independently: their TeX groups can span
     // several displayed MacroCode environments.
-    name == "MacroCode" && context.has_package("skdoc")
+    matches!(name, "java" | "scheme" | "assembly" | "pseudocode")
+        && context.has_package("brandeis-problemset")
+        || name == "MacroCode" && context.has_package("skdoc")
         || matches!(name, "sverbatim" | "fverbatim") && context.has_package("tex-live")
         || matches!(name, "example" | "sidebyside" | "sourcecode" | "bash")
             && context.has_package("cnltx-example")
@@ -59,6 +61,134 @@ pub(crate) fn context_command_data_ranges(
     end: usize,
     context: &super::InvocationContext<'_>,
 ) -> Option<Vec<std::ops::Range<usize>>> {
+    if matches!(name, "beginverse" | "beginchorus")
+        && context.environment() == Some("songs")
+        && context.has_package("songs")
+    {
+        // Verse lines carry line breaks and use \[ for chord annotations.
+        // Recognize an explicit closing control on its own physical line.
+        let close = if name == "beginverse" {
+            "endverse"
+        } else {
+            "endchorus"
+        };
+        for (offset, _) in source[end..].match_indices('\\') {
+            let at = end + offset;
+            let Some((word, finish)) = crate::syntax::command_at(source, at) else {
+                continue;
+            };
+            if word == close {
+                let line = &source[crate::syntax::line_start(source, at)..at];
+                if !line.trim().is_empty() {
+                    return None;
+                }
+                return Some(std::iter::once(end..finish).collect());
+            }
+            if matches!(
+                word,
+                "beginverse" | "beginchorus" | "end" | "catcode" | "verb" | "begin"
+            ) {
+                return None;
+            }
+        }
+        return None;
+    }
+    if name.trim_end_matches('*') == "qrcode" && context.has_package("qrcode") {
+        let header = crate::syntax::arguments::signature_end(source, end, "o")?;
+        let start = crate::trivia::skip(source, header);
+        let finish = crate::syntax::literal_group_end(source, start)?;
+        return Some(std::iter::once(start..finish).collect());
+    }
+    if matches!(name, "verbfile" | "verbdir" | "verbarchive") && context.has_package("dirtreex") {
+        return crate::syntax::arguments::domain_ranges(source, end, "o v m", "TUT");
+    }
+    if matches!(name, "svnid" | "svnidlong" | "svnkwsave") {
+        // svn-multi reads dollar-delimited keyword data inside each group.
+        let count = if name == "svnidlong" { 4 } else { 1 };
+        let mut cursor = end;
+        let mut ranges = Vec::with_capacity(count);
+        for _ in 0..count {
+            let start = crate::trivia::skip(source, cursor);
+            cursor = raw_group_end(source, start)?;
+            let keyword = source[start + 1..cursor - 1]
+                .strip_prefix('$')?
+                .strip_suffix('$')?;
+            // Embedded files and included chapters often have no package preamble.
+            // In that case require a Subversion keyword in every argument.
+            if !context.has_package("svn-multi")
+                && !matches!(
+                    keyword.split(':').next()?,
+                    "Id" | "Header"
+                        | "Date"
+                        | "LastChangedDate"
+                        | "Revision"
+                        | "Rev"
+                        | "LastChangedRevision"
+                        | "Author"
+                        | "LastChangedBy"
+                        | "URL"
+                        | "HeadURL"
+                )
+            {
+                return None;
+            }
+            ranges.push(start..cursor);
+        }
+        return Some(ranges);
+    }
+    if name == "makepercentother" && context.has_package("mfpic") {
+        // mfpic lets \using read a percent sign as a parameter delimiter.
+        // Check the entire assignment, including the return to normal catcodes.
+        let using = source.len() - source[end..].trim_start().len();
+        let ("using", mut cursor) = crate::syntax::command_at(source, using)? else {
+            return None;
+        };
+        for _ in 0..2 {
+            cursor = source.len() - source[cursor..].trim_start().len();
+            cursor = crate::syntax::literal_group_end(source, cursor)?;
+        }
+        let close = source.len() - source[cursor..].trim_start().len();
+        let ("makepercentcomment", finish) = crate::syntax::command_at(source, close)? else {
+            return None;
+        };
+        return Some(std::iter::once(end..finish).collect());
+    }
+    // doc.sty stores this token list for \Finale, or executes it on the
+    // description-only path. Its terminator belongs to the callback.
+    if matches!(name, "xspaceaddexceptions" | "xspaceremoveexception")
+        && context.has_package("xspace")
+        || name == "Fields" && context.has_package("textmerg")
+        || name == "lispinterp" && context.has_package("lisp-on-tex")
+        || matches!(name, "StopEventually" | "MaybeStop")
+            && ["doc", "ltxdoc", "l3doc", "source2edoc", "gmdoc", "gmdocc"]
+                .iter()
+                .any(|package| context.has_package(package))
+    {
+        let start = crate::trivia::skip(source, end);
+        let finish = crate::syntax::balanced_end(source, start, b'{', b'}')?;
+        return Some(std::iter::once(start..finish).collect());
+    }
+    if name == "htmlonly" && context.has_package("moodle") {
+        return crate::syntax::arguments::domain_ranges(source, end, "o m", "TU");
+    }
+    if name == "Merge" && context.has_package("textmerg") {
+        // Each record binds the declared field names before executing its template.
+        let args =
+            crate::layout::signature_argument_ranges(source, end..source.len(), "mm".bytes());
+        let template = args.get(1)?;
+        return Some(std::iter::once(template.clone()).collect());
+    }
+    if matches!(name, "createexample" | "createexample*") && context.has_package("nlctuserguide") {
+        let signature = crate::syntax::xparse::Signature::parse("omm")?;
+        let arguments = signature.slot_ranges(source, end..source.len())?;
+        return Some(
+            arguments
+                .into_iter()
+                .filter(|argument| argument.slot > 0)
+                .map(|argument| argument.range)
+                .collect(),
+        );
+    }
     if matches!(
         name,
         "macro"
@@ -89,7 +219,9 @@ pub(crate) fn context_command_data_ranges(
         return Some(std::iter::once(start..finish).collect());
     }
     if matches!(name, "filename" | "dirname") && context.has_package("tex-live")
-        || name == "path" && context.has_package("url") && !context.possibly_has_package("tikz")
+        || name == "path"
+            && (context.has_package("url") || context.has_package("hyperref"))
+            && !context.possibly_has_package("tikz")
     {
         let start = crate::trivia::skip(source, end);
         let finish = crate::code_package_syntax::raw_group_end(source, start)?;

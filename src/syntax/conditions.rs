@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use super::{
     CompiledSyntax, TokenKind, command_at, env_at, is_condition_command, latex_macro_definition,
-    lex_with_ranges, line_end, skip_trivia, tex_token_end,
+    lex_with_ranges, line_end, skip_trivia, tex_token_end, untranslated_character_sequence_at,
 };
 use crate::Config;
 
@@ -625,6 +625,17 @@ pub(super) fn inactive_branch_marker(
     let mut pos = start;
     let mut depth = 1usize;
     while pos < source.len() {
+        let sequence_start = if source[pos..].starts_with("\\^^") {
+            pos + 1
+        } else {
+            pos
+        };
+        if config.protect.dynamic_catcodes
+            && untranslated_character_sequence_at(source, sequence_start).is_some()
+        {
+            pos = line_end(source, pos);
+            continue;
+        }
         match source.as_bytes()[pos] {
             b'%' => {
                 pos = line_end(source, pos);

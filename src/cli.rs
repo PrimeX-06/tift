@@ -1,8 +1,7 @@
-use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::{CommandFactory, Parser};
 use ignore::WalkBuilder;
@@ -22,6 +21,9 @@ mod project_context;
 
 #[path = "persistent_cache.rs"]
 mod persistent_cache;
+
+#[path = "project_cache.rs"]
+mod project_cache;
 
 #[path = "source_encoding.rs"]
 mod source_encoding;
@@ -254,11 +256,9 @@ impl Args {
 struct Job {
     path: PathBuf,
     ranges: Option<tift::LineRanges>,
-    source: Arc<String>,
     input: Arc<source_encoding::SourceFile>,
     kind: FileKind,
     config: Arc<CompiledConfig>,
-    input_graph: Option<blake3::Hash>,
     config_sources: Vec<PathBuf>,
     matched_overrides: usize,
     cache: Option<persistent_cache::Request>,
@@ -267,6 +267,47 @@ struct Job {
 struct InputPath {
     path: PathBuf,
     identity: Option<PathBuf>,
+}
+
+struct ProjectFile {
+    selected: InputPath,
+    identity: PathBuf,
+    input: Arc<source_encoding::SourceFile>,
+    preparation_started: Option<std::time::Instant>,
+    effective: config_io::EffectiveConfig,
+}
+
+impl ProjectFile {
+    fn read(
+        selected: InputPath,
+        effective: config_io::EffectiveConfig,
+        project: &project_context::ProjectSnapshot,
+        preparation_started: Option<std::time::Instant>,
+    ) -> Result<(project_context::ProjectDependency, Self), String> {
+        let identity = selected
+            .identity
+            .clone()
+            .or_else(|| fs::canonicalize(&selected.path).ok());
+        let identity =
+            config_io::absolute(identity.as_deref().unwrap_or(&selected.path), Path::new(""));
+        let input = project.read(&identity)?;
+        let dependency = recover_panic(|| {
+            let inputs =
+                project_context::ProjectInputs::scan(&identity, &input.text, &effective.config)?;
+            project.dependency(&identity, &input.text, &effective.config, inputs)
+        })
+        .map_err(|error| format!("{}: {error}", selected.path.display()))??;
+        Ok((
+            dependency,
+            Self {
+                selected,
+                identity,
+                input,
+                preparation_started,
+                effective,
+            },
+        ))
+    }
 }
 
 struct Work {
@@ -432,152 +473,164 @@ fn execute(args: &Args) -> Result<i32, String> {
         .map(|revision| git_changes::Changes::load(revision, &paths))
         .transpose()?;
     let files = collect_files(&paths)?;
-    let mut context = project_context::ProjectContext::default();
-    let mut jobs = Vec::with_capacity(files.len());
+    let mut selected = Vec::with_capacity(files.len());
     let mut preparation_errors = Vec::new();
     for mut input in files {
-        let path = input.path;
-        let changed_path = if let Some(changes) = &changes {
+        if let Some(changes) = &changes {
             if input.identity.is_none() {
-                input.identity =
-                    Some(fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+                input.identity = Some(
+                    fs::canonicalize(&input.path)
+                        .map_err(|error| format!("{}: {error}", input.path.display()))?,
+                );
             }
-            let canonical = input.identity.as_deref().unwrap();
-            if !changes.contains(canonical) && !args.print && args.output.is_none() {
+            if !changes.contains(input.identity.as_deref().unwrap())
+                && !args.print
+                && args.output.is_none()
+            {
                 continue;
             }
-            Some((changes, canonical.to_owned()))
-        } else {
-            None
-        };
-        let effective = match loader.for_path(&path) {
-            Ok(effective) => effective,
-            Err(error) => {
-                preparation_errors.push((path, Err(error)));
-                continue;
-            }
-        };
-        if effective.excluded {
-            continue;
         }
-        let input = match context.read_file_with_identity(&path, input.identity) {
-            Ok(input) => input,
-            Err(error) => {
-                preparation_errors.push((path, Err(error)));
-                continue;
-            }
-        };
-        let source = Arc::clone(&input.text);
-        let ranges = match changed_path {
-            Some((changes, canonical)) => changes.ranges(&canonical, &source)?,
-            None => args.lines.clone(),
-        };
-        let prepared = match recover_panic(|| {
-            context.for_source(&path, Arc::clone(&source), effective.config)
-        }) {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => {
-                preparation_errors.push((path, Err(error)));
-                continue;
-            }
-            Err(error) => {
-                context = project_context::ProjectContext::default();
-                let error = format!("{}: {error}", path.display());
-                preparation_errors.push((path, Err(error)));
-                continue;
-            }
-        };
-        jobs.push(Job {
-            ranges,
-            kind: FileKind::from_path(&path).expect("selected file has a supported extension"),
-            path,
-            source,
-            input,
-            config: prepared.config,
-            input_graph: prepared.input_graph,
-            config_sources: effective.sources,
-            matched_overrides: effective.matched_overrides,
-            cache: None,
-        });
+        match loader.for_path(&input.path) {
+            Ok(effective) if !effective.excluded => selected.push((input, effective)),
+            Ok(_) => (),
+            Err(error) => preparation_errors.push((input.path, error)),
+        }
     }
-    if (args.print || args.output.is_some()) && jobs.is_empty() && preparation_errors.is_empty() {
+    drop(loader);
+    let pool = if selected.len() > 1 {
+        let threads = args
+            .threads
+            .or(selected[0].1.config.config.files.threads)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            })
+            .min(selected.len());
+        (threads > 1)
+            .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
+            .transpose()
+            .map_err(|e| format!("cannot create formatting worker pool: {e}"))?
+    } else {
+        None
+    };
+    if selected.is_empty() && preparation_errors.is_empty() && (args.print || args.output.is_some())
+    {
         return Err("the input file is excluded by configuration".into());
     }
     if let Some(started) = preparation_started {
         eprintln!(
-            "trace: project-preparation: {} file(s), elapsed={:.3} ms",
-            jobs.len(),
+            "trace: input-selection: {} file(s), elapsed={:.3} ms",
+            selected.len(),
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
-    // Each job owns immutable input/configuration snapshots. Dependency graphs,
-    // sibling scans and configuration documents are preparation-only state;
-    // release them before worker parsing and result-cache loading overlap.
-    drop(context);
-    drop(loader);
-    let mut cache = persistent_cache::PersistentCache::default();
-    if !args.trace && !args.trace_detail && args.lines.is_none() && changes.is_none() {
-        for job in &mut jobs {
-            job.cache = cache.request(
-                &job.path,
-                &job.source,
-                job.kind,
-                &job.config,
-                job.input_graph,
-            );
+    let cache = Mutex::new(persistent_cache::PersistentCache::default());
+    let cache_enabled =
+        !args.trace && !args.trace_detail && args.lines.is_none() && changes.is_none();
+    let project = project_context::ProjectSnapshot::new(cache_enabled);
+    let read = |(selected, effective): (InputPath, config_io::EffectiveConfig)| {
+        let path = selected.path.clone();
+        let started = (args.trace || args.trace_detail).then(std::time::Instant::now);
+        ProjectFile::read(selected, effective, &project, started).map_err(|error| (path, error))
+    };
+    let files: Vec<_> = match &pool {
+        Some(pool) => pool.install(|| selected.into_par_iter().map(read).collect()),
+        None => selected.into_iter().map(read).collect(),
+    };
+    let mut groups = std::collections::HashMap::new();
+    for file in files {
+        match file {
+            Ok((dependency, file)) => {
+                let base = Arc::as_ptr(&file.effective.config) as usize;
+                groups
+                    .entry((dependency, base))
+                    .or_insert_with(Vec::new)
+                    .push(file);
+            }
+            Err(error) => preparation_errors.push(error),
         }
     }
-    let mut results = if jobs.len() <= 1 {
-        jobs.iter()
-            .map(|job| {
-                (
-                    Cow::Borrowed(job.path.as_path()),
-                    Some(job),
-                    format_job(job, args),
+    let process = |file: ProjectFile,
+                   prepared: &Result<project_context::PreparedProject, String>| {
+        let path = file.selected.path.clone();
+        let ranges = match (&changes, &file.selected.identity) {
+            (Some(changes), Some(canonical)) => changes.ranges(canonical, &file.input.text)?,
+            _ => args.lines.clone(),
+        };
+        let result = recover_panic(|| {
+            let prepared = prepared
+                .as_ref()
+                .map_err(Clone::clone)?
+                .for_source(&file.identity, &file.input.text)?;
+            let kind = FileKind::from_path(&path).expect("selected file has a supported extension");
+            let request = if cache_enabled && prepared.config.config.cache.enabled {
+                cache.lock().unwrap().request(
+                    &path,
+                    &file.input.text,
+                    kind,
+                    &prepared.config,
+                    prepared.input_graph,
                 )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let threads = args
-            .threads
-            .or_else(|| jobs.first().and_then(|job| job.config.config.files.threads))
-            .unwrap_or(available)
-            .min(jobs.len());
-        if threads == 1 {
-            jobs.iter()
-                .map(|job| {
-                    (
-                        Cow::Borrowed(job.path.as_path()),
-                        Some(job),
-                        format_job(job, args),
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| format!("cannot create formatting worker pool: {e}"))?;
-            pool.install(|| {
-                jobs.par_iter()
-                    .map(|job| {
-                        (
-                            Cow::Borrowed(job.path.as_path()),
-                            Some(job),
-                            format_job(job, args),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-        }
+            } else {
+                None
+            };
+            let job = Job {
+                path: file.selected.path,
+                ranges,
+                kind,
+                input: file.input,
+                config: prepared.config,
+                config_sources: file.effective.sources,
+                matched_overrides: file.effective.matched_overrides,
+                cache: request,
+            };
+            let preparation = file.preparation_started.map(|start| start.elapsed());
+            let work = format_job(&job, args)?;
+            Ok((job, work, preparation))
+        })
+        .map_err(|error| format!("{}: {error}", path.display()))
+        .and_then(|result| result);
+        Ok::<_, String>((path, result))
     };
+    let build = |dependency: &project_context::ProjectDependency, files: &[ProjectFile]| {
+        recover_panic(|| {
+            project.build(
+                dependency,
+                Arc::clone(&files[0].effective.config),
+                files.iter().map(|file| file.identity.clone()).collect(),
+            )
+        })
+        .and_then(|result| result)
+    };
+    let mut results: Vec<_> = match pool {
+        Some(pool) => pool.install(|| {
+            groups
+                .into_par_iter()
+                .flat_map(|((dependency, _), files)| {
+                    let prepared = Arc::new(build(&dependency, &files));
+                    files
+                        .into_par_iter()
+                        .map(move |file| process(file, &prepared))
+                })
+                .collect::<Result<_, _>>()
+        }),
+        None => {
+            let mut results = Vec::new();
+            for ((dependency, _), files) in groups {
+                let prepared = build(&dependency, &files);
+                for file in files {
+                    results.push(process(file, &prepared)?);
+                }
+            }
+            Ok(results)
+        }
+    }?;
+    drop(project);
+    cache.into_inner().unwrap().flush();
     results.extend(
         preparation_errors
             .into_iter()
-            .map(|(path, result)| (Cow::Owned(path), None, result)),
+            .map(|(path, error)| (path, Err(error))),
     );
-    cache.flush();
     results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let checked = results.len();
     let mut changed = 0;
@@ -586,22 +639,26 @@ fn execute(args: &Args) -> Result<i32, String> {
     let mut cache_misses = 0;
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    for (path, job, result) in results {
-        let work = match result {
-            Ok(work) => work,
+    for (path, result) in results {
+        let (job, work, preparation) = match result {
+            Ok(done) => done,
             Err(error) => {
                 eprintln!("error: {error}");
                 failed = true;
                 continue;
             }
         };
-        let job = job.expect("successful work has a prepared job");
         match work.cache_status {
             persistent_cache::Status::Hit => cache_hits += 1,
             persistent_cache::Status::Miss => cache_misses += 1,
             persistent_cache::Status::Bypassed => {}
         }
-        if args.trace || args.trace_detail {
+        if let Some(elapsed) = preparation {
+            eprintln!(
+                "trace: {}: project-preparation: {:.3} ms",
+                path.display(),
+                elapsed.as_secs_f64() * 1000.0
+            );
             trace_configuration(&path, &job.config_sources, job.matched_overrides);
             encoding_trace(&path, &job.input);
             print_trace(&path, &work.trace);
@@ -689,10 +746,11 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
     io::stdin()
         .read_to_end(&mut bytes)
         .map_err(|e| format!("stdin: {e}"))?;
-    let input =
-        source_encoding::SourceFile::decode(bytes).map_err(|error| format!("stdin: {error}"))?;
+    let input = Arc::new(
+        source_encoding::SourceFile::decode(bytes).map_err(|error| format!("stdin: {error}"))?,
+    );
     let source = input.text.as_str();
-    let (mut formatted, trace, details) = if effective.excluded {
+    let (mut formatted, trace, mut details) = if effective.excluded {
         (
             FormatOutput {
                 text: source.to_owned(),
@@ -702,13 +760,16 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
             Vec::new(),
         )
     } else {
-        let prepared = project_context::ProjectContext::default().for_source(
+        let inputs = project_context::ProjectInputs::scan(path, source, &effective.config)?;
+        let cache_enabled = !args.trace && !args.trace_detail && args.lines.is_none();
+        let prepared = project_context::ProjectSnapshot::new(cache_enabled).prepare_buffer(
             path,
-            Arc::clone(&input.text),
+            &input,
             effective.config,
+            inputs,
         )?;
         let mut cache = persistent_cache::PersistentCache::default();
-        let request = if !args.trace && !args.trace_detail && args.lines.is_none() {
+        let request = if cache_enabled {
             let cwd = std::env::current_dir().map_err(|e| format!("stdin: {e}"))?;
             cache.request(
                 &config_io::absolute(path, &cwd),
@@ -735,6 +796,9 @@ fn stdin(args: &Args, loader: &mut config_io::Loader) -> Result<i32, String> {
     let encoded = input.encode(&formatted.text)?;
     for diagnostic in &mut formatted.diagnostics {
         diagnostic.span = input.original_span(diagnostic.span.clone());
+    }
+    for detail in &mut details {
+        detail.original_bytes = input.original_span(detail.original_bytes.clone());
     }
     if args.trace || args.trace_detail {
         trace_configuration(path, &effective.sources, effective.matched_overrides);
@@ -832,11 +896,6 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<InputPath>, String> {
 }
 
 fn format_job(job: &Job, args: &Args) -> Result<Work, String> {
-    recover_panic(|| format_job_inner(job, args))
-        .map_err(|error| format!("{}: {error}", job.path.display()))?
-}
-
-fn format_job_inner(job: &Job, args: &Args) -> Result<Work, String> {
     let metadata =
         fs::symlink_metadata(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
     if !metadata.is_file() {
@@ -845,8 +904,8 @@ fn format_job_inner(job: &Job, args: &Args) -> Result<Work, String> {
             job.path.display()
         ));
     }
-    let original = Arc::clone(&job.source);
-    let (mut formatted, trace, details, cache_status) = format_cached_source(
+    let original = Arc::clone(&job.input.text);
+    let (mut formatted, trace, mut details, cache_status) = format_cached_source(
         &original,
         job.kind,
         &job.config,
@@ -863,6 +922,9 @@ fn format_job_inner(job: &Job, args: &Args) -> Result<Work, String> {
     let encoded = (!job.input.is_utf8()).then(|| encoded.into_owned());
     for diagnostic in &mut formatted.diagnostics {
         diagnostic.span = job.input.original_span(diagnostic.span.clone());
+    }
+    for detail in &mut details {
+        detail.original_bytes = job.input.original_span(detail.original_bytes.clone());
     }
     if args.check && !args.diff {
         // Cache storage and detailed traces are complete. Check-only results
@@ -961,6 +1023,8 @@ fn format_source(
             stage.output_bytes += 3;
         }
         for detail in &mut details {
+            detail.original_bytes.start += 3;
+            detail.original_bytes.end += 3;
             detail.input_bytes.start += 3;
             detail.input_bytes.end += 3;
             detail.output_bytes.start += 3;
@@ -1071,7 +1135,7 @@ fn print_trace(path: &Path, trace: &[StageTrace]) {
 fn print_detail_trace(path: &Path, details: &[tift::trace::DetailTrace]) {
     for event in details {
         eprintln!(
-            "{}: detail: stage={}, action={}, input-lines={}..{}, output-lines={}..{}, input-bytes={}..{}, output-bytes={}..{}, context={}, rule={}",
+            "{}: detail: stage={}, action={}, input-lines={}..{}, output-lines={}..{}, input-bytes={}..{}, output-bytes={}..{}, original-bytes={}..{}, context={}, rule={}",
             path.display(),
             event.stage,
             event.action,
@@ -1083,6 +1147,8 @@ fn print_detail_trace(path: &Path, details: &[tift::trace::DetailTrace]) {
             event.input_bytes.end,
             event.output_bytes.start,
             event.output_bytes.end,
+            event.original_bytes.start,
+            event.original_bytes.end,
             event.context.as_deref().unwrap_or("none"),
             event.rule.as_deref().unwrap_or("none")
         );
@@ -1117,7 +1183,7 @@ fn diagnostics(path: &Path, diagnostics: &[Diagnostic], quiet: bool) -> bool {
 fn encoding_trace(path: &Path, input: &source_encoding::SourceFile) {
     if !input.is_utf8() {
         eprintln!(
-            "{}: trace: stage byte counts and ranges address decoded UTF-8 text; diagnostics address original file bytes",
+            "{}: trace: stage byte counts and ranges address decoded UTF-8 text; original-bytes and diagnostics address original file bytes",
             path.display()
         );
     }

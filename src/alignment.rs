@@ -28,8 +28,8 @@ pub enum ColumnSpecLayout {
     Expand,
 }
 
-pub(crate) use column_spec::format_preambles;
 pub(crate) use column_spec::parts as comma_parts;
+pub(crate) use column_spec::preamble_edits;
 
 const DEFAULT_ENVIRONMENTS: &[&str] = &[
     "tabu",
@@ -600,17 +600,12 @@ fn format_alignment_with_context(
         advanced || matrix_command || tikz_matrix || source.contains('[') || has_code_after;
     let parsed = parsing.snapshot(source, true, structure_needed)?;
     let protected = &parsed.protected;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
+    let analysis = parsed.analysis(&config.config);
     let mut data_ends = std::collections::HashMap::new();
     if has_code_after {
         let structure = parsed.blocks.as_deref().expect("parsed structure");
         for (marker, parent) in
-            crate::package_tables::code_after_markers(structure, &config.config, &analysis)?
+            crate::package_tables::code_after_markers(structure, &config.config, &analysis)
         {
             let pos = structure[marker].begin.start;
             let line = source[..pos].rfind('\n').map_or(0, |i| i + 1);
@@ -635,14 +630,9 @@ fn format_alignment_with_context(
     } else {
         column_spec::DeclaredTypes::default()
     };
-    let environments = crate::syntax::environment_ranges_with_tokens(
-        source,
-        cached_tokens,
-        protected,
-        &config.config,
-    )?;
+    let environments = parsed.environment_ranges(&config.config)?;
     let known_package_environment = crate::packages::is_alignment_environment;
-    let declared_defaults = if environments.iter().any(|environment| {
+    let check_declarations = environments.iter().any(|environment| {
         known_package_environment(&environment.name)
             || equation_labels::environment(&environment.name)
                 && config
@@ -650,17 +640,15 @@ fn format_alignment_with_context(
                     .rules
                     .get(&environment.name)
                     .is_some_and(|r| r.settings.align_equation_labels)
-    }) {
-        analysis.declared_environments()?
-    } else {
-        Default::default()
-    };
+    });
+    let declared_default =
+        |name: &str| check_declarations && analysis.declared_environments().contains(name);
     let declared_ray_commands = if environments
         .iter()
         .any(|environment| crate::package_tables::is_tabularray(&environment.name))
     {
         analysis
-            .declared_commands()?
+            .declared_commands()
             .iter()
             .any(|name| column_spec::TABULARRAY_STYLE_COMMANDS.contains(&name.as_str()))
             || column_spec::TABULARRAY_STYLE_COMMANDS
@@ -674,7 +662,7 @@ fn format_alignment_with_context(
         .map(|e| e.begin.start..e.end.end)
         .collect::<Vec<_>>();
     let mut blocks = environments
-        .into_iter()
+        .iter()
         .filter(|environment| {
             config
                 .alignment
@@ -683,7 +671,7 @@ fn format_alignment_with_context(
                 .is_some_and(|r| r.settings.enabled)
                 && !crate::syntax::is_protected(environment.begin.start, protected)
                 && (!known_package_environment(&environment.name)
-                    || !declared_defaults.contains(&environment.name)
+                    || !declared_default(&environment.name)
                     || config
                         .config
                         .alignment
@@ -705,9 +693,9 @@ fn format_alignment_with_context(
         })
         .map(|environment| Block {
             begin: environment.begin.start,
-            body: environment.body,
+            body: environment.body.clone(),
             end: environment.end.end,
-            name: environment.name,
+            name: environment.name.clone(),
             children: Vec::new(),
             environment: true,
             markup_indent: None,
@@ -735,7 +723,7 @@ fn format_alignment_with_context(
         let matrix_redefined = !explicit_matrix
             && matrix_command
             && (config.config.syntax.commands.contains_key("matrix")
-                || analysis.declared_commands()?.contains("matrix"));
+                || analysis.declared_commands().contains("matrix"));
         if matrix_command && !matrix_redefined {
             for token in tokens.iter() {
                 if token.kind != crate::syntax::TokenKind::Command
@@ -951,7 +939,7 @@ fn format_alignment_with_context(
                 &block.name,
                 &source[block.body.start..content_start],
             )
-            && !declared_defaults.contains(&block.name)
+            && !declared_default(&block.name)
             && !config
                 .config
                 .syntax
@@ -959,7 +947,7 @@ fn format_alignment_with_context(
                 .contains_key(&block.name)
             && source[content_start..block.body.end].contains(r"\label")
             && !config.config.syntax.commands.contains_key("label")
-            && !analysis.declared_commands()?.contains("label"))
+            && !analysis.declared_commands().contains("label"))
         .then_some(equation_labels::Layout {
             limit: config.config.wrap.columns,
             opaque: &opaque,
@@ -973,7 +961,7 @@ fn format_alignment_with_context(
         }
         let columns = if rule.settings.justification == Justification::Columns
             && block.environment
-            && !declared_defaults.contains(&block.name)
+            && !declared_default(&block.name)
             && !config
                 .config
                 .syntax
@@ -991,7 +979,7 @@ fn format_alignment_with_context(
         };
         let diagram_arrows = block.name == "tikzcd"
             && rule.settings.tikzcd_arrows
-            && !declared_defaults.contains(&block.name)
+            && !declared_default(&block.name)
             && !config
                 .config
                 .syntax
@@ -1006,7 +994,7 @@ fn format_alignment_with_context(
             .filter(|&n| n > 0)
             .filter(|_| {
                 block.environment
-                    && !declared_defaults.contains(&block.name)
+                    && !declared_default(&block.name)
                     && (crate::package_tables::is_table(&block.name)
                         || (block.name.contains("NiceArray")
                             && crate::package_environments::column_spec_slot(&block.name)
@@ -1089,11 +1077,19 @@ fn format_alignment_with_context(
         };
         rendered[index] = body;
     }
-    let edits = roots
-        .iter()
-        .map(|&root| (blocks[root].body.clone(), rendered[root].as_str()))
-        .collect::<Vec<_>>();
-    Ok(apply_edits(source, 0..source.len(), &edits))
+    let mut edits = crate::edit_plan::EditPlan::new();
+    let mut cursor = 0;
+    for root in roots {
+        let body = blocks[root].body.clone();
+        if body.start < cursor {
+            continue;
+        }
+        cursor = body.end;
+        if source[body.clone()] != rendered[root] {
+            edits.replace(body, std::mem::take(&mut rendered[root]));
+        }
+    }
+    edits.apply_ordered(source)
 }
 
 // Ranges are ordered by start, with the longest first for equal starts. The
@@ -1324,25 +1320,27 @@ fn indent_markup_body(
         offset += line.len();
     }
     let base = if base == usize::MAX { 0 } else { base };
-    let mut output = String::with_capacity(source.len() + source.len() / 16);
+    let mut edits = crate::edit_plan::EditPlan::new();
     offset = 0;
     for line in source.split_inclusive('\n') {
         if line.trim().is_empty()
             || crate::syntax::is_protected(offset, &protected)
             || crate::syntax::is_protected(offset, &children)
         {
-            output.push_str(line);
+            offset += line.len();
         } else {
             let leading = line.len() - line.trim_start_matches([' ', '\t']).len();
-            output.push_str(indent);
+            let mut replacement = indent.to_owned();
             if !line[leading..].starts_with("%*") {
-                output.push_str(&line[base.min(leading)..leading]);
+                replacement.push_str(&line[base.min(leading)..leading]);
             }
-            output.push_str(&line[leading..]);
+            if replacement != line[..leading] {
+                edits.replace(offset..offset + leading, replacement);
+            }
+            offset += line.len();
         }
-        offset += line.len();
     }
-    Ok(output)
+    edits.apply_ordered(source)
 }
 
 fn apply_edits(source: &str, range: Range<usize>, edits: &[(Range<usize>, &str)]) -> String {
@@ -2157,7 +2155,29 @@ fn format_rows(
                 && (has_row_break
                     || !row.delimiters.is_empty()
                     || cells.iter().any(|cell| !cell.text.is_empty()));
-            let eligible = data_row && !unsafe_comment;
+            // Joining physical lines can change line-scoped readers such as
+            // ltxdoc short verbatim and TeX character translations. Keep such
+            // a row in place when either boundary would move across a line.
+            let content = row.full.start + prefix_len..row.tail.start.min(row.full.end);
+            let first_reader = protected.partition_point(|r| r.end <= content.start);
+            let reader_spans_lines = protected[first_reader..]
+                .iter()
+                .take_while(|r| r.start < content.end)
+                .any(|r| {
+                    let literal = &source[r.clone()];
+                    literal.contains("^^")
+                        || literal.chars().next().is_some_and(|c| {
+                            !c.is_alphanumeric()
+                                && !c.is_whitespace()
+                                && !matches!(c, '\\' | '{' | '[' | '%')
+                                && literal.len() > c.len_utf8()
+                                && literal.ends_with(c)
+                        })
+                })
+                && source[content.clone()]
+                    .trim_end_matches(['\r', '\n', ' ', '\t'])
+                    .contains('\n');
+            let eligible = data_row && !unsafe_comment && !reader_spans_lines;
             Ok::<_, FormatError>(MeasuredRow {
                 equation_label: None,
                 folded: false,

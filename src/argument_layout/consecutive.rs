@@ -2,7 +2,6 @@
 use crate::{
     CompiledConfig, FormatError,
     parse_context::ParseContext,
-    source_analysis::SourceAnalysis,
     source_model::{RuleMeaning, SourceModel},
     syntax,
     wrap::display_width,
@@ -33,13 +32,16 @@ pub(crate) fn format(
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
 ) -> Result<String, FormatError> {
+    collect_edits(source, config, parsing)?.apply_ordered(source)
+}
+
+pub(crate) fn collect_edits(
+    source: &str,
+    config: &CompiledConfig,
+    parsing: &mut ParseContext<'_>,
+) -> Result<crate::edit_plan::EditPlan<'static>, FormatError> {
     let parsed = parsing.snapshot(source, false, false)?;
-    let analysis = SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
+    let analysis = parsed.analysis(&config.config);
     let model = analysis.model();
     let limit = config
         .config
@@ -48,7 +50,7 @@ pub(crate) fn format(
         .unwrap_or(config.config.wrap.columns);
     let tab = config.config.indent.width.max(1);
     let mut group: Vec<Row<'_>> = Vec::new();
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut offset = 0;
     for physical in source.split_inclusive('\n') {
         let line = physical.trim_end_matches(['\r', '\n']);
@@ -58,7 +60,7 @@ pub(crate) fn format(
             .zip(next.as_ref())
             .is_some_and(|(last, next)| last.matches(next))
         {
-            align(&group, limit, tab, &mut edits);
+            align(source, &group, limit, tab, &mut edits);
             group.clear();
         }
         if let Some(next) = next {
@@ -66,8 +68,8 @@ pub(crate) fn format(
         }
         offset += physical.len();
     }
-    align(&group, limit, tab, &mut edits);
-    crate::layout::apply_edits(source, edits)
+    align(source, &group, limit, tab, &mut edits);
+    Ok(edits)
 }
 
 fn row<'a>(
@@ -208,7 +210,13 @@ fn starts(rows: &[Row<'_>], limit: usize, tab: usize) -> Option<Vec<usize>> {
     Some(result)
 }
 
-fn align(mut rows: &[Row<'_>], limit: usize, tab: usize, edits: &mut Vec<(Range<usize>, String)>) {
+fn align(
+    source: &str,
+    mut rows: &[Row<'_>],
+    limit: usize,
+    tab: usize,
+    edits: &mut crate::edit_plan::EditPlan<'_>,
+) {
     while rows.len() >= 2 {
         if starts(&rows[..2], limit, tab).is_none() {
             rows = &rows[1..];
@@ -238,7 +246,14 @@ fn align(mut rows: &[Row<'_>], limit: usize, tab: usize, edits: &mut Vec<(Range<
         for row in group {
             for (col, gap) in row.gaps.iter().enumerate() {
                 let end = columns[col] + display_width(row.cells[col], columns[col], tab);
-                edits.push((gap.clone(), " ".repeat(columns[col + 1] - end)));
+                let spaces = columns[col + 1] - end;
+                if gap.len() != spaces || source[gap.clone()].contains('\t') {
+                    edits.replace_from(
+                        crate::edit_plan::EditOrigin::ConsecutiveArguments,
+                        gap.clone(),
+                        " ".repeat(spaces),
+                    );
+                }
             }
         }
         rows = rest;

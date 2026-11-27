@@ -36,6 +36,14 @@ pub(crate) fn context_header_signature(
         "forestexample" if context.has_package("forest-doc") => Some("o"),
         "numVblock" if context.has_package("numberedblock") => Some("o"),
         "codeexample" if context.has_package("pgfmanual-en-macros") => Some("o"),
+        // codelisting.sty defines this stored source reader with \newenvsc.
+        "codestore" if context.has_package("codelisting") => Some("o"),
+        "vdm_al" | "vdmsl" | "vdmsl_10" | "vdmpp" | "vdmpp_10" | "vdmrt" | "vdmrt_10"
+            if context.has_package("vdmlisting") =>
+        {
+            Some("o")
+        }
+        "vdmrealtimeinfo" if context.has_package("vdmlisting") => Some(""),
         _ if is_terminal_listing(name) && context.has_package("sim-os-menus") => Some("om"),
         // naive-ebnf tokenizes punctuation in the collected grammar body.
         "ebnf" if context.has_package("naive-ebnf") => Some("o"),

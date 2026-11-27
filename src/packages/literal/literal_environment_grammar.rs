@@ -95,9 +95,8 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
 /// Backslashes and percent signs in the raw body have ordinary character
 /// catcodes, so each literal same-name begin/end contributes to nesting.
 pub(crate) fn nested_environment_end(source: &str, body_start: usize, name: &str) -> Option<usize> {
-    if name != "scontents" {
-        return None;
-    }
+    let begin = format!("\\begin{{{name}}}");
+    let end = format!("\\end{{{name}}}");
     let mut start = body_start;
     while matches!(source.as_bytes().get(start), Some(b' ' | b'\t' | b'\r')) {
         start += 1;
@@ -111,12 +110,12 @@ pub(crate) fn nested_environment_end(source: &str, body_start: usize, name: &str
     let mut depth = 1usize;
     while let Some(offset) = source.get(cursor..)?.find('\\') {
         cursor += offset;
-        if source[cursor..].starts_with("\\begin{scontents}") {
+        if source[cursor..].starts_with(&begin) {
             depth += 1;
-            cursor += "\\begin{scontents}".len();
-        } else if source[cursor..].starts_with("\\end{scontents}") {
+            cursor += begin.len();
+        } else if source[cursor..].starts_with(&end) {
             depth -= 1;
-            cursor += "\\end{scontents}".len();
+            cursor += end.len();
             if depth == 0 {
                 return Some(cursor);
             }

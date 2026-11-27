@@ -15,12 +15,16 @@ pub(crate) struct MathRegion {
     pub text_cases: bool,
 }
 
+struct MathInvocation {
+    signature: math::Signature,
+    arguments: Vec<MathArgument>,
+}
+
 pub(crate) struct MathModes {
     pub regions: Vec<MathRegion>,
     pub declared: HashSet<String>,
     source_overrides: HashSet<usize>,
-    signatures: HashMap<usize, math::Signature>,
-    arguments: HashMap<usize, Vec<MathArgument>>,
+    invocations: HashMap<usize, MathInvocation>,
     environments: HashMap<usize, usize>,
     literal_environments: HashMap<usize, Range<usize>>,
 }
@@ -54,20 +58,15 @@ impl MathModes {
             .iter()
             .map(|&at| positions.position(at, true))
             .collect::<Option<_>>()?;
-        self.signatures = self
-            .signatures
+        self.invocations = self
+            .invocations
             .drain()
-            .map(|(at, signature)| Some((positions.position(at, true)?, signature)))
-            .collect::<Option<_>>()?;
-        self.arguments = self
-            .arguments
-            .drain()
-            .map(|(at, mut arguments)| {
-                for argument in &mut arguments {
+            .map(|(at, mut invocation)| {
+                for argument in &mut invocation.arguments {
                     positions.remap_range(&mut argument.range)?;
                     positions.remap_range(&mut argument.body)?;
                 }
-                Some((positions.position(at, true)?, arguments))
+                Some((positions.position(at, true)?, invocation))
             })
             .collect::<Option<_>>()?;
         Some(())
@@ -93,15 +92,15 @@ impl MathModes {
         if self.source_overrides.contains(&at) {
             return None;
         }
-        self.signatures
+        self.invocations
             .get(&at)
-            .copied()
+            .map(|invocation| invocation.signature)
             .or_else(|| command_signature(name))
     }
 
     pub(crate) fn is_overridden(&self, name: &str, at: usize) -> bool {
         self.source_overrides.contains(&at)
-            || self.declared.contains(name) && !self.signatures.contains_key(&at)
+            || self.declared.contains(name) && !self.invocations.contains_key(&at)
     }
 
     pub(crate) fn arguments_at(
@@ -112,7 +111,8 @@ impl MathModes {
         limit: usize,
         signature: math::Signature,
     ) -> Cow<'_, [MathArgument]> {
-        if let Some(arguments) = self.arguments.get(&at) {
+        if let Some(invocation) = self.invocations.get(&at) {
+            let arguments = &invocation.arguments;
             let count = arguments.partition_point(|argument| argument.range.end <= limit);
             return Cow::Borrowed(&arguments[..count]);
         }
@@ -131,7 +131,7 @@ impl MathModes {
     ) -> Result<Self, FormatError> {
         let same_protection = parsing.snapshot(source, false, false)?.protected == protected;
         let parsed = parsing.snapshot(source, same_protection, same_protection)?;
-        let exposed_model = (parsed.protected != protected).then(|| {
+        let exposed_model = (!same_protection).then(|| {
             parsed
                 .metadata
                 .exposed_model(source, &config.config, protected)
@@ -144,15 +144,10 @@ impl MathModes {
                 model,
             )
         } else {
-            crate::source_analysis::SourceAnalysis::with_memo(
-                source,
-                &config.config,
-                &parsed.protected,
-                std::rc::Rc::clone(&parsed.metadata),
-            )
+            parsed.analysis(&config.config)
         };
         let adjusted;
-        let (tokens, blocks) = if parsed.protected == protected {
+        let (tokens, blocks) = if same_protection {
             (
                 parsed.tokens.as_deref().expect("math tokens"),
                 parsed.blocks.as_deref().expect("math blocks"),
@@ -164,15 +159,25 @@ impl MathModes {
             adjusted = syntax::shared_blocks_with_analysis(source, config, ranges, &analysis)?;
             (adjusted.0.as_slice(), adjusted.1.as_slice())
         };
-        let declared = analysis.declared_commands()?.into_owned();
+        let declared = analysis.declared_commands().clone();
         let mut regions = Vec::new();
-        let mut signatures = HashMap::new();
-        let mut arguments = HashMap::new();
+        let mut invocations = HashMap::new();
         let mut source_overrides = HashSet::new();
         let mut literal_environments = HashMap::new();
         for block in blocks {
+            // Tabular cells start in text mode even inside a display. Their
+            // explicit inner math shifts are independent regions below.
             if block.kind == BlockKind::Environment
-                && (block.name == "tikzcd" || crate::tikz_scan::environment(&block.name))
+                && (block.name == "tikzcd"
+                    || crate::tikz_scan::environment(&block.name)
+                    || matches!(
+                        block.name.as_str(),
+                        "tabular" | "tabular*" | "tabularx" | "tabulary" | "longtable"
+                    ) && !config
+                        .config
+                        .syntax
+                        .environment_arguments
+                        .contains_key(&*block.name))
             {
                 literal_environments.insert(block.begin.start, block.begin.start..block.end.end);
                 continue;
@@ -243,19 +248,20 @@ impl MathModes {
                 });
             }
         }
+        let model = analysis.model();
         for token in tokens {
             if token.kind != TokenKind::Command {
                 continue;
             }
-            let Some((name, end)) = syntax::command_at(source, token.span.start) else {
+            let Some((name, end)) = model
+                .control_at(token.span.start)
+                .or_else(|| syntax::command_at(source, token.span.start))
+            else {
                 continue;
             };
             let name = name.trim_end_matches('*');
-            let inferred_signature = analysis
-                .model()
-                .inferred_math_signature_at(token.span.start);
-            let source_override = analysis
-                .model()
+            let inferred_signature = model.inferred_math_signature_at(token.span.start);
+            let source_override = model
                 .invocation_rule(token.span.start)
                 .is_some_and(|rule| rule.origin != crate::source_model::RuleOrigin::Builtin);
             if config.config.syntax.commands.contains_key(name)
@@ -267,32 +273,29 @@ impl MathModes {
             let signature = inferred_signature.or_else(|| {
                 crate::packages::context_math_signature(
                     name,
-                    &analysis.model().invocation_context_at(token.span.start),
+                    &model.invocation_context_at(token.span.start),
                 )
                 .or_else(|| command_signature(name))
             });
             let Some(signature) = signature else {
                 continue;
             };
-            signatures.insert(token.span.start, signature);
             let end = invocation_cursor(source, end, signature);
-            let invocation_arguments = if let Some(slots) = analysis
-                .model()
-                .invocation_argument_ranges_at(token.span.start)
-            {
-                slots
-                    .iter()
-                    .filter_map(|slot| {
-                        Some(MathArgument {
-                            range: slot.range.clone(),
-                            body: slot.body.clone(),
-                            domain: *signature.domains.as_bytes().get(slot.slot)?,
+            let invocation_arguments =
+                if let Some(slots) = model.invocation_argument_ranges_at(token.span.start) {
+                    slots
+                        .iter()
+                        .filter_map(|slot| {
+                            Some(MathArgument {
+                                range: slot.range.clone(),
+                                body: slot.body.clone(),
+                                domain: *signature.domains.as_bytes().get(slot.slot)?,
+                            })
                         })
-                    })
-                    .collect()
-            } else {
-                argument_ranges(source, end, source.len(), signature)
-            };
+                        .collect()
+                } else {
+                    argument_ranges(source, end, source.len(), signature)
+                };
             for argument in &invocation_arguments {
                 if argument.domain == b'M' {
                     regions.push(MathRegion {
@@ -303,7 +306,13 @@ impl MathModes {
                     });
                 }
             }
-            arguments.insert(token.span.start, invocation_arguments);
+            invocations.insert(
+                token.span.start,
+                MathInvocation {
+                    signature,
+                    arguments: invocation_arguments,
+                },
+            );
         }
         regions.sort_by_key(|region| (region.body.start, std::cmp::Reverse(region.body.end)));
         regions.dedup_by(|left, right| left.body == right.body);
@@ -316,8 +325,7 @@ impl MathModes {
         Ok(Self {
             regions,
             declared,
-            signatures,
-            arguments,
+            invocations,
             source_overrides,
             environments,
             literal_environments,

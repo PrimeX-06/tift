@@ -1,6 +1,6 @@
 //! Raw pseudocode bodies from the `algorithms` and `algorithmicx` packages.
 
-use crate::{CompiledConfig, FormatError, source_analysis::SourceAnalysis, syntax};
+use crate::{CompiledConfig, source_analysis::SourceAnalysis, syntax};
 use std::{collections::BTreeMap, ops::Range};
 
 pub(crate) const VERBATIM_ENVIRONMENTS: &[&str] = &[
@@ -19,16 +19,16 @@ pub(crate) fn indent_lines(
     config: &CompiledConfig,
     protected: &[Range<usize>],
     analysis: &SourceAnalysis<'_>,
-) -> Result<BTreeMap<usize, usize>, FormatError> {
+) -> BTreeMap<usize, usize> {
     let mut result = BTreeMap::new();
     if config
         .config
         .syntax
         .environment_arguments
         .contains_key("algorithmic")
-        || analysis.declared_environments()?.contains("algorithmic")
+        || analysis.declared_environments().contains("algorithmic")
     {
-        return Ok(result);
+        return result;
     }
     for block in syntax::verbatim_blocks_with_ranges(source, protected) {
         if block.name != "algorithmic" {
@@ -52,7 +52,7 @@ pub(crate) fn indent_lines(
             result.insert(block.end.start, 0);
         }
     }
-    Ok(result)
+    result
 }
 
 fn body_lines(

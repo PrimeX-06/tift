@@ -9,8 +9,10 @@ pub mod code_layout;
 pub mod config;
 mod description;
 mod docstrip;
+mod edit_plan;
 mod foreach;
 pub mod layout;
+mod lexical_index;
 pub mod literal_expansion;
 pub mod math_layout;
 #[path = "packages/package_support_registry.rs"]
@@ -21,7 +23,9 @@ mod pgfplots_table;
 mod playground;
 pub mod ranges;
 pub mod replacements;
+mod semantic_index;
 mod source_analysis;
+mod source_document;
 pub mod source_model;
 pub mod syntax;
 mod tikz;
@@ -65,8 +69,65 @@ pub struct FormatOutput {
 pub enum FormatError {
     #[error("{0}")]
     Syntax(String),
+    #[error("{closing} at byte {at}; {opening} at byte {opener}", at = .closer.start)]
+    StructuralMismatch {
+        opening: String,
+        closing: String,
+        opener: usize,
+        closer: Range<usize>,
+    },
     #[error("replacement failed: {0}")]
     Replacement(String),
+}
+
+impl FormatError {
+    pub(crate) fn byte_offset(&self) -> Option<usize> {
+        if let Self::StructuralMismatch { closer, .. } = self {
+            return Some(closer.start);
+        }
+        let Self::Syntax(message) = self else {
+            return None;
+        };
+        let (_, rest) = message.split_once(" at byte ")?;
+        rest[..rest.bytes().take_while(u8::is_ascii_digit).count()]
+            .parse()
+            .ok()
+    }
+
+    /// Syntax errors can include both the failing token and the opener.
+    pub(crate) fn map_byte_offsets(self, offset: impl Fn(usize) -> Option<usize>) -> Self {
+        if let Self::StructuralMismatch {
+            opening,
+            closing,
+            opener,
+            closer,
+        } = self
+        {
+            return Self::StructuralMismatch {
+                opening,
+                closing,
+                opener: offset(opener).unwrap_or(opener),
+                closer: offset(closer.start).unwrap_or(closer.start)
+                    ..offset(closer.end).unwrap_or(closer.end),
+            };
+        }
+        let Self::Syntax(message) = self else {
+            return self;
+        };
+        let mut parts = message.split(" at byte ");
+        let mut mapped = String::from(parts.next().unwrap_or_default());
+        for part in parts {
+            mapped.push_str(" at byte ");
+            let count = part.bytes().take_while(u8::is_ascii_digit).count();
+            if let Some(at) = part[..count].parse().ok().and_then(&offset) {
+                mapped.push_str(&at.to_string());
+                mapped.push_str(&part[count..]);
+            } else {
+                mapped.push_str(part);
+            }
+        }
+        Self::Syntax(mapped)
+    }
 }
 
 pub fn compile_config(config: Config) -> Result<CompiledConfig, ConfigError> {

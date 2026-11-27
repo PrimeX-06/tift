@@ -208,15 +208,15 @@ pub(crate) fn code_after_markers(
     blocks: &[crate::syntax::SharedBlock],
     config: &crate::Config,
     analysis: &crate::source_analysis::SourceAnalysis<'_>,
-) -> Result<Vec<(usize, usize)>, crate::FormatError> {
+) -> Vec<(usize, usize)> {
     use crate::syntax::BlockKind;
     if config.syntax.commands.contains_key("CodeAfter")
-        || analysis.declared_commands()?.contains("CodeAfter")
+        || analysis.declared_commands().contains("CodeAfter")
     {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let declared = analysis.declared_environments()?;
-    Ok(blocks
+    let declared = analysis.declared_environments();
+    blocks
         .iter()
         .enumerate()
         .filter_map(|(i, block)| {
@@ -234,5 +234,5 @@ pub(crate) fn code_after_markers(
                     .contains_key(env.name.as_str()))
             .then_some((i, parent))
         })
-        .collect())
+        .collect()
 }

@@ -196,11 +196,11 @@ fn named_rows(data: &str, slash: bool, base: &str, unit: &str) -> Option<String>
     Some(output)
 }
 
-pub(crate) fn format(
+pub(crate) fn table_edits(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
-) -> Result<String, FormatError> {
+) -> Result<crate::edit_plan::RuleEdits, FormatError> {
     let parsed = parsing.snapshot(source, true, false)?;
     let newline = if source.contains("\r\n") {
         "\r\n"
@@ -208,7 +208,7 @@ pub(crate) fn format(
         "\n"
     };
     let unit = config.config.indent.unit("tikz-path", "addplot");
-    let mut edits = Vec::new();
+    let mut plan = crate::edit_plan::RuleEdits::default();
     let mut inherited_reader = false;
     for token in parsed.tokens.as_deref().expect("plot tokens") {
         if token.kind != syntax::TokenKind::Command {
@@ -218,6 +218,7 @@ pub(crate) fn format(
         if matches!(name, r"\pgfplotstableset" | r"\pgfplotsset" | r"\pgfkeys") {
             let arg = crate::trivia::skip(source, token.span.end);
             if let Some(end) = syntax::balanced_end(source, arg, b'{', b'}') {
+                plan.reads.push(token.span.start..end);
                 let options = &source[arg + 1..end - 1];
                 inherited_reader |= match name {
                     r"\pgfplotstableset" => {
@@ -257,6 +258,17 @@ pub(crate) fn format(
         let Some((options, data)) = args else {
             continue;
         };
+        let line_start = source[..token.span.start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        let read_end = if named {
+            source[data.end..]
+                .find('\n')
+                .map_or(source.len(), |at| data.end + at)
+        } else {
+            data.end
+        };
+        plan.reads.push(line_start..read_end);
         // The lexical pass assigns this range only to a recognized package reader.
         let owner = options.start..data.end;
         let index = parsed.protected.partition_point(|r| r.end <= owner.start);
@@ -286,10 +298,10 @@ pub(crate) fn format(
         if let Some(text) = rendered
             && text != source[body.clone()]
         {
-            edits.push((body, text));
+            plan.edits.replace(body, text);
         }
     }
-    crate::layout::apply_edits(source, edits)
+    Ok(plan)
 }
 
 fn standalone_target(rest: &str) -> bool {

@@ -30,6 +30,9 @@ pub(crate) fn format_docstrip(
     }
     let opaque = code_layout::Opaque::new(source, ranges);
     let mut settings = config.config.clone();
+    // Documentation, macrocode and guard lines are parts of one physical
+    // file. Only the enclosing document can apply its final-newline policy.
+    settings.output.final_newline = crate::config::FinalNewline::Preserve;
     settings.code.algorithm2e = false;
     settings.code.expl3 = false;
     settings.math.enabled = false;
@@ -50,6 +53,7 @@ pub(crate) fn format_docstrip(
     let formatted = if kind == FileKind::Dtx {
         let documentation = documentation_config(class.as_deref(), &structural)?;
         let mut code = config.config.clone();
+        code.output.final_newline = crate::config::FinalNewline::Preserve;
         code.replacements.clear();
         let code =
             CompiledConfig::new(code).map_err(|error| FormatError::Syntax(error.to_string()))?;

@@ -1,4 +1,5 @@
 use crate::config::{BreakMode, FinalNewline, LineEnding};
+use crate::edit_plan::EditOrigin;
 use crate::parse_context::ParseContext;
 use crate::source_analysis::SourceAnalysis;
 use crate::syntax::{self, BlockKind, SharedBlock as Block};
@@ -21,15 +22,28 @@ fn stage(
     name: &'static str,
     source: &str,
     trace: &mut Option<&mut Vec<StageTrace>>,
-    details: &mut Option<&mut Vec<crate::trace::DetailTrace>>,
+    details: &mut Option<&mut crate::trace::DetailJournal>,
     config: &CompiledConfig,
     operation: impl FnOnce() -> Result<String, FormatError>,
 ) -> Result<String, FormatError> {
+    stage_recording(name, source, trace, details, config, || {
+        Ok((operation()?, None))
+    })
+}
+
+fn stage_recording(
+    name: &'static str,
+    source: &str,
+    trace: &mut Option<&mut Vec<StageTrace>>,
+    details: &mut Option<&mut crate::trace::DetailJournal>,
+    config: &CompiledConfig,
+    operation: impl FnOnce() -> Result<(String, Option<crate::edit_plan::EditHistory>), FormatError>,
+) -> Result<String, FormatError> {
     let started = trace.is_some().then(Instant::now);
-    let text = operation()?;
+    let (text, exact) = operation()?;
     let elapsed = started.map(|started| started.elapsed());
     if let Some(details) = details.as_deref_mut() {
-        details.extend(crate::trace::stage_changes(name, source, &text, config));
+        details.record(name, source, &text, config, exact);
     }
     if let Some(trace) = trace.as_deref_mut() {
         trace.push(StageTrace {
@@ -43,11 +57,27 @@ fn stage(
     Ok(text)
 }
 
+fn planned_stage(
+    name: &'static str,
+    source: &str,
+    trace: &mut Option<&mut Vec<StageTrace>>,
+    details: &mut Option<&mut crate::trace::DetailJournal>,
+    config: &CompiledConfig,
+    operation: impl FnOnce(Option<&mut crate::edit_plan::EditHistory>) -> Result<String, FormatError>,
+) -> Result<String, FormatError> {
+    let detailed = details.is_some();
+    stage_recording(name, source, trace, details, config, || {
+        let mut history = detailed.then(crate::edit_plan::EditHistory::default);
+        let output = operation(history.as_mut())?;
+        Ok((output, history))
+    })
+}
+
 fn optional_stage(
     name: &'static str,
     text: &mut String,
     trace: &mut Option<&mut Vec<StageTrace>>,
-    details: &mut Option<&mut Vec<crate::trace::DetailTrace>>,
+    details: &mut Option<&mut crate::trace::DetailJournal>,
     config: &CompiledConfig,
     enabled: bool,
     operation: impl FnOnce(&str) -> Result<String, FormatError>,
@@ -68,6 +98,265 @@ fn optional_stage(
     let changed = processed != *text;
     *text = processed;
     Ok(changed)
+}
+
+/// Each rule reads the preceding rule's output. Follow-up passes consult the
+/// edit status of their prerequisites, including on the untraced entry point.
+#[derive(Clone, Copy)]
+enum TexRule {
+    Macros,
+    Math,
+    Arguments,
+    ProseSpaces,
+    Description,
+    TextBefore,
+    Alignment,
+    TextAfter,
+    WhitespaceAfter,
+    Code,
+    MathFinal,
+    MacrosFinal,
+    WhitespaceFinal,
+    ColumnSpecs,
+    Trees,
+    PlotTables,
+    Foreach,
+    Consecutive,
+    TrailingComments,
+}
+
+impl TexRule {
+    const ORDER: &[Self] = &[
+        Self::Macros,
+        Self::Math,
+        Self::Arguments,
+        Self::ProseSpaces,
+        Self::Description,
+        Self::TextBefore,
+        Self::Alignment,
+        Self::TextAfter,
+        Self::WhitespaceAfter,
+        Self::Code,
+        Self::MathFinal,
+        Self::MacrosFinal,
+        Self::WhitespaceFinal,
+        Self::ColumnSpecs,
+        Self::Trees,
+        Self::PlotTables,
+        Self::Foreach,
+        Self::Consecutive,
+        Self::TrailingComments,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Macros => "macro-bodies",
+            Self::Math => "math",
+            Self::Arguments => "arguments",
+            Self::ProseSpaces => "prose-spaces",
+            Self::Description => "description",
+            Self::TextBefore => "text-before",
+            Self::Alignment => "alignment",
+            Self::TextAfter => "text-after",
+            Self::WhitespaceAfter => "whitespace-after",
+            Self::Code => "code",
+            Self::MathFinal => "math-final",
+            Self::MacrosFinal => "macro-bodies-final",
+            Self::WhitespaceFinal => "whitespace-final",
+            Self::ColumnSpecs => "column-specs",
+            Self::Trees => "trees",
+            Self::PlotTables => "pgfplots-tables",
+            Self::Foreach => "foreach-lists",
+            Self::Consecutive => "consecutive-arguments",
+            Self::TrailingComments => "trailing-comments",
+        }
+    }
+
+    const fn bit(self) -> u32 {
+        1 << self as u8
+    }
+
+    fn local_edits(
+        self,
+        source: &str,
+        config: &CompiledConfig,
+        parsing: &mut ParseContext<'_>,
+    ) -> Result<crate::edit_plan::RuleEdits, FormatError> {
+        match self {
+            Self::ColumnSpecs => crate::alignment::preamble_edits(source, config, parsing),
+            Self::Trees => crate::tree_layout::tree_edits(source, config, parsing),
+            Self::PlotTables => crate::pgfplots_table::table_edits(source, config, parsing),
+            Self::Foreach => crate::foreach::list_edits(source, config, parsing),
+            _ => unreachable!("nonlocal rule cannot submit to the local layout batch"),
+        }
+    }
+}
+
+fn format_tex_rules(
+    text: &mut String,
+    kind: FileKind,
+    config: &CompiledConfig,
+    parsing: &mut ParseContext<'_>,
+    trace: &mut Option<&mut Vec<StageTrace>>,
+    details: &mut Option<&mut crate::trace::DetailJournal>,
+) -> Result<(), FormatError> {
+    use TexRule::*;
+    const CLEANUP_INPUTS: u32 =
+        Math.bit() | Arguments.bit() | TextBefore.bit() | Alignment.bit() | TextAfter.bit();
+    let mut changed = 0;
+    let mut code_activity = None;
+    let mut math_recheck = false;
+    let mut column_edits = None;
+    let mut batch = crate::edit_plan::LayoutBatch::default();
+    let settings = &config.config;
+    for &rule in TexRule::ORDER {
+        let local = matches!(rule, ColumnSpecs | Trees | PlotTables | Foreach);
+        if !local || batch.requires_snapshot() {
+            batch.flush(text)?;
+        }
+        // The two horizontal alignment passes share token positions. When
+        // individual trace stages are requested, materialize each stage for
+        // its own timing, coordinates and diff.
+        if matches!(rule, Consecutive)
+            && settings.arguments.align_consecutive
+            && settings.comments.align_trailing
+            && trace.is_none()
+        {
+            column_edits = Some(crate::argument_layout::consecutive::collect_edits(
+                text, config, parsing,
+            )?);
+            continue;
+        }
+        let enabled = match rule {
+            Macros => syntax::macro_layout_active(text, config),
+            Math => crate::math_layout::is_active(text, config),
+            Arguments => crate::argument_layout::is_active(text, config),
+            ProseSpaces => {
+                kind == FileKind::Tex
+                    && settings.wrap.mode == "preserve"
+                    && settings.wrap.collapse_spaces
+                    && text.contains("  ")
+            }
+            Description => settings.wrap.align_description,
+            TextBefore => crate::wrap::is_active(config, crate::wrap::Stage::Before),
+            Alignment => true,
+            TextAfter => crate::wrap::is_active(config, crate::wrap::Stage::After),
+            WhitespaceAfter if changed & CLEANUP_INPUTS == 0 => continue,
+            WhitespaceAfter => true,
+            Code => {
+                let activity = crate::code_layout::activity(text, config);
+                code_activity = Some(activity);
+                activity.active()
+            }
+            MathFinal => {
+                changed & Code.bit() != 0
+                    && math_recheck
+                    && crate::math_layout::is_active(text, config)
+            }
+            MacrosFinal => changed & (Code.bit() | CLEANUP_INPUTS) != 0,
+            WhitespaceFinal => {
+                changed & Macros.bit() != 0 || code_activity.is_some_and(|a| a.active())
+            }
+            ColumnSpecs => {
+                settings.alignment.column_spec != crate::alignment::ColumnSpecLayout::Preserve
+                    || settings
+                        .alignment
+                        .rules
+                        .values()
+                        .any(|rule| rule.column_spec.is_some())
+            }
+            Trees => {
+                settings.trees.mode != crate::tree_layout::TreeMode::Preserve
+                    || settings.trees.dirtree && text.contains(r"\dirtree")
+            }
+            PlotTables => {
+                settings.breaks.enabled
+                    && (settings.breaks.pgfplots_tables && text.contains(r"\addplot")
+                        || settings.breaks.pgfplots_named_tables
+                            && text.contains(r"\pgfplotstableread"))
+            }
+            Foreach => {
+                settings.arguments.foreach_lists
+                    != crate::argument_layout::ForeachListMode::Preserve
+            }
+            Consecutive => settings.arguments.align_consecutive,
+            TrailingComments => settings.comments.align_trailing,
+        };
+        if local && enabled && trace.is_none() {
+            let mut proposals = rule.local_edits(text, config, parsing)?;
+            if batch.affects(&proposals.reads) {
+                batch.flush(text)?;
+                proposals = rule.local_edits(text, config, parsing)?;
+            }
+            batch.queue(text, proposals);
+            continue;
+        }
+        let edited = optional_stage(
+            rule.name(),
+            text,
+            trace,
+            details,
+            config,
+            enabled,
+            |source| match rule {
+                Macros | MacrosFinal => {
+                    syntax::format_macro_definitions_with_context(source, config, parsing)
+                }
+                Math | MathFinal => {
+                    crate::math_layout::format_math_with_context(source, kind, config, parsing)
+                }
+                Arguments => crate::argument_layout::format_arguments_with_context(
+                    source, config, kind, parsing,
+                ),
+                ProseSpaces => crate::wrap::collapse_prose_spaces(source, config, parsing),
+                Description => crate::description::format(source, config, parsing),
+                TextBefore => crate::wrap::format_text_with_context(
+                    source,
+                    config,
+                    crate::wrap::Stage::Before,
+                    parsing,
+                ),
+                Alignment => {
+                    crate::alignment::format_alignment_after_indent(source, config, parsing)
+                }
+                TextAfter => crate::wrap::format_text_with_context(
+                    source,
+                    config,
+                    crate::wrap::Stage::After,
+                    parsing,
+                ),
+                WhitespaceAfter | WhitespaceFinal => {
+                    clean_whitespace(source, config, parsing, None)
+                }
+                Code => {
+                    let output = crate::code_layout::format_code_with_context(
+                        source,
+                        kind,
+                        config,
+                        parsing,
+                        code_activity.expect("code eligibility checked"),
+                    )?;
+                    math_recheck = output.math_recheck;
+                    Ok(output.text)
+                }
+                ColumnSpecs | Trees | PlotTables | Foreach => rule
+                    .local_edits(source, config, parsing)?
+                    .edits
+                    .apply_first_wins(source),
+                Consecutive => crate::argument_layout::consecutive::format(source, config, parsing),
+                TrailingComments => crate::wrap::align_comments_after_edits(
+                    source,
+                    config,
+                    parsing,
+                    column_edits.take().unwrap_or_default(),
+                ),
+            },
+        )?;
+        if edited {
+            changed |= rule.bit();
+        }
+    }
+    Ok(())
 }
 
 pub fn format_document(
@@ -102,9 +391,101 @@ pub fn format_document_detailed(
     FormatError,
 > {
     let mut trace = Vec::new();
-    let mut details = Vec::new();
+    let mut details = crate::trace::DetailJournal::default();
     let output = format_document_inner(source, kind, config, Some(&mut trace), Some(&mut details))?;
-    Ok((output, trace, details))
+    Ok((output, trace, details.records))
+}
+
+/// A document terminator inside a macro, example or verbatim block cannot
+/// close the root environment. Validate the candidate with the normal parser.
+fn document_prefix(
+    source: &str,
+    config: &CompiledConfig,
+) -> Option<(usize, crate::source_model::SourceModel)> {
+    if !source.contains(r"\documentclass") {
+        return None;
+    }
+    let content_end = source.trim_end().len();
+    let candidate = |(at, _): (usize, &str)| {
+        let ("document", false, end) = syntax::env_after_command(source, "end", at + 4)? else {
+            return None;
+        };
+        Some((at, end))
+    };
+    let candidates = source
+        .match_indices(r"\end")
+        .filter_map(candidate)
+        .filter(|(_, end)| *end < content_end);
+    let prefix_end = |end: usize| {
+        end + if source[end..].starts_with("\r\n") {
+            2
+        } else {
+            usize::from(source[end..].starts_with('\n'))
+        }
+    };
+    fn root_end(model: &crate::source_model::SourceModel) -> Option<&std::ops::Range<usize>> {
+        model.document_class()?;
+        if model.has_errors() {
+            return None;
+        }
+        model
+            .structure
+            .as_ref()?
+            .1
+            .iter()
+            .find(|b| {
+                b.kind == BlockKind::Environment && b.name == "document" && b.parent.is_none()
+            })
+            .map(|b| &b.end)
+    }
+    let mut candidates = candidates.peekable();
+    candidates.peek()?;
+    let (_, last) = source.rmatch_indices(r"\end").find_map(candidate)?;
+    // Include the remainder of the last candidate's physical line. A short
+    // verbatim reader can close immediately after the apparent terminator.
+    let limit = if last >= content_end {
+        source.len()
+    } else {
+        syntax::line_end(source, last)
+    };
+    let model = crate::source_model::SourceModel::analyze(&source[..limit], config);
+    if let Some(close) = root_end(&model)
+        && source[close.clone()].starts_with(r"\end")
+        && matches!(syntax::env_after_command(source, "end", close.start + 4),
+            Some(("document", false, end)) if end == close.end)
+    {
+        let tail = if close.end >= content_end {
+            source.len()
+        } else {
+            prefix_end(close.end)
+        };
+        if tail == limit {
+            return Some((limit, model));
+        }
+        let prefix = crate::source_model::SourceModel::analyze(&source[..tail], config);
+        if root_end(&prefix) == Some(close) {
+            return Some((tail, prefix));
+        }
+    }
+
+    // A real document may be followed by unparseable material. Validate its
+    // prefix independently, keeping reader spans from the untruncated line.
+    let protected = model.lexical_protection();
+    for (at, end) in candidates {
+        let i = protected.partition_point(|r| r.end <= at);
+        if protected
+            .get(i)
+            .is_some_and(|r| r.contains(&at) && r.len() < limit)
+        {
+            continue;
+        }
+        let tail = prefix_end(end);
+        let prefix = crate::source_model::SourceModel::analyze(&source[..tail], config);
+        if root_end(&prefix) == Some(&(at..end)) {
+            return Some((tail, prefix));
+        }
+    }
+    (limit == source.len()).then_some((limit, model))
 }
 
 fn format_document_inner(
@@ -112,69 +493,48 @@ fn format_document_inner(
     kind: FileKind,
     config: &CompiledConfig,
     mut trace: Option<&mut Vec<StageTrace>>,
-    mut details: Option<&mut Vec<crate::trace::DetailTrace>>,
+    mut details: Option<&mut crate::trace::DetailJournal>,
 ) -> Result<FormatOutput, FormatError> {
-    if kind == FileKind::Tex
-        && !config.config.replacement_only
-        && source.contains("\\documentclass")
-    {
-        for (at, marker) in source.match_indices("\\end{document}") {
-            let end = at + marker.len();
-            if source[end..].trim().is_empty() {
-                continue;
-            }
-            let prefix = crate::source_model::SourceModel::analyze(&source[..end], config);
-            let closes_document = prefix.structure.as_ref().is_some_and(|(_, blocks)| {
-                blocks.iter().any(|block| {
-                    block.kind == BlockKind::Environment
-                        && block.name == "document"
-                        && block.parent.is_none()
-                        && block.end.end == end
-                })
+    let (end, model) = if !config.config.replacement_only
+        && matches!(
+            kind,
+            FileKind::Tex | FileKind::Tikz | FileKind::Style | FileKind::Class
+        ) {
+        let (end, model) = (kind == FileKind::Tex)
+            .then(|| document_prefix(source, config))
+            .flatten()
+            .unwrap_or_else(|| {
+                (
+                    source.len(),
+                    crate::source_model::SourceModel::analyze(source, config),
+                )
             });
-            if prefix.document_class().is_none() || prefix.has_errors() || !closes_document {
-                continue;
-            }
-            let tail = if source[end..].starts_with("\r\n") {
-                end + 2
-            } else if source[end..].starts_with('\n') {
-                end + 1
-            } else {
-                end
-            };
-            let mut output = format_document_inner(&source[..tail], kind, config, trace, details)?;
-            if output
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == Severity::Error)
-            {
-                return Ok(output);
-            }
-            output.text.push_str(&source[tail..]);
-            output.diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                message: "Nonexecuted source after \\end{document} retained unchanged".into(),
-                span: tail..source.len(),
-            });
-            return Ok(output);
-        }
-    }
+        (end, Some(model))
+    } else {
+        (source.len(), None)
+    };
+    // A prefix ends at an internal source boundary. Apply the user's
+    // final-newline policy only when formatting the physical end of the file.
+    let final_newline = if end == source.len() {
+        config.config.output.final_newline
+    } else {
+        FinalNewline::Preserve
+    };
     match format_document_stages(
-        source,
+        &source[..end],
         kind,
         config,
+        model,
+        final_newline,
         trace.as_deref_mut(),
         details.as_deref_mut(),
     ) {
-        Err(FormatError::Syntax(message)) => {
-            // A later stage can expose syntax hidden by the original opaque
-            // regions. Its offsets belong to an intermediate snapshot, so the
-            // recovery diagnostic covers the original file as a whole.
+        Err(message @ (FormatError::Syntax(_) | FormatError::StructuralMismatch { .. })) => {
             if let Some(trace) = trace {
                 trace.clear();
             }
             if let Some(details) = details {
-                details.clear();
+                details.records.clear();
             }
             Ok(FormatOutput {
                 text: source.into(),
@@ -183,9 +543,26 @@ fn format_document_inner(
                     message: format!(
                         "Source retained because a formatting stage could not safely analyze an intermediate snapshot: {message}"
                     ),
-                    span: 0..source.len(),
+                    span: 0..end,
                 }],
             })
+        }
+        Ok(mut output) if end < source.len() => {
+            if output
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error)
+            {
+                output.text = source.into();
+            } else {
+                output.text.push_str(&source[end..]);
+                output.diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: "Nonexecuted source after \\end{document} retained unchanged".into(),
+                    span: end..source.len(),
+                });
+            }
+            Ok(output)
         }
         result => result,
     }
@@ -195,33 +572,66 @@ fn format_document_stages(
     source: &str,
     kind: FileKind,
     config: &CompiledConfig,
+    model: Option<crate::source_model::SourceModel>,
+    final_newline: FinalNewline,
     mut trace: Option<&mut Vec<StageTrace>>,
-    mut details: Option<&mut Vec<crate::trace::DetailTrace>>,
+    mut details: Option<&mut crate::trace::DetailJournal>,
 ) -> Result<FormatOutput, FormatError> {
     let original_source = source;
-    let model = if !config.config.replacement_only
-        && matches!(
-            kind,
-            FileKind::Tex | FileKind::Tikz | FileKind::Style | FileKind::Class
-        ) {
-        Some(crate::source_model::SourceModel::analyze(source, config))
-    } else {
-        None
-    };
     if let Some(model) = &model
         && model.has_errors()
     {
-        return Ok(FormatOutput {
-            text: model.reconstruct(),
-            diagnostics: model.diagnostics().to_vec(),
-        });
+        let mut diagnostics = Vec::new();
+        let text = stage(
+            "syntax-recovery",
+            source,
+            &mut trace,
+            &mut details,
+            config,
+            || {
+                if let Some(output) = syntax::recovery::Recovery::format(
+                    source,
+                    kind,
+                    config,
+                    model,
+                    |masked, model| {
+                        format_document_stages(
+                            masked,
+                            kind,
+                            config,
+                            Some(model),
+                            final_newline,
+                            None,
+                            None,
+                        )
+                    },
+                ) {
+                    diagnostics = output.diagnostics;
+                    Ok(output.text)
+                } else {
+                    diagnostics.extend_from_slice(model.diagnostics());
+                    Ok(model.reconstruct())
+                }
+            },
+        )?;
+        return Ok(FormatOutput { text, diagnostics });
     }
     let bom = source.starts_with('\u{feff}');
+    if bom && let Some(journal) = details.as_deref_mut() {
+        journal.history.record(vec![(0..3, 0..0)]);
+    }
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut diagnostics = model
         .as_ref()
         .map_or_else(Vec::new, |model| model.diagnostics().to_vec());
     let mut parsing = ParseContext::with_model(config, model);
+    let mut history = crate::edit_plan::EditHistory::default();
+    let record_positions = !config.config.replacement_only
+        && matches!(
+            kind,
+            FileKind::Bibtex | FileKind::Bst | FileKind::Dtx | FileKind::Ins
+        );
+    let detailed = details.is_some();
     let embedded;
     let source = if config.config.bibtex.format_filecontents
         && !config.config.replacement_only
@@ -236,20 +646,22 @@ fn format_document_stages(
         )
         && source.contains("filecontents")
     {
-        embedded = stage(
+        embedded = stage_recording(
             "embedded-bibtex",
             source,
             &mut trace,
             &mut details,
             config,
             || {
-                crate::bibtex::format_embedded(
+                let text = crate::bibtex::format_embedded(
                     source,
                     config,
                     &mut parsing,
                     usize::from(bom) * 3,
                     &mut diagnostics,
-                )
+                    (record_positions || detailed).then_some(&mut history),
+                )?;
+                Ok((text, detailed.then(|| history.clone())))
             },
         )?;
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
@@ -262,21 +674,33 @@ fn format_document_stages(
     } else {
         source
     };
-    let mut text = stage(
+    let mut text = stage_recording(
         "replacements-before",
         source,
         &mut trace,
         &mut details,
         config,
         || {
-            crate::replacements::apply_for_kind(
+            let mut replacements = crate::edit_plan::EditHistory::default();
+            let text = crate::replacements::apply_recording(
                 source,
                 kind,
                 config,
                 crate::replacements::When::Before,
-            )
+                (record_positions || detailed).then_some(&mut replacements),
+            )?;
+            if record_positions {
+                history.append(replacements.clone());
+            }
+            Ok((text, detailed.then_some(replacements)))
         },
     )?;
+    let original_diagnostic = |mut diagnostic: Diagnostic| {
+        let span = history.original_range(diagnostic.span);
+        let start = usize::from(bom) * '\u{feff}'.len_utf8();
+        diagnostic.span = span.start + start..span.end + start;
+        diagnostic
+    };
     if !config.config.replacement_only {
         if matches!(kind, FileKind::Bibtex | FileKind::Bst) {
             let name = if kind == FileKind::Bst {
@@ -290,13 +714,7 @@ fn format_document_stages(
                 } else {
                     crate::bibtex::format_bibtex_detailed(&text, config)?
                 };
-                diagnostics.extend(output.diagnostics.into_iter().map(|mut diagnostic| {
-                    if bom {
-                        diagnostic.span.start += 3;
-                        diagnostic.span.end += 3;
-                    }
-                    diagnostic
-                }));
+                diagnostics.extend(output.diagnostics.into_iter().map(original_diagnostic));
                 Ok(output.text)
             })?;
             if diagnostics
@@ -309,11 +727,40 @@ fn format_document_stages(
                 });
             }
         } else if matches!(kind, FileKind::Dtx | FileKind::Ins) {
+            let mut syntax_error = false;
             text = stage("docstrip", &text, &mut trace, &mut details, config, || {
-                let output = crate::docstrip::format_docstrip(&text, kind, config)?;
-                diagnostics.extend(output.diagnostics);
+                let output = match crate::docstrip::format_docstrip(&text, kind, config) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let Some(at) = error.byte_offset().filter(|&at| text.is_char_boundary(at))
+                        else {
+                            return Err(error);
+                        };
+                        let end = at + text[at..].chars().next().map_or(0, char::len_utf8);
+                        let source_start = |at| {
+                            text.is_char_boundary(at).then(|| {
+                                history.original_range(at..at).start
+                                    + usize::from(bom) * '\u{feff}'.len_utf8()
+                            })
+                        };
+                        diagnostics.push(original_diagnostic(Diagnostic {
+                            severity: Severity::Error,
+                            span: at..end,
+                            message: error.map_byte_offsets(source_start).to_string(),
+                        }));
+                        syntax_error = true;
+                        return Ok(text.clone());
+                    }
+                };
+                diagnostics.extend(output.diagnostics.into_iter().map(original_diagnostic));
                 Ok(output.text)
             })?;
+            if syntax_error {
+                return Ok(FormatOutput {
+                    text: original_source.to_owned(),
+                    diagnostics,
+                });
+            }
             let math_active = crate::math_layout::is_active(&text, config);
             optional_stage(
                 "math",
@@ -337,281 +784,74 @@ fn format_document_stages(
             )?;
         } else {
             if config.config.whitespace.before_processing {
-                text = stage(
+                text = planned_stage(
                     "whitespace-before",
                     &text,
                     &mut trace,
                     &mut details,
                     config,
-                    || clean_whitespace(&text, config, &mut parsing),
+                    |history| clean_whitespace(&text, config, &mut parsing, history),
                 )?;
             }
             if config.config.breaks.enabled {
-                text = stage("structure", &text, &mut trace, &mut details, config, || {
-                    apply_breaks(&text, config, &mut parsing)
-                })?;
+                text = planned_stage(
+                    "structure",
+                    &text,
+                    &mut trace,
+                    &mut details,
+                    config,
+                    |history| apply_breaks(&text, config, &mut parsing, history),
+                )?;
             }
-            text = stage(
+            text = planned_stage(
                 "indentation",
                 &text,
                 &mut trace,
                 &mut details,
                 config,
-                || indent(&text, kind, config, &mut parsing),
-            )?;
-            let macro_active = syntax::macro_layout_active(&text, config);
-            let macro_changed = optional_stage(
-                "macro-bodies",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                macro_active,
-                |text| syntax::format_macro_definitions_with_context(text, config, &mut parsing),
-            )?;
-            // Formula spacing contributes to the width of text arguments and
-            // prose, so normalize math before either text stage measures it.
-            let math_active = crate::math_layout::is_active(&text, config);
-            let mut needs_cleanup = optional_stage(
-                "math",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                math_active,
-                |text| {
-                    crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
+                |history| {
+                    indent_with_argument_ranges(&text, kind, config, &mut parsing, &[], history)
                 },
             )?;
-            let arguments_active = crate::argument_layout::is_active(&text, config);
-            needs_cleanup |= optional_stage(
-                "arguments",
+            format_tex_rules(
                 &mut text,
+                kind,
+                config,
+                &mut parsing,
                 &mut trace,
                 &mut details,
-                config,
-                arguments_active,
-                |text| {
-                    crate::argument_layout::format_arguments_with_context(
-                        text,
-                        config,
-                        kind,
-                        &mut parsing,
-                    )
-                },
-            )?;
-            let collapse_prose = kind == FileKind::Tex
-                && config.config.wrap.mode == "preserve"
-                && config.config.wrap.collapse_spaces
-                && text.contains("  ");
-            optional_stage(
-                "prose-spaces",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                collapse_prose,
-                |text| crate::wrap::collapse_prose_spaces(text, config, &mut parsing),
-            )?;
-            // Resolve structure first so wrapping always measures final indentation.
-            optional_stage(
-                "description",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                config.config.wrap.align_description,
-                |text| crate::description::format(text, config, &mut parsing),
-            )?;
-            needs_cleanup |= optional_stage(
-                "text-before",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                crate::wrap::is_active(config, crate::wrap::Stage::Before),
-                |text| {
-                    crate::wrap::format_text_with_context(
-                        text,
-                        config,
-                        crate::wrap::Stage::Before,
-                        &mut parsing,
-                    )
-                },
-            )?;
-            let processed = stage("alignment", &text, &mut trace, &mut details, config, || {
-                crate::alignment::format_alignment_after_indent(&text, config, &mut parsing)
-            })?;
-            needs_cleanup |= processed != text;
-            text = processed;
-            needs_cleanup |= optional_stage(
-                "text-after",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                crate::wrap::is_active(config, crate::wrap::Stage::After),
-                |text| {
-                    crate::wrap::format_text_with_context(
-                        text,
-                        config,
-                        crate::wrap::Stage::After,
-                        &mut parsing,
-                    )
-                },
-            )?;
-            if needs_cleanup {
-                text = stage(
-                    "whitespace-after",
-                    &text,
-                    &mut trace,
-                    &mut details,
-                    config,
-                    || clean_whitespace(&text, config, &mut parsing),
-                )?;
-            }
-            let code_activity = crate::code_layout::activity(&text, config);
-            let code_active = code_activity.active();
-            let mut math_recheck = false;
-            let code_changed = optional_stage(
-                "code",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                code_active,
-                |text| {
-                    let output = crate::code_layout::format_code_with_context(
-                        text,
-                        kind,
-                        config,
-                        &mut parsing,
-                        code_activity,
-                    )?;
-                    math_recheck = output.math_recheck;
-                    Ok(output.text)
-                },
-            )?;
-            // Code preserves inline math islands exactly. A changed display
-            // prefix or an uncovered mathematical argument needs rechecking.
-            let math_active =
-                code_changed && math_recheck && crate::math_layout::is_active(&text, config);
-            optional_stage(
-                "math-final",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                math_active,
-                |text| {
-                    crate::math_layout::format_math_with_context(text, kind, config, &mut parsing)
-                },
-            )?;
-            optional_stage(
-                "macro-bodies-final",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                code_changed || needs_cleanup,
-                |text| syntax::format_macro_definitions_with_context(text, config, &mut parsing),
-            )?;
-            optional_stage(
-                "whitespace-final",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                code_active || macro_changed,
-                |text| clean_whitespace(text, config, &mut parsing),
-            )?;
-            optional_stage(
-                "column-specs",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                config.config.alignment.column_spec != crate::alignment::ColumnSpecLayout::Preserve
-                    || config
-                        .config
-                        .alignment
-                        .rules
-                        .values()
-                        .any(|rule| rule.column_spec.is_some()),
-                |text| crate::alignment::format_preambles(text, config, &mut parsing),
-            )?;
-            let tree_layout = config.config.trees.mode != crate::tree_layout::TreeMode::Preserve
-                || config.config.trees.dirtree && text.contains(r"\dirtree");
-            optional_stage(
-                "trees",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                tree_layout,
-                |text| crate::tree_layout::format_with_context(text, config, &mut parsing),
-            )?;
-            let plot_tables = config.config.breaks.enabled
-                && (config.config.breaks.pgfplots_tables && text.contains(r"\addplot")
-                    || config.config.breaks.pgfplots_named_tables
-                        && text.contains(r"\pgfplotstableread"));
-            optional_stage(
-                "pgfplots-tables",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                plot_tables,
-                |text| crate::pgfplots_table::format(text, config, &mut parsing),
-            )?;
-            optional_stage(
-                "foreach-lists",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                config.config.arguments.foreach_lists
-                    != crate::argument_layout::ForeachListMode::Preserve,
-                |text| crate::foreach::format_lists(text, config, &mut parsing),
-            )?;
-            optional_stage(
-                "consecutive-arguments",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                config.config.arguments.align_consecutive,
-                |text| crate::argument_layout::consecutive::format(text, config, &mut parsing),
-            )?;
-            optional_stage(
-                "trailing-comments",
-                &mut text,
-                &mut trace,
-                &mut details,
-                config,
-                config.config.comments.align_trailing,
-                |text| crate::wrap::align_trailing_comments(text, config, &mut parsing),
             )?;
         }
     }
-    optional_stage(
-        "replacements-after",
-        &mut text,
-        &mut trace,
-        &mut details,
-        config,
-        crate::replacements::is_active(config, crate::replacements::When::After),
-        |text| {
-            crate::replacements::apply_for_kind(
-                text,
-                kind,
-                config,
-                crate::replacements::When::After,
-            )
-        },
-    )?;
+    if crate::replacements::is_active(config, crate::replacements::When::After) {
+        text = planned_stage(
+            "replacements-after",
+            &text,
+            &mut trace,
+            &mut details,
+            config,
+            |history| {
+                crate::replacements::apply_recording(
+                    &text,
+                    kind,
+                    config,
+                    crate::replacements::When::After,
+                    history,
+                )
+            },
+        )?;
+    } else if let Some(trace) = trace.as_deref_mut() {
+        trace.push(StageTrace {
+            name: "replacements-after",
+            changed: false,
+            input_bytes: text.len(),
+            output_bytes: text.len(),
+            elapsed: Duration::ZERO,
+        });
+    }
     let final_started = trace.is_some().then(Instant::now);
-    let before_final = trace.is_some().then(|| text.clone());
+    let before_final = details.is_some().then(|| text.clone());
+    let input_bytes = text.len();
     let ending = preferred_ending(source, config);
     let mut boundary_protection = |text: &str| -> Result<Vec<Range<usize>>, FormatError> {
         if kind == FileKind::Bst {
@@ -622,45 +862,80 @@ fn format_document_stages(
             Ok(parsing.snapshot(text, false, false)?.protected.clone())
         }
     };
-    if config.config.output.line_ending != LineEnding::Preserve {
-        text = convert_endings(&text, ending, &boundary_protection(&text)?);
+    let protected = boundary_protection(&text)?;
+    let mut edits = crate::edit_plan::EditPlan::new();
+    if bom {
+        edits.replace(0..0, "\u{feff}");
     }
-    match config.config.output.final_newline {
+    let remove_trailing_endings = if final_newline == FinalNewline::Never {
+        let mut start = text.len();
+        while start > 0 && text.as_bytes()[start - 1] == b'\n' {
+            let newline = start - 1;
+            if syntax::is_protected(newline, &protected) {
+                break;
+            }
+            start -= usize::from(start >= 2 && text.as_bytes()[start - 2] == b'\r') + 1;
+        }
+        (start < text.len()).then_some(start..text.len())
+    } else {
+        None
+    };
+    if config.config.output.line_ending != LineEnding::Preserve {
+        let retained_end = remove_trailing_endings
+            .as_ref()
+            .map_or(text.len(), |range| range.start);
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            if line.ends_with('\n') {
+                let newline = offset + line.len() - 1;
+                if newline < retained_end && !syntax::is_protected(newline, &protected) {
+                    let start = if line.ends_with("\r\n") {
+                        newline - 1
+                    } else {
+                        newline
+                    };
+                    if &text[start..newline + 1] != ending {
+                        edits.replace(start..newline + 1, ending);
+                    }
+                }
+            }
+            offset += line.len();
+        }
+    }
+    match final_newline {
         FinalNewline::Always
             if !text.is_empty()
                 && !text.ends_with('\n')
-                && !syntax::is_protected(text.len() - 1, &boundary_protection(&text)?) =>
+                && !syntax::is_protected(text.len() - 1, &protected) =>
         {
-            text.push_str(ending)
+            edits.replace(text.len()..text.len(), ending);
         }
-        FinalNewline::Never if text.ends_with('\n') => {
-            let protected = boundary_protection(&text)?;
-            while text.ends_with('\n') && !syntax::is_protected(text.len() - 1, &protected) {
-                text.pop();
-                if text.ends_with('\r') {
-                    text.pop();
-                }
+        FinalNewline::Never => {
+            if let Some(range) = remove_trailing_endings {
+                edits.replace(range, "");
             }
         }
         _ => (),
     }
-    if bom {
-        text.insert(0, '\u{feff}');
+    let changed = !edits.is_empty();
+    let mut boundaries = crate::edit_plan::EditHistory::default();
+    if changed {
+        text = edits.apply_recording(&text, detailed.then_some(&mut boundaries))?;
     }
     if let Some(trace) = trace {
-        let original = before_final.expect("final trace input");
         if let Some(details) = details {
-            details.extend(crate::trace::stage_changes(
+            details.record(
                 "file-boundaries",
-                &original,
+                before_final.as_deref().expect("detailed trace input"),
                 &text,
                 config,
-            ));
+                Some(boundaries),
+            );
         }
         trace.push(StageTrace {
             name: "file-boundaries",
-            changed: original != text,
-            input_bytes: original.len(),
+            changed,
+            input_bytes,
             output_bytes: text.len(),
             elapsed: final_started.expect("final trace timer").elapsed(),
         });
@@ -682,28 +957,11 @@ fn preferred_ending<'a>(source: &str, config: &CompiledConfig) -> &'a str {
     }
 }
 
-fn convert_endings(source: &str, ending: &str, protected: &[Range<usize>]) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut offset = 0;
-    for line in source.split_inclusive('\n') {
-        if line.ends_with('\n') && !syntax::is_protected(offset + line.len() - 1, protected) {
-            output.push_str(
-                line.strip_suffix("\r\n")
-                    .unwrap_or_else(|| line.strip_suffix('\n').expect("line ending")),
-            );
-            output.push_str(ending);
-        } else {
-            output.push_str(line);
-        }
-        offset += line.len();
-    }
-    output
-}
-
 pub(crate) fn clean_whitespace(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
+    history: Option<&mut crate::edit_plan::EditHistory>,
 ) -> Result<String, FormatError> {
     // Most layout stages leave trailing whitespace and blank-line runs clean.
     // Check the bytes before rebuilding semantic protection for a new snapshot.
@@ -711,7 +969,7 @@ pub(crate) fn clean_whitespace(
     if !whitespace_cleanup_needed(source, config) {
         return Ok(source.into());
     }
-    clean_whitespace_parsed(source, config, parsing)
+    clean_whitespace_parsed(source, config, parsing, history)
 }
 
 fn whitespace_cleanup_needed(source: &str, config: &CompiledConfig) -> bool {
@@ -743,11 +1001,13 @@ fn clean_whitespace_parsed(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
+    history: Option<&mut crate::edit_plan::EditHistory>,
 ) -> Result<String, FormatError> {
     let protected = &parsing.snapshot(source, false, false)?.protected;
-    let mut output = String::with_capacity(source.len());
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut offset = 0usize;
     let mut blanks = 0usize;
+    let maximum = config.config.whitespace.blank_lines.limit();
     for line in source.split_inclusive('\n') {
         let ending = if line.ends_with("\r\n") {
             "\r\n"
@@ -760,8 +1020,8 @@ fn clean_whitespace_parsed(
         let protected_line = syntax::overlaps(&(offset..offset + line.len()), protected);
         if body.trim_matches([' ', '\t']).is_empty() && !protected_line {
             blanks += 1;
-            let maximum = config.config.whitespace.blank_lines.limit();
             if maximum.is_some_and(|maximum| blanks > maximum) {
+                edits.replace(offset..offset + line.len(), "");
                 offset += line.len();
                 continue;
             }
@@ -770,14 +1030,17 @@ fn clean_whitespace_parsed(
         }
         let trimmed = trailing_content_end(body);
         if config.config.whitespace.remove_trailing
+            && trimmed < body.len()
             && !syntax::overlaps(&(offset + trimmed..offset + body.len()), protected)
         {
-            output.push_str(&body[..trimmed]);
-        } else {
-            output.push_str(body);
+            edits.replace(offset + trimmed..offset + body.len(), "");
         }
-        output.push_str(ending);
         offset += line.len();
+    }
+    let (output, mappings) = edits.apply_ordered_with_mappings(source)?;
+    parsing.reuse_whitespace_snapshot(source, &output, &mappings);
+    if let Some(history) = history {
+        history.record(mappings);
     }
     Ok(output)
 }
@@ -950,16 +1213,7 @@ pub(crate) fn indent_after_arguments(
     parsing: &mut ParseContext<'_>,
     arguments: &[Range<usize>],
 ) -> Result<String, FormatError> {
-    indent_with_argument_ranges(source, kind, config, parsing, arguments)
-}
-
-fn indent(
-    source: &str,
-    kind: FileKind,
-    config: &CompiledConfig,
-    parsing: &mut ParseContext<'_>,
-) -> Result<String, FormatError> {
-    indent_with_argument_ranges(source, kind, config, parsing, &[])
+    indent_with_argument_ranges(source, kind, config, parsing, arguments, None)
 }
 
 fn indent_with_argument_ranges(
@@ -968,23 +1222,20 @@ fn indent_with_argument_ranges(
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
     arguments: &[Range<usize>],
+    history: Option<&mut crate::edit_plan::EditHistory>,
 ) -> Result<String, FormatError> {
     let parsed = parsing.snapshot(source, true, true)?;
     let protected = &parsed.protected;
     let argument_literals = if arguments.is_empty() {
         Vec::new()
     } else {
-        let analysis = SourceAnalysis::with_memo(
-            source,
-            &config.config,
-            protected,
-            std::rc::Rc::clone(&parsed.metadata),
-        );
+        let analysis = parsed.analysis(&config.config);
         crate::argument_layout::literal_argument_ranges(
             source,
             config,
             protected,
-            analysis.declared_commands()?.as_ref(),
+            analysis.declared_commands(),
+            analysis.model().tokens(),
         )
     };
     let original_blocks = parsed.blocks.as_ref().expect("parsed structure");
@@ -1034,16 +1285,11 @@ fn indent_with_argument_ranges(
     // of one buffer or the configured literal instead of allocating per block.
     let spaces = " ".repeat(256);
     let mut branches = BTreeMap::new();
-    let newlines: Vec<usize> = memchr::memchr_iter(b'\n', source.as_bytes()).collect();
+    let newlines = parsed.document.newlines();
     let indent = &config.config.indent;
     let algorithm_lines = if indent.algpseudocode && source.contains("algorithmic") {
-        let analysis = SourceAnalysis::with_memo(
-            source,
-            &config.config,
-            protected,
-            std::rc::Rc::clone(&parsed.metadata),
-        );
-        crate::packages::code_algorithms::indent_lines(source, config, protected, &analysis)?
+        let analysis = parsed.analysis(&config.config);
+        crate::packages::code_algorithms::indent_lines(source, config, protected, &analysis)
     } else {
         BTreeMap::new()
     };
@@ -1099,14 +1345,9 @@ fn indent_with_argument_ranges(
         })
         .peekable();
     if markers.peek().is_some() {
-        let analysis = SourceAnalysis::with_memo(
-            source,
-            &config.config,
-            protected,
-            std::rc::Rc::clone(&parsed.metadata),
-        );
-        let commands = analysis.declared_commands()?;
-        let environments = analysis.declared_environments()?;
+        let analysis = parsed.analysis(&config.config);
+        let commands = analysis.declared_commands();
+        let environments = analysis.declared_environments();
         for (_, marker) in markers {
             if !commands.contains(marker.command) && !environments.contains(marker.environment) {
                 marker_indent_events(
@@ -1120,14 +1361,9 @@ fn indent_with_argument_ranges(
         }
     }
     if source.contains(r"\CodeAfter") {
-        let analysis = SourceAnalysis::with_memo(
-            source,
-            &config.config,
-            protected,
-            std::rc::Rc::clone(&parsed.metadata),
-        );
+        let analysis = parsed.analysis(&config.config);
         for (marker, parent) in
-            crate::package_tables::code_after_markers(blocks, &config.config, &analysis)?
+            crate::package_tables::code_after_markers(blocks, &config.config, &analysis)
         {
             let block = &blocks[marker];
             let environment = &blocks[parent];
@@ -1214,14 +1450,13 @@ fn indent_with_argument_ranges(
         .map(|b| b.body.clone())
         .collect();
     filecontents.sort_by_key(|r| r.start);
-    let mut output = String::with_capacity(source.len() + source.len() / 8);
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut active: BTreeMap<usize, &str> = BTreeMap::new();
     let mut event = 0usize;
-    let mut offset = 0usize;
     let mut cached_prefix = String::new();
     let mut dirty = true;
     let mut blanks = 0usize;
-    for line in source.split_inclusive('\n') {
+    for (offset, line) in parsed.document.lines() {
         let start = line.len() - line.trim_start_matches([' ', '\t']).len();
         let first = offset + start;
         while event < events.len() && events[event].pos <= first {
@@ -1241,8 +1476,6 @@ fn indent_with_argument_ranges(
                 .get(arguments.partition_point(|argument| argument.end <= first))
                 .is_none_or(|argument| first < argument.start)
         {
-            output.push_str(line);
-            offset += line.len();
             continue;
         }
         let protected_index = protected.partition_point(|r| r.end <= offset);
@@ -1270,8 +1503,6 @@ fn indent_with_argument_ranges(
             || in_argument_literal
             || in_configuration && line.trim_matches([' ', '\t', '\r', '\n']).is_empty()
         {
-            output.push_str(line);
-            offset += line.len();
             blanks = 0;
             continue;
         }
@@ -1294,18 +1525,18 @@ fn indent_with_argument_ranges(
         if body.trim_matches([' ', '\t']).is_empty() {
             blanks += 1;
             let maximum = config.config.whitespace.blank_lines.limit();
-            if maximum.is_none_or(|maximum| blanks <= maximum) {
-                output.push_str(&body[..content_end]);
-                output.push_str(ending);
+            if maximum.is_some_and(|maximum| blanks > maximum) {
+                edits.replace(offset..offset + line.len(), "");
+            } else if content_end < body.len() {
+                edits.replace(offset + content_end..offset + body.len(), "");
             }
-            offset += line.len();
             continue;
         }
         blanks = 0;
         if in_preamble && preamble_argument.is_none() {
-            output.push_str(&body[..content_end]);
-            output.push_str(ending);
-            offset += line.len();
+            if content_end < body.len() {
+                edits.replace(offset + content_end..offset + body.len(), "");
+            }
             continue;
         }
         if dirty {
@@ -1368,12 +1599,18 @@ fn indent_with_argument_ranges(
                 prefix.to_mut().truncate(length);
             }
         }
-        output.push_str(&prefix);
-        output.push_str(&body[start..content_end]);
-        output.push_str(ending);
-        offset += line.len();
+        if prefix.as_ref() != &line[..start] {
+            edits.replace(offset..offset + start, prefix.into_owned());
+        }
+        if content_end < body.len() {
+            edits.replace(offset + content_end..offset + body.len(), "");
+        }
     }
-    parsing.reuse_indented_snapshot(source, &output);
+    let (output, mappings) = edits.apply_ordered_with_mappings(source)?;
+    parsing.reuse_whitespace_snapshot(source, &output, &mappings);
+    if let Some(history) = history {
+        history.record(mappings);
+    }
     Ok(output)
 }
 
@@ -1398,8 +1635,8 @@ fn has_filecontents_ancestor(block: &Block, blocks: &[Block], config: &CompiledC
 #[derive(Debug)]
 struct Boundary {
     pos: usize,
-    before: BreakMode,
-    after: BreakMode,
+    before: (BreakMode, EditOrigin),
+    after: (BreakMode, EditOrigin),
 }
 
 // `o` is a bracketed option, `O` is an option that must be token-adjacent,
@@ -1443,10 +1680,7 @@ fn source_environment_signature(
             .then(|| environment_signature(name))
             .flatten();
     }
-    if analysis
-        .declared_environments()
-        .is_ok_and(|names| names.contains(name))
-    {
+    if analysis.declared_environments().contains(name) {
         return None;
     }
     environment_signature(name)
@@ -2043,7 +2277,7 @@ fn row_boundaries(
     blocks: &[Block],
     declared_environments: &std::collections::HashSet<String>,
     index: &BoundaryIndex<'_, '_>,
-) -> Vec<(usize, BreakMode)> {
+) -> Vec<(usize, BreakMode, EditOrigin)> {
     use syntax::TokenKind;
     let config = index.config;
     let analysis = index.analysis;
@@ -2097,8 +2331,14 @@ fn row_boundaries(
                     continue;
                 }
                 let block = &blocks[i];
-                let explicit = config.config.breaks.rules.contains_key(block.name.as_str())
-                    || config.config.breaks.categories.contains_key("environment");
+                let origin = if config.config.breaks.rules.contains_key(block.name.as_str()) {
+                    EditOrigin::Named
+                } else if config.config.breaks.categories.contains_key("environment") {
+                    EditOrigin::Category
+                } else {
+                    EditOrigin::TableRow
+                };
+                let explicit = origin.priority() > 0;
                 if !explicit && index.filecontents_ancestors[i] {
                     continue;
                 }
@@ -2127,7 +2367,7 @@ fn row_boundaries(
                 } else {
                     rule.row
                 };
-                output.push((end, mode));
+                output.push((end, mode, origin));
             }
             _ => (),
         }
@@ -2142,7 +2382,7 @@ fn table_rule_boundaries(
     declared_environments: &std::collections::HashSet<String>,
     declared_commands: &std::collections::HashSet<String>,
     index: &BoundaryIndex<'_, '_>,
-) -> Vec<(usize, BreakMode, bool)> {
+) -> Vec<(usize, BreakMode, bool, EditOrigin)> {
     use syntax::TokenKind;
     let config = index.config;
     let environments = index.environments();
@@ -2258,8 +2498,19 @@ fn table_rule_boundaries(
                     };
                     (rule.row, rule.row)
                 };
-                output.push((token.span.start, before, true));
-                output.push((end, after, false));
+                let origin = if config.config.breaks.rules.contains_key(name) {
+                    EditOrigin::Named
+                } else if named.is_some() {
+                    EditOrigin::Category
+                } else if config.config.breaks.rules.contains_key(block.name.as_str()) {
+                    EditOrigin::Named
+                } else if config.config.breaks.categories.contains_key("environment") {
+                    EditOrigin::Category
+                } else {
+                    EditOrigin::TableRule
+                };
+                output.push((token.span.start, before, true, origin));
+                output.push((end, after, false, origin));
                 skip_until = end;
             }
             _ => (),
@@ -2272,6 +2523,7 @@ fn apply_breaks(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut ParseContext<'_>,
+    history: Option<&mut crate::edit_plan::EditHistory>,
 ) -> Result<String, FormatError> {
     if config.config.breaks.rules.is_empty()
         && config.config.breaks.categories.is_empty()
@@ -2286,12 +2538,7 @@ fn apply_breaks(
     }
     let parsed = parsing.snapshot(source, true, true)?;
     let protected = &parsed.protected;
-    let analysis = &SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
+    let analysis = &parsed.analysis(&config.config);
     let tokens = parsed.tokens.as_ref().expect("parsed tokens");
     let mut blocks: Cow<'_, [Block]> =
         Cow::Borrowed(parsed.blocks.as_deref().expect("parsed structure"));
@@ -2299,8 +2546,8 @@ fn apply_breaks(
     if !verbatim.is_empty() {
         blocks.to_mut().extend(verbatim);
     }
-    let declared_environments = analysis.declared_environments()?;
-    let declared_commands = analysis.declared_commands()?;
+    let declared_environments = analysis.declared_environments();
+    let declared_commands = analysis.declared_commands();
     let boundary_index = BoundaryIndex::new(source, &blocks, config, analysis);
     let paragraph_ends = blocks
         .iter()
@@ -2321,22 +2568,34 @@ fn apply_breaks(
     // also keeps rewrap stable when it rejoins a command split in this stage.
     let local_newlines = (config.config.output.line_ending == LineEnding::Preserve
         && source.contains("\r\n"))
-    .then(|| memchr::memchr_iter(b'\n', source.as_bytes()).collect::<Vec<_>>());
+    .then(|| parsed.document.newlines());
     let mut boundaries: BTreeMap<usize, Boundary> = BTreeMap::new();
     let mut preserved_path_begins = std::collections::HashSet::new();
-    let mut record = |pos, mode, before| {
+    let mut record = |pos, mode, before, origin: EditOrigin| {
         if mode == BreakMode::Preserve {
             return;
         }
         let entry = boundaries.entry(pos).or_insert(Boundary {
             pos,
-            before: BreakMode::Preserve,
-            after: BreakMode::Preserve,
+            before: (BreakMode::Preserve, EditOrigin::Layout),
+            after: (BreakMode::Preserve, EditOrigin::Layout),
         });
-        if before {
-            entry.before = mode;
+        // A tight TikZ path needs a comment to avoid introducing a TeX space.
+        // Its comment line also satisfies a configured line on the other side.
+        if origin == EditOrigin::TikzPath
+            && before
+            && mode == BreakMode::CommentLine
+            && entry.after.0 == BreakMode::Line
+        {
+            entry.after.0 = BreakMode::CommentLine;
+        }
+        let side = if before {
+            &mut entry.before
         } else {
-            entry.after = mode;
+            &mut entry.after
+        };
+        if origin.priority() >= side.1.priority() {
+            *side = (mode, origin);
         }
     };
     for (block_index, block) in blocks.iter().enumerate() {
@@ -2349,13 +2608,21 @@ fn apply_breaks(
         ) && block
             .parent
             .is_some_and(|parent| blocks[parent].kind == BlockKind::Environment);
-        let explicit_rule = (!environment_argument
-            && config.config.breaks.rules.contains_key(block.name.as_str()))
-            || config
-                .config
-                .breaks
-                .categories
-                .contains_key(block.kind.category());
+        let origin = if !environment_argument
+            && config.config.breaks.rules.contains_key(block.name.as_str())
+        {
+            EditOrigin::Named
+        } else if config
+            .config
+            .breaks
+            .categories
+            .contains_key(block.kind.category())
+        {
+            EditOrigin::Category
+        } else {
+            EditOrigin::Layout
+        };
+        let explicit_rule = origin.priority() > 0;
         if !explicit_rule && boundary_index.filecontents_ancestors[block_index] {
             continue;
         }
@@ -2371,6 +2638,7 @@ fn apply_breaks(
                 .rule(block.kind.category(), &block.name)
         };
         if let Some(rule) = rule {
+            let mut record = |pos, mode, before| record(pos, mode, before, origin);
             let split_outer = block.kind == BlockKind::Environment
                 && !explicit_rule
                 && environment_can_split_outer_boundaries(
@@ -2378,7 +2646,7 @@ fn apply_breaks(
                     block,
                     &blocks,
                     config,
-                    &declared_environments,
+                    declared_environments,
                 );
             let begin_mode = if block.kind == BlockKind::Environment && !explicit_rule {
                 automatic_environment_begin(source, block, tokens, &paragraph_ends, split_outer)
@@ -2449,7 +2717,7 @@ fn apply_breaks(
                         block,
                         tokens,
                         config,
-                        &declared_commands,
+                        declared_commands,
                         split_outer,
                     )
                 } else {
@@ -2505,24 +2773,24 @@ fn apply_breaks(
             }
         }
     }
-    for (pos, mode) in row_boundaries(
+    for (pos, mode, origin) in row_boundaries(
         source,
         tokens,
         &blocks,
-        &declared_environments,
+        declared_environments,
         &boundary_index,
     ) {
-        record(pos, mode, false);
+        record(pos, mode, false, origin);
     }
-    for (pos, mode, before) in table_rule_boundaries(
+    for (pos, mode, before, origin) in table_rule_boundaries(
         source,
         tokens,
         &blocks,
-        &declared_environments,
-        &declared_commands,
+        declared_environments,
+        declared_commands,
         &boundary_index,
     ) {
-        record(pos, mode, before);
+        record(pos, mode, before, origin);
     }
     for (pos, mode, before) in crate::tikz::boundaries(source, &blocks, config, protected) {
         // Only automatic path boundaries yield to an explicit environment
@@ -2530,11 +2798,11 @@ fn apply_breaks(
         if before && preserved_path_begins.contains(&pos) {
             continue;
         }
-        record(pos, mode, before);
+        record(pos, mode, before, EditOrigin::TikzPath);
     }
-    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     for boundary in boundaries.values() {
-        for (before, mode) in [(true, boundary.before), (false, boundary.after)] {
+        for (before, (mode, origin)) in [(true, boundary.before), (false, boundary.after)] {
             if mode == BreakMode::Preserve {
                 continue;
             }
@@ -2578,6 +2846,19 @@ fn apply_breaks(
                         "\n"
                     }
                 });
+            let already_satisfied = match mode {
+                BreakMode::Line | BreakMode::CommentLine => whitespace.contains('\n'),
+                BreakMode::BlankLine => whitespace.matches('\n').count() >= 2,
+                _ => false,
+            };
+            if already_satisfied {
+                // Keep a configured boundary ahead of conflicting lower-priority
+                // edits even if its own replacement would be a no-op.
+                if origin.priority() > 0 {
+                    edits.replace_from(origin, start..end, whitespace);
+                }
+                continue;
+            }
             let replacement = match mode {
                 BreakMode::Preserve => unreachable!(),
                 BreakMode::Join => {
@@ -2587,40 +2868,27 @@ fn apply_breaks(
                         continue;
                     }
                     if whitespace.is_empty() {
-                        String::new()
+                        "".into()
                     } else {
                         " ".into()
                     }
                 }
-                BreakMode::Line => {
-                    if whitespace.contains('\n') || !before && source[end..].starts_with('%') {
-                        continue;
-                    } else {
-                        ending.into()
-                    }
+                BreakMode::Line | BreakMode::CommentLine
+                    if !before && source[end..].starts_with('%') =>
+                {
+                    continue;
                 }
-                BreakMode::CommentLine => {
-                    if whitespace.contains('\n') || !before && source[end..].starts_with('%') {
-                        continue;
-                    }
-                    format!("%{ending}")
-                }
-                BreakMode::BlankLine => {
-                    if whitespace.matches('\n').count() >= 2 {
-                        continue;
-                    } else {
-                        ending.repeat(2)
-                    }
-                }
-                BreakMode::ResetBlankLine => ending.repeat(2),
+                BreakMode::Line => ending.into(),
+                BreakMode::CommentLine => Cow::Owned(format!("%{ending}")),
+                BreakMode::BlankLine | BreakMode::ResetBlankLine => Cow::Owned(ending.repeat(2)),
             };
             if start == 0 && before && mode != BreakMode::Join {
                 continue;
             }
-            edits.push((start..end, replacement));
+            edits.replace_from(origin, start..end, replacement);
         }
     }
-    apply_edits(source, edits)
+    edits.resolve_priorities().apply_recording(source, history)
 }
 
 pub(crate) fn comment_position(line: &str) -> Option<usize> {
@@ -2639,31 +2907,4 @@ pub(crate) fn comment_position(line: &str) -> Option<usize> {
         }
     }
     None
-}
-
-pub(crate) fn apply_edits(
-    source: &str,
-    mut edits: Vec<(Range<usize>, String)>,
-) -> Result<String, FormatError> {
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut output = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    let mut last_empty = None;
-    for (range, text) in edits {
-        if range.start < cursor {
-            continue;
-        }
-        if range.is_empty() && last_empty == Some(range.start) {
-            continue;
-        }
-        if !source.is_char_boundary(range.start) || !source.is_char_boundary(range.end) {
-            return Err(FormatError::Syntax("invalid UTF-8 edit boundary".into()));
-        }
-        output.push_str(&source[cursor..range.start]);
-        output.push_str(&text);
-        cursor = range.end;
-        last_empty = range.is_empty().then_some(range.start);
-    }
-    output.push_str(&source[cursor..]);
-    Ok(output)
 }

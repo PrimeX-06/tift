@@ -46,42 +46,33 @@ pub(crate) fn validate(config: &TreeConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn format_with_context(
+pub(crate) fn tree_edits(
     source: &str,
     config: &CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
-) -> Result<String, FormatError> {
+) -> Result<crate::edit_plan::RuleEdits, FormatError> {
     let settings = &config.config.trees;
     let bracket_trees = settings.mode != TreeMode::Preserve;
     let forest = bracket_trees && settings.forest && source.contains("forest");
     let qtree = bracket_trees && settings.qtree && source.contains("\\Tree");
     let directory = settings.dirtree && source.contains(r"\dirtree");
     if !(forest || qtree || directory) {
-        return Ok(source.into());
+        return Ok(Default::default());
     }
     let parsed = parsing.snapshot(source, true, false)?;
     let tokens = parsed.tokens.as_deref().expect("tree tokens");
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
+    let analysis = parsed.analysis(&config.config);
     let mut roots = Vec::new();
+    let mut plan = crate::edit_plan::RuleEdits::default();
     if forest
-        && !analysis.declared_environments()?.contains("forest")
+        && !analysis.declared_environments().contains("forest")
         && !config
             .config
             .syntax
             .environment_arguments
             .contains_key("forest")
     {
-        for env in syntax::environment_ranges_with_tokens(
-            source,
-            tokens,
-            &parsed.protected,
-            &config.config,
-        )? {
+        for env in parsed.environment_ranges(&config.config)? {
             if env.name != "forest" || syntax::is_protected(env.begin.start, &parsed.protected) {
                 continue;
             }
@@ -92,6 +83,8 @@ pub(crate) fn format_with_context(
                 &config.config,
                 &analysis,
             );
+            let line = source[..env.begin.start].rfind('\n').map_or(0, |at| at + 1);
+            plan.reads.push(line..env.body.end);
             // Forest options preceding the root stay opaque.
             if let Some(root) = forest_root(tokens, header..env.body.end)
                 && !syntax::overlaps(&root, &parsed.protected)
@@ -101,7 +94,7 @@ pub(crate) fn format_with_context(
         }
     }
     if qtree
-        && !analysis.declared_commands()?.contains("Tree")
+        && !analysis.declared_commands().contains("Tree")
         && !config.config.syntax.commands.contains_key("Tree")
     {
         for token in tokens {
@@ -110,16 +103,25 @@ pub(crate) fn format_with_context(
             {
                 continue;
             }
-            if let Some(("Tree", end)) = syntax::command_at(source, token.span.start) {
+            if let Some(("Tree", end)) = analysis
+                .model()
+                .control_at(token.span.start)
+                .or_else(|| syntax::command_at(source, token.span.start))
+            {
                 let start = crate::trivia::skip(source, end);
-                if let Some(end) = syntax::balanced_end(source, start, b'[', b']')
-                    && let Some(literal) = crate::packages::tikz_diagrams::literal_data_range(
-                        source,
-                        token.span.end,
-                        "Tree",
-                        false,
-                    )
-                    && literal.end >= end
+                let Some(end) = syntax::balanced_end(source, start, b'[', b']') else {
+                    continue;
+                };
+                let line = source[..token.span.start]
+                    .rfind('\n')
+                    .map_or(0, |at| at + 1);
+                plan.reads.push(line..end);
+                if let Some(literal) = crate::packages::tikz_diagrams::literal_data_range(
+                    source,
+                    token.span.end,
+                    "Tree",
+                    false,
+                ) && literal.end >= end
                     && !parsed
                         .protected
                         .iter()
@@ -131,18 +133,32 @@ pub(crate) fn format_with_context(
         }
     }
     roots.sort_by_key(|(range, _)| range.start);
-    let mut edits = Vec::new();
     if directory
         && !config.config.syntax.commands.contains_key("dirtree")
-        && !analysis.declared_commands()?.contains("dirtree")
+        && !analysis.declared_commands().contains("dirtree")
     {
         for token in tokens {
             if token.kind == syntax::TokenKind::Command
                 && &source[token.span.clone()] == r"\dirtree"
-                && let Some(edit) =
-                    directory_tree(source, token.span.clone(), &parsed.protected, config)
             {
-                edits.push(edit);
+                let line = source[..token.span.start]
+                    .rfind('\n')
+                    .map_or(0, |at| at + 1);
+                let open = crate::trivia::skip(source, token.span.end);
+                let Some(end) = syntax::balanced_end(source, open, b'{', b'}') else {
+                    continue;
+                };
+                let tail = source[end..].find('\n').map_or(source.len(), |at| end + at);
+                plan.reads.push(line..tail);
+                if let Some((span, text)) = directory_tree(
+                    source,
+                    token.span.start,
+                    open..end,
+                    &parsed.protected,
+                    config,
+                ) {
+                    plan.edits.replace(span, text);
+                }
             }
         }
     }
@@ -167,27 +183,27 @@ pub(crate) fn format_with_context(
             continue;
         }
         if let Some(text) = render(source, root.clone(), qtree, &indent, config) {
-            edits.push((root, text));
+            plan.edits.replace(root, text);
         }
     }
-    crate::layout::apply_edits(source, edits)
+    Ok(plan)
 }
 
 fn directory_tree(
     source: &str,
-    command: Range<usize>,
+    command: usize,
+    argument: Range<usize>,
     protected: &[Range<usize>],
     config: &CompiledConfig,
 ) -> Option<(Range<usize>, String)> {
-    let base = source[..command.start].rsplit('\n').next()?;
+    let base = source[..command].rsplit('\n').next()?;
     if !base.trim_matches([' ', '\t']).is_empty() {
         return None;
     }
-    let open = crate::trivia::skip(source, command.end);
-    let end = syntax::balanced_end(source, open, b'{', b'}')?;
+    let open = argument.start;
+    let end = argument.end;
     let tail = source[end..].split('\n').next()?.trim();
-    if (!tail.is_empty() && !tail.starts_with('%'))
-        || syntax::overlaps(&(command.start..end), protected)
+    if (!tail.is_empty() && !tail.starts_with('%')) || syntax::overlaps(&(command..end), protected)
     {
         return None;
     }
@@ -197,13 +213,13 @@ fn directory_tree(
         return None;
     }
     let unit = config.config.indent.unit("environment", "dirtree");
-    let mut output = String::from(header);
-    output.push('\n');
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut previous = 0usize;
+    let mut offset = header.len() + 1;
     for line in nodes.split_inclusive('\n') {
         let text = line.trim_start_matches([' ', '\t']);
         if text.trim().is_empty() || text.starts_with('%') {
-            output.push_str(line);
+            offset += line.len();
             continue;
         }
         let mut code = text;
@@ -228,16 +244,21 @@ fn directory_tree(
             return None;
         }
         previous = depth;
-        output.push_str(base);
         let levels = if let Some(max) = config.config.indent.maximum {
             let width = |s| crate::wrap::display_width(s, 0, config.config.indent.width.max(1));
             depth.min(max.saturating_sub(width(base)) / width(&unit).max(1))
         } else {
             depth
         };
-        output.push_str(&unit.repeat(levels));
-        output.push_str(text);
+        let leading = line.len() - text.len();
+        let mut indentation = base.to_owned();
+        indentation.push_str(&unit.repeat(levels));
+        if indentation != line[..leading] {
+            edits.replace(offset..offset + leading, indentation);
+        }
+        offset += line.len();
     }
+    let output = edits.apply_ordered(&source[body.clone()]).ok()?;
     (previous > 0 && output != source[body.clone()]).then_some((body, output))
 }
 
@@ -496,13 +517,9 @@ fn render(
         text.push_str(&unit.repeat(depth));
         edits.push((start..position, text));
     }
-    let mut output = String::new();
-    let mut copied = root.start;
+    let mut plan = crate::edit_plan::EditPlan::new();
     for (range, text) in edits {
-        output.push_str(&source[copied..range.start]);
-        output.push_str(&text);
-        copied = range.end;
+        plan.replace(range.start - root.start..range.end - root.start, text);
     }
-    output.push_str(&source[copied..root.end]);
-    Some(output)
+    plan.apply_ordered(&source[root]).ok()
 }

@@ -122,16 +122,33 @@ pub(crate) fn format_embedded(
     parsing: &mut crate::parse_context::ParseContext<'_>,
     bom_bytes: usize,
     diagnostics: &mut Vec<Diagnostic>,
+    history: Option<&mut crate::edit_plan::EditHistory>,
 ) -> Result<String, FormatError> {
     let parsed = parsing.snapshot(source, false, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let declared = analysis.declared_environments()?;
-    let mut edits = Vec::new();
+    let analysis = parsed.analysis(&config.config);
+    let declared = analysis.declared_environments();
+    // The closing delimiter occupies its own physical line. Replacements over
+    // the whole host already include this payload and must run only once.
+    let local_config = if config.config.output.final_newline == crate::config::FinalNewline::Never
+        || config
+            .config
+            .replacements
+            .iter()
+            .any(|rule| rule.enabled && rule.scope == crate::replacements::Scope::All)
+    {
+        let mut settings = config.config.clone();
+        if settings.output.final_newline == crate::config::FinalNewline::Never {
+            settings.output.final_newline = crate::config::FinalNewline::Preserve;
+        }
+        settings
+            .replacements
+            .retain(|rule| rule.scope != crate::replacements::Scope::All);
+        Some(CompiledConfig::new(settings).map_err(|err| FormatError::Syntax(err.to_string()))?)
+    } else {
+        None
+    };
+    let payload_config = local_config.as_ref().unwrap_or(config);
+    let mut edits = crate::edit_plan::EditPlan::new();
     for span in &parsed.protected {
         let region = &source[span.clone()];
         let Some(("begin", command_end)) = syntax::command_at(region, 0) else {
@@ -155,23 +172,17 @@ pub(crate) fn format_embedded(
             continue;
         };
         let body = span.start + body.start..span.start + body.end;
-        let result = if kind == crate::FileKind::Bibtex {
-            format_bibtex_detailed(&source[body.clone()], config)?
-        } else if kind == crate::FileKind::Bst {
-            crate::bst::format_style(&source[body.clone()], config)?
-        } else {
-            crate::format(&source[body.clone()], kind, config)?
-        };
+        let result = crate::format(&source[body.clone()], kind, payload_config)?;
         for mut diagnostic in result.diagnostics {
             diagnostic.span.start += body.start + bom_bytes;
             diagnostic.span.end += body.start + bom_bytes;
             diagnostics.push(diagnostic);
         }
         if result.text != source[body.clone()] {
-            edits.push((body, result.text));
+            edits.replace(body, result.text);
         }
     }
-    crate::layout::apply_edits(source, edits)
+    edits.apply_recording(source, history)
 }
 
 pub fn format_bibtex(source: &str, config: &CompiledConfig) -> Result<String, FormatError> {

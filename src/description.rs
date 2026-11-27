@@ -86,7 +86,7 @@ pub(crate) fn format(
         "\n"
     };
     let unit = config.config.indent.unit("item", "item");
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     for items in lists.values() {
         let fits = |item: &Item<'_>| {
             item.label_width
@@ -112,7 +112,7 @@ pub(crate) fn format(
                 format!("{newline}{hanging}")
             };
             if gap != source[item.gap.clone()] {
-                edits.push((item.gap.clone(), gap));
+                edits.replace(item.gap.clone(), gap);
             }
             let mut cursor = item.gap.end;
             for (n, line) in source[cursor..item.body_end]
@@ -134,10 +134,10 @@ pub(crate) fn format(
                 }
                 if n > 0 && !syntax::is_protected(start, &opaque) && line[..pos - start] != hanging
                 {
-                    edits.push((start..pos, hanging.clone()));
+                    edits.replace(start..pos, hanging.clone());
                 }
             }
         }
     }
-    crate::layout::apply_edits(source, edits)
+    edits.apply_first_wins(source)
 }

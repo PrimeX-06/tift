@@ -60,6 +60,7 @@ struct ScopedSignature {
     depth: usize,
     binding: Option<BoundSignature>,
     inline_code: Option<crate::code_package_syntax::GeneratedInlineKind>,
+    delimited: Option<DelimitedReader>,
 }
 
 struct BoundSignature {
@@ -190,6 +191,113 @@ impl SignatureBindings {
         self.values[usize::from(environment)].contains_key(name)
     }
 
+    pub(super) fn copied_verb(&self, name: &str) -> bool {
+        self.values[0]
+            .get(name)
+            .and_then(|values| values.last())
+            .map_or(name == "verb", |value| {
+                matches!(value.delimited, Some(DelimitedReader::CopiedVerb))
+            })
+    }
+
+    pub(super) fn mark_copied_verb(&mut self, name: &str) {
+        if let Some(value) = self.values[0]
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+        {
+            value.delimited = Some(DelimitedReader::CopiedVerb);
+        }
+    }
+
+    pub(super) fn observe_reader(&mut self, name: &str, body: &str) {
+        let Some(binding) = self.values[0].get_mut(name).and_then(|v| v.last_mut()) else {
+            return;
+        };
+        if !body.contains("##1#")
+            && !body.contains(r"\begingroup")
+            && !body.contains(r"\expandafter")
+            && !body.contains(r"\tokencycle")
+            && !body.trim_start().starts_with(r"\verb")
+        {
+            return;
+        }
+        let Some(shape) = binding.binding.as_ref().and_then(|b| b.syntax.compact()) else {
+            return;
+        };
+        binding.delimited = DelimitedReader::from_body(body, &shape);
+    }
+
+    pub(super) fn delimited_end<'a>(
+        &'a self,
+        source: &str,
+        mut at: usize,
+        mut name: &'a str,
+        tokcycle_loaded: impl Fn() -> bool,
+    ) -> Option<usize> {
+        let mut raw = false;
+        let mut remaining = self.values[0].len();
+        while remaining > 0 {
+            let reader = self.values[0].get(name)?.last()?.delimited.as_ref()?;
+            match reader {
+                DelimitedReader::CopiedVerb => return super::inline_end(source, "verb", at),
+                DelimitedReader::PercentGroupForward(target) => {
+                    at = super::skip_trivia(source, at);
+                    if source.as_bytes().get(at) == Some(&b'[') {
+                        at = balanced_end(source, at, b'[', b']')?;
+                    }
+                    name = target;
+                    raw = true;
+                }
+                DelimitedReader::TokenCycleGroup => {
+                    if !raw || self.contains(false, "tokencycle") || !tokcycle_loaded() {
+                        return None;
+                    }
+                    at = super::skip_trivia(source, at);
+                    if source.as_bytes().get(at) == Some(&b'[') {
+                        return None;
+                    }
+                    return super::literal_group_end(source, at);
+                }
+                DelimitedReader::Verbatim(delimiter) => {
+                    if self.contains(false, "verb") {
+                        return None;
+                    }
+                    return source[at..super::line_end(source, at)]
+                        .find(*delimiter)
+                        .map(|offset| at + offset + delimiter.len_utf8());
+                }
+                DelimitedReader::Forward {
+                    target,
+                    changes_catcodes,
+                } => {
+                    raw |= changes_catcodes;
+                    name = target;
+                }
+                DelimitedReader::Capture {
+                    optional,
+                    changes_catcodes,
+                } => {
+                    if !raw && !changes_catcodes {
+                        return None;
+                    }
+                    at = super::skip_trivia(source, at);
+                    if *optional && source.as_bytes().get(at) == Some(&b'[') {
+                        at = super::skip_trivia(source, balanced_end(source, at, b'[', b']')?);
+                    }
+                    let delimiter = *source.as_bytes().get(at)?;
+                    if !delimiter.is_ascii_punctuation() || b"\\{}%#".contains(&delimiter) {
+                        return None;
+                    }
+                    return source[at + 1..]
+                        .find(char::from(delimiter))
+                        .map(|i| at + i + 2);
+                }
+            }
+            remaining -= 1;
+        }
+        None
+    }
+
     pub(super) fn inline_code(
         &self,
         name: &str,
@@ -234,14 +342,163 @@ impl SignatureBindings {
         if let Some(value) = values.last_mut().filter(|value| value.depth == depth) {
             value.binding = binding;
             value.inline_code = None;
+            value.delimited = None;
         } else {
             values.push(ScopedSignature {
                 depth,
                 binding,
                 inline_code: None,
+                delimited: None,
             });
         }
         self.scopes[depth][index].insert(name);
+    }
+}
+
+/// An outer parameter supplies the final delimiter of a nested TeX reader.
+/// Forwarders are resolved at invocation so that later definitions and scopes apply.
+enum DelimitedReader {
+    CopiedVerb,
+    PercentGroupForward(String),
+    TokenCycleGroup,
+    Verbatim(char),
+    Forward {
+        target: String,
+        changes_catcodes: bool,
+    },
+    Capture {
+        optional: bool,
+        changes_catcodes: bool,
+    },
+}
+
+impl DelimitedReader {
+    fn from_body(body: &str, shape: &str) -> Option<Self> {
+        // An optional setup argument selects local printing options. Require
+        // both branches to consist solely of definitions before the common
+        // catcode assignment and tail call.
+        if shape == "o" && body.contains(r"\catcode") {
+            let mut rest = body
+                .trim()
+                .strip_prefix(r"\begingroup")?
+                .trim_start()
+                .strip_prefix(r"\ifx\relax#1\relax")?;
+            for terminator in [r"\else", r"\fi"] {
+                rest = rest.trim_start();
+                while let Some(("def", end)) = command_at(rest, 0) {
+                    let (_, after) = command_at(rest, super::skip_trivia(rest, end))?;
+                    let finish = balanced_end(rest, super::skip_trivia(rest, after), b'{', b'}')?;
+                    rest = rest[finish..].trim_start();
+                }
+                rest = rest.strip_prefix(terminator)?;
+            }
+            let ("catcode", end) = command_at(rest, super::skip_trivia(rest, 0))? else {
+                return None;
+            };
+            let (37, 12, end) = super::literal_catcode_assignment(rest, end, false)? else {
+                return None;
+            };
+            let (target, end) = command_at(rest, super::skip_trivia(rest, end))?;
+            return (super::skip_trivia(rest, end) == rest.len())
+                .then(|| Self::PercentGroupForward(target.to_owned()));
+        }
+        if shape == "om" && body.contains(r"\tokencycle") {
+            let mut at = super::skip_trivia(body, 0);
+            if let Some(("ttfamily", end)) = command_at(body, at) {
+                at = super::skip_trivia(body, end);
+            }
+            let ("tokencycle", mut at) = command_at(body, at)? else {
+                return None;
+            };
+            for _ in 0..4 {
+                at = balanced_end(body, super::skip_trivia(body, at), b'{', b'}')?;
+            }
+            return (body[super::skip_trivia(body, at)..].trim_end()
+                == r"#2\endtokencycle\endgroup")
+                .then_some(Self::TokenCycleGroup);
+        }
+        if shape.is_empty() {
+            let body = body.trim_start();
+            if let Some(("verb" | "verb*", end)) = command_at(body, 0) {
+                let mut rest = body[end..].chars();
+                if let Some(delimiter) = rest.next()
+                    && delimiter.is_ascii_punctuation()
+                    && !matches!(delimiter, '\\' | '{' | '}' | '%' | '#')
+                    && rest.as_str().is_empty()
+                {
+                    return Some(Self::Verbatim(delimiter));
+                }
+            }
+        }
+        // Find the terminal control and ignore comments between definition and
+        // invocation. Only recognize a scanner actually called in tail position.
+        let params = match shape {
+            "" => None,
+            "m" => Some("##1#1"),
+            "om" => Some("##1#2"),
+            _ => return None,
+        };
+        let mut tail = None;
+        let mut at = 0;
+        let mut grouped = false;
+        let mut changes_catcodes = false;
+        while at < body.len() {
+            at = super::skip_trivia(body, at);
+            if at == body.len() {
+                break;
+            }
+            if body.as_bytes()[at] == b'{' {
+                at = balanced_end(body, at, b'{', b'}')?;
+                tail = None;
+                continue;
+            }
+            let Some((name, end)) = command_at(body, at) else {
+                at += body[at..].chars().next()?.len_utf8();
+                tail = None;
+                continue;
+            };
+            if name.starts_with("if") || matches!(name, "else" | "fi" | "expandafter" if at != 0) {
+                return None;
+            }
+            if let Some(params) = params
+                && name == "def"
+                && let Some((reader, after)) = command_at(body, super::skip_trivia(body, end))
+                && body[after..].starts_with(params)
+                && let Some(group_end) = balanced_end(body, after + params.len(), b'{', b'}')
+                && let Some((invoked, finish)) =
+                    command_at(body, super::skip_trivia(body, group_end))
+                && invoked == reader
+                && super::skip_trivia(body, finish) == body.len()
+            {
+                return Some(Self::Capture {
+                    optional: shape == "om",
+                    changes_catcodes,
+                });
+            }
+            grouped |= name == "begingroup";
+            changes_catcodes |= name == "dospecials";
+            tail = Some((name, at));
+            at = end;
+        }
+        let (last, start) = tail?;
+        if !shape.is_empty() {
+            return None;
+        }
+        if last == "string" {
+            let first = super::skip_trivia(body, 0);
+            let (op, end) = command_at(body, first)?;
+            let (target, end) = command_at(body, super::skip_trivia(body, end))?;
+            return (op == "expandafter" && super::skip_trivia(body, end) == start).then(|| {
+                Self::Forward {
+                    target: target.to_owned(),
+                    changes_catcodes: false,
+                }
+            });
+        }
+        grouped.then(|| Self::Forward {
+            target: last.to_owned(),
+            changes_catcodes,
+        })
     }
 }
 
@@ -412,6 +669,8 @@ pub(crate) fn unclosed_argument(
     source: &str,
     mut cursor: usize,
     signature: &str,
+    kernel_item: bool,
+    protected_group_end: impl Fn(usize) -> Option<usize>,
 ) -> Option<Range<usize>> {
     if xparse::extended(signature) {
         return None;
@@ -432,7 +691,14 @@ pub(crate) fn unclosed_argument(
                 b'<' => b'>',
                 _ => b'}',
             };
-            let Some(end) = balanced_end(source, start, open, close) else {
+            let end = if open == b'[' && kernel_item {
+                // \@item[#1] takes the first closing bracket outside a TeX group.
+                xparse::until_end(source, start + 1, source.len(), "]")
+            } else {
+                balanced_end(source, start, open, close)
+                    .or_else(|| (open == b'{').then(|| protected_group_end(start)).flatten())
+            };
+            let Some(end) = end else {
                 return Some(start..source.len());
             };
             cursor = end;

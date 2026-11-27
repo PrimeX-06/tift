@@ -21,15 +21,10 @@ pub(super) fn format(
     parsing: &mut ParseContext<'_>,
 ) -> Result<String, FormatError> {
     let parsed = parsing.snapshot(source, true, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let declared = analysis.declared_commands()?;
+    let analysis = parsed.analysis(&config.config);
+    let declared = analysis.declared_commands();
     let options = &config.config.arguments;
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut consumed = 0;
     for token in parsed.tokens.as_deref().expect("parsed tokens") {
         if token.kind != syntax::TokenKind::Command || token.span.start < consumed {
@@ -123,7 +118,7 @@ pub(super) fn format(
                             + column(&unit, config.config.indent.width),
                     ),
                 ) {
-                    edits.push((body, text));
+                    edits.replace(body, text);
                 }
             }
             continue;
@@ -142,7 +137,7 @@ pub(super) fn format(
                 ),
                 options.line_width.unwrap_or(config.config.wrap.columns),
             ) {
-                edits.push((body, rendered));
+                edits.replace(body, rendered);
             }
         } else {
             for entry in crate::packages::keys::definition_entries(&source[body.clone()]) {
@@ -158,7 +153,7 @@ pub(super) fn format(
             }
         }
     }
-    crate::layout::apply_edits(source, edits)
+    edits.apply_first_wins(source)
 }
 
 fn listings_entry(
@@ -168,7 +163,7 @@ fn listings_entry(
     base: &str,
     unit: &str,
     newline: &str,
-    edits: &mut Vec<(Range<usize>, String)>,
+    edits: &mut crate::edit_plan::EditPlan<'_>,
 ) {
     let at = entry.start;
     let entry = &source[entry];
@@ -195,7 +190,7 @@ fn listings_entry(
     if inline {
         let lead = format!("{newline}{key_indent}");
         let previous_break = edits
-            .last()
+            .last_replacement()
             .is_some_and(|(r, text)| r.end == key_at && text.ends_with(&lead));
         rendered.insert_str(0, &source[key_at..start]);
         if !previous_break {
@@ -223,7 +218,7 @@ fn listings_entry(
         rendered.push_str(newline);
         rendered.push_str(base);
     }
-    edits.push((if inline { key_at } else { start }..end, rendered));
+    edits.replace(if inline { key_at } else { start }..end, rendered);
 }
 
 fn graphics_paths(

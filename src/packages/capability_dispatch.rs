@@ -153,6 +153,7 @@ macro_rules! providers {
                 commands: (4, visual_languages::command_signature),
                 data_ends: (2, visual_languages::command_header_end),
                 metadata: (2, visual_languages::is_metadata_command),
+                context_data: (3, visual_languages::context_command_data_ranges),
                 adders: (4, visual_languages::add_command_rules),
             }
             Graphics {

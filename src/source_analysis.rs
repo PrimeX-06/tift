@@ -8,19 +8,24 @@ use std::rc::Rc;
 
 use crate::Config;
 use crate::config::EnvironmentArguments;
+use crate::source_document::SourceDocument;
+use crate::source_model::SourceModel;
 
 pub(crate) struct SourceAnalysis<'a> {
     source: &'a str,
     config: &'a Config,
-    protected: Option<&'a [Range<usize>]>,
+    protected: &'a [Range<usize>],
     memo: Rc<AnalysisMemo>,
-    model_ref: Option<&'a crate::source_model::SourceModel>,
+    model_ref: Option<&'a SourceModel>,
 }
 
 #[derive(Default)]
 pub(crate) struct AnalysisMemo {
-    model: OnceCell<crate::source_model::SourceModel>,
-    exposed_model: RefCell<Option<ExposedModelCache>>,
+    document: OnceCell<SourceDocument>,
+    lexical_protection: Option<Vec<Range<usize>>>,
+    reader_windows: RefCell<Vec<crate::syntax::ReaderWindow>>,
+    model: OnceCell<Rc<SourceModel>>,
+    exposed_model: RefCell<Option<Rc<SourceModel>>>,
     declaration_tokens: OnceCell<bool>,
     boxes: OnceCell<HashMap<String, EnvironmentArguments>>,
     arguments: OnceCell<HashMap<String, EnvironmentArguments>>,
@@ -31,15 +36,29 @@ pub(crate) struct AnalysisMemo {
     lists: OnceCell<Vec<String>>,
 }
 
-struct ExposedModelCache {
-    ranges: Vec<Range<usize>>,
-    model: Rc<crate::source_model::SourceModel>,
-}
-
 impl AnalysisMemo {
-    pub(crate) fn with_model(model: crate::source_model::SourceModel) -> Self {
+    pub(crate) fn existing_model(&self) -> Option<&SourceModel> {
+        self.model.get().map(Rc::as_ref)
+    }
+
+    pub(crate) fn with_document(
+        document: SourceDocument,
+        lexical_protection: Vec<Range<usize>>,
+        reader_windows: Vec<crate::syntax::ReaderWindow>,
+    ) -> Self {
         Self {
-            model: OnceCell::from(model),
+            document: OnceCell::from(document),
+            lexical_protection: Some(lexical_protection),
+            reader_windows: RefCell::new(reader_windows),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_model(model: SourceModel) -> Self {
+        let document = model.document().clone();
+        Self {
+            document: OnceCell::from(document),
+            model: OnceCell::from(Rc::new(model)),
             ..Self::default()
         }
     }
@@ -51,43 +70,56 @@ impl AnalysisMemo {
         source: &str,
         config: &Config,
         protected: &[Range<usize>],
-    ) -> Rc<crate::source_model::SourceModel> {
+    ) -> Rc<SourceModel> {
+        if let Some(model) = self.model.get()
+            && model.lexical_protection() == protected
+        {
+            return Rc::clone(model);
+        }
         let mut cached = self.exposed_model.borrow_mut();
         if let Some(cached) = &*cached
-            && cached.ranges == protected
+            && cached.lexical_protection() == protected
         {
-            return Rc::clone(&cached.model);
+            return Rc::clone(cached);
         }
-        let model = Rc::new(crate::source_model::SourceModel::with_ranges(
-            source, config, protected,
-        ));
-        *cached = Some(ExposedModelCache {
-            ranges: protected.to_vec(),
-            model: Rc::clone(&model),
-        });
+        let document = self
+            .document
+            .get_or_init(|| SourceDocument::new(source))
+            .clone();
+        let model = Rc::new(SourceModel::with_document(document, config, protected));
+        *cached = Some(Rc::clone(&model));
         model
     }
 }
 
 impl<'a> SourceAnalysis<'a> {
-    pub(crate) fn model(&self) -> &crate::source_model::SourceModel {
+    pub(crate) fn model(&self) -> &SourceModel {
         if let Some(model) = self.model_ref {
             return model;
         }
         self.memo.model.get_or_init(|| {
-            crate::source_model::SourceModel::with_ranges(
-                self.source,
+            let document = self
+                .memo
+                .document
+                .get_or_init(|| SourceDocument::new(self.source))
+                .clone();
+            let mut model = SourceModel::with_document(
+                document,
                 self.config,
-                self.protected.unwrap_or(&[]),
-            )
+                self.memo
+                    .lexical_protection
+                    .as_deref()
+                    .unwrap_or(self.protected),
+            );
+            model.set_reader_windows(self.memo.reader_windows.take());
+            Rc::new(model)
         })
     }
     fn has_declaration_tokens(&self) -> bool {
-        self.protected.is_none()
-            || *self
-                .memo
-                .declaration_tokens
-                .get_or_init(|| crate::syntax::has_analysis_declaration_tokens(self.source))
+        *self
+            .memo
+            .declaration_tokens
+            .get_or_init(|| crate::syntax::has_analysis_declaration_tokens(self.source))
     }
 
     pub(crate) fn constructed_commands(
@@ -97,10 +129,7 @@ impl<'a> SourceAnalysis<'a> {
         // Some public block parsers use broader protection for metadata than
         // for lexing. A constructed command is meaningful only in the ranges
         // used to resolve it; those callers keep a separate owned result.
-        if self
-            .protected
-            .is_some_and(|metadata| std::ptr::eq(metadata, protected) || metadata == protected)
-        {
+        if std::ptr::eq(self.protected, protected) || self.protected == protected {
             Cow::Borrowed(self.model().constructed_commands())
         } else {
             Cow::Owned(crate::syntax::constant_constructed_commands(
@@ -115,21 +144,17 @@ impl<'a> SourceAnalysis<'a> {
         if self.config.syntax.environment_arguments.contains_key(name) {
             return false;
         }
-        let declared_environment = self
-            .declared_environments()
-            .is_ok_and(|names| names.contains(name));
-        let declared_command = self.declared_commands().is_ok_and(|names| {
-            names.contains(name) || !names.is_empty() && names.contains(&format!("end{name}"))
-        });
-        if !declared_environment && !declared_command {
+        let names = self.declared_commands();
+        if !self.declared_environments().contains(name)
+            && !names.contains(name)
+            && (names.is_empty() || !names.contains(&format!("end{name}")))
+        {
             return true;
         }
         self.memo
             .visual_headers
             .get_or_init(|| {
-                self.protected.and_then(|protected| {
-                    crate::syntax::visual_header_bindings(self.source, self.config, protected).ok()
-                })
+                crate::syntax::visual_header_bindings(self.source, self.config, self.protected).ok()
             })
             .as_ref()
             .and_then(|headers| headers.get(&begin_end))
@@ -145,12 +170,12 @@ impl<'a> SourceAnalysis<'a> {
         source: &'a str,
         config: &'a Config,
         protected: &'a [Range<usize>],
-        model: &'a crate::source_model::SourceModel,
+        model: &'a SourceModel,
     ) -> Self {
         Self {
             source,
             config,
-            protected: Some(protected),
+            protected,
             memo: Rc::default(),
             model_ref: Some(model),
         }
@@ -165,7 +190,7 @@ impl<'a> SourceAnalysis<'a> {
         Self {
             source,
             config,
-            protected: Some(protected),
+            protected,
             memo,
             model_ref: None,
         }
@@ -173,21 +198,16 @@ impl<'a> SourceAnalysis<'a> {
 
     pub(crate) fn implicit_list(&self, name: &str) -> bool {
         !self.config.syntax.environment_arguments.contains_key(name)
-            && !self
-                .declared_environments()
-                .is_ok_and(|names| names.contains(name))
+            && !self.declared_environments().contains(name)
     }
 
     pub(crate) fn box_arguments(&self, name: &str) -> Option<Cow<'_, EnvironmentArguments>> {
         let ordinary = self.memo.arguments.get_or_init(|| {
-            let Some(protected) = self.protected else {
-                return HashMap::new();
-            };
             crate::syntax::environment_argument_map_with_definitions(
                 self.source,
                 self.config,
-                protected,
-                &self.definitions(),
+                self.protected,
+                self.definitions(),
             )
         });
         if let Some(arguments) = ordinary.get(name) {
@@ -199,13 +219,10 @@ impl<'a> SourceAnalysis<'a> {
                 if !self.has_declaration_tokens() {
                     return HashMap::new();
                 }
-                let Some(protected) = self.protected else {
-                    return HashMap::new();
-                };
                 crate::package_environments::source_box_argument_map(
                     self.source,
                     self.config,
-                    protected,
+                    self.protected,
                 )
             })
             .get(name)
@@ -213,11 +230,7 @@ impl<'a> SourceAnalysis<'a> {
             .or_else(|| {
                 crate::packages::header_signature(name)
                     .filter(|signature| crate::syntax::xparse::extended(signature))
-                    .filter(|_| {
-                        !self
-                            .declared_environments()
-                            .is_ok_and(|names| names.contains(name))
-                    })
+                    .filter(|_| !self.declared_environments().contains(name))
                     .map(|signature| {
                         Cow::Owned(EnvironmentArguments {
                             signature: Some(signature.to_owned()),
@@ -257,80 +270,57 @@ impl<'a> SourceAnalysis<'a> {
         self.box_arguments(name)
     }
 
-    fn definitions(&self) -> Cow<'_, [crate::syntax::MacroDefinition]> {
-        let analyze = || {
-            if !self.has_declaration_tokens() {
-                return Vec::new();
+    fn definitions(&self) -> &[crate::syntax::MacroDefinition] {
+        self.memo.definitions.get_or_init(|| {
+            if self.has_declaration_tokens() {
+                crate::syntax::macro_definitions_from_model(self.source, self.model())
+            } else {
+                Vec::new()
             }
-            crate::syntax::macro_definitions_from_model(self.source, self.model())
-        };
-        Cow::Borrowed(self.memo.definitions.get_or_init(analyze))
+        })
     }
 
-    pub(crate) fn declared_commands(&self) -> Result<Cow<'_, HashSet<String>>, crate::FormatError> {
-        let Some(protected) = self.protected else {
-            return crate::syntax::declared_command_names(self.source, self.config).map(Cow::Owned);
-        };
-        let analyze = || {
-            if !self.has_declaration_tokens() {
-                return HashSet::new();
-            }
-            crate::syntax::declared_command_names_with_ranges(
-                self.source,
-                protected,
-                &self.definitions(),
-            )
-        };
-        Ok(Cow::Borrowed(self.memo.commands.get_or_init(analyze)))
-    }
-
-    pub(crate) fn declared_environments(
-        &self,
-    ) -> Result<Cow<'_, HashSet<String>>, crate::FormatError> {
-        if self.protected.is_none() {
-            return crate::syntax::declared_environment_names(self.source, self.config)
-                .map(Cow::Owned);
-        }
-        let analyze =
-            || crate::syntax::declared_environment_names_with_definitions(&self.definitions());
-        Ok(Cow::Borrowed(self.memo.environments.get_or_init(analyze)))
-    }
-
-    pub(crate) fn inferred_lists(
-        &self,
-        compiled: &crate::syntax::CompiledSyntax,
-    ) -> Cow<'_, [String]> {
-        if !self.has_declaration_tokens() {
-            return Cow::Borrowed(&[]);
-        }
-        if ![
-            "newenvironment",
-            "renewenvironment",
-            "DocumentEnvironment",
-            "newlist",
-        ]
-        .iter()
-        .any(|name| self.source.contains(name))
-        {
-            return Cow::Borrowed(&[]);
-        }
-        let analyze = || {
-            if self.protected.is_none() {
-                crate::syntax::infer_list_environments_with_config(
+    pub(crate) fn declared_commands(&self) -> &HashSet<String> {
+        self.memo.commands.get_or_init(|| {
+            if self.has_declaration_tokens() {
+                crate::syntax::declared_command_names_with_ranges(
                     self.source,
-                    &self.config.syntax.list_environments,
-                    self.config,
+                    self.protected,
+                    self.definitions(),
                 )
             } else {
-                crate::syntax::infer_list_environments_with_definitions(
-                    self.source,
-                    &self.config.syntax.list_environments,
-                    self.config,
-                    &self.definitions(),
-                    compiled,
-                )
+                HashSet::new()
             }
-        };
-        Cow::Borrowed(self.memo.lists.get_or_init(analyze))
+        })
+    }
+
+    pub(crate) fn declared_environments(&self) -> &HashSet<String> {
+        self.memo.environments.get_or_init(|| {
+            crate::syntax::declared_environment_names_with_definitions(self.definitions())
+        })
+    }
+
+    pub(crate) fn inferred_lists(&self, compiled: &crate::syntax::CompiledSyntax) -> &[String] {
+        self.memo.lists.get_or_init(|| {
+            if !self.has_declaration_tokens()
+                || ![
+                    "newenvironment",
+                    "renewenvironment",
+                    "DocumentEnvironment",
+                    "newlist",
+                ]
+                .iter()
+                .any(|name| self.source.contains(name))
+            {
+                return Vec::new();
+            }
+            crate::syntax::infer_list_environments_with_definitions(
+                self.source,
+                &self.config.syntax.list_environments,
+                self.config,
+                self.definitions(),
+                compiled,
+            )
+        })
     }
 }

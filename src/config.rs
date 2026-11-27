@@ -885,7 +885,7 @@ pub struct PackageLoadEvent {
     pub packages: BTreeMap<String, bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImportedCommand {
     pub arguments: Option<EnvironmentArguments>,
     pub literal_arguments: bool,

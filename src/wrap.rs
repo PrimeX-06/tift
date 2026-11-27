@@ -4,6 +4,7 @@
 //! Standard text arguments have a separate whitespace-safe wrap pass.
 //! Multi-line atomic spans form paragraph boundaries.
 
+use crate::edit_plan::EditPlan;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -315,6 +316,7 @@ pub fn compile(wrap: &WrapConfig, sentences: &SentenceConfig) -> Result<Compiled
 
 #[derive(Debug)]
 struct Paragraph {
+    span: Range<usize>,
     regions: Vec<Region>,
     prefix: String,
     continuation: String,
@@ -371,14 +373,9 @@ pub(crate) fn collapse_prose_spaces(
 
     let needs_environments = source.contains("\\begin") || source.contains("\\end");
     let parsed = parsing.snapshot(source, needs_environments, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let declared_commands = analysis.declared_commands()?;
-    let declared_environments = analysis.declared_environments()?;
+    let analysis = parsed.analysis(&config.config);
+    let declared_commands = analysis.declared_commands();
+    let declared_environments = analysis.declared_environments();
     let mut opaque = parsed.protected.clone();
     // A setter stored in a macro, alias or hook can execute after its source
     // range ends. Only use a setter's existing protection when the scanner
@@ -408,12 +405,7 @@ pub(crate) fn collapse_prose_spaces(
     }
     let mut body = 0..source.len();
     if needs_environments {
-        let Ok(environments) = crate::syntax::environment_ranges_with_tokens(
-            source,
-            parsed.tokens.as_deref().expect("environment tokens"),
-            &parsed.protected,
-            &config.config,
-        ) else {
+        let Ok(environments) = parsed.environment_ranges(&config.config) else {
             return Ok(source.into());
         };
         for environment in environments {
@@ -431,16 +423,9 @@ pub(crate) fn collapse_prose_spaces(
             }
         }
     }
-    add_inline_atoms(
-        source,
-        &mut opaque,
-        &config.config,
-        &declared_commands,
-        true,
-    );
+    add_inline_atoms(source, &mut opaque, &config.config, declared_commands, true);
 
-    let mut output = String::with_capacity(source.len());
-    let mut copied = 0;
+    let mut edits = EditPlan::new();
     let mut start = body.start;
     for line in source[body].split_inclusive('\n') {
         let end = start + line.len();
@@ -455,15 +440,13 @@ pub(crate) fn collapse_prose_spaces(
             for spaces in crate::trivia::repeated_spaces(&source[start_content..end_prose]) {
                 let spaces = start_content + spaces.start..start_content + spaces.end;
                 if !intersects(spaces.clone(), &opaque) {
-                    output.push_str(&source[copied..spaces.start + 1]);
-                    copied = spaces.end;
+                    edits.replace(spaces.start + 1..spaces.end, "");
                 }
             }
         }
         start = end;
     }
-    output.push_str(&source[copied..]);
-    Ok(output)
+    edits.apply_ordered(source)
 }
 
 pub fn format_text(
@@ -525,22 +508,12 @@ fn format_text_with_arguments(
     let parsed = parsing.snapshot(source, needs_environments || inline_paths, inline_paths)?;
     let mut opaque = parsed.protected.clone();
     let environments = if needs_environments {
-        crate::syntax::environment_ranges_with_tokens(
-            source,
-            parsed.tokens.as_deref().expect("environment tokens"),
-            &opaque,
-            &config.config,
-        )?
+        parsed.environment_ranges(&config.config)?
     } else {
-        Vec::new()
+        &[]
     };
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let declared_commands = analysis.declared_commands()?;
+    let analysis = parsed.analysis(&config.config);
+    let declared_commands = analysis.declared_commands();
     if inline_paths && let Some(blocks) = &parsed.blocks {
         opaque.extend(
             blocks
@@ -557,7 +530,7 @@ fn format_text_with_arguments(
         source,
         &mut opaque,
         &config.config,
-        &declared_commands,
+        declared_commands,
         false,
     );
     for environment in environments {
@@ -571,7 +544,7 @@ fn format_text_with_arguments(
         .filter(|range| source[(*range).clone()].contains('\n'))
         .cloned()
         .collect();
-    let mut output = String::with_capacity(source.len() + source.len() / 16);
+    let mut edits = EditPlan::new();
     let mut paragraph: Option<Paragraph> = None;
     let mut blocked_item: Option<(usize, String)> = None;
     let mut offset = 0;
@@ -611,7 +584,7 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
         }
         let comment = comment_prefix(body);
@@ -675,15 +648,14 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
             if let Some(prefix) = continuation {
                 // Only the indentation before the multiline atom is adjusted;
                 // its contents and the blocked-line protection stay intact.
-                output.push_str(&prefix);
-                output.push_str(&source[body_start..offset]);
-            } else {
-                output.push_str(line);
+                if prefix != source[start..body_start] {
+                    edits.replace(start..body_start, prefix);
+                }
             }
             continue;
         }
@@ -701,9 +673,8 @@ fn format_text_with_arguments(
                     config,
                     wrap_active,
                     sentences_active,
-                    &mut output,
+                    &mut edits,
                 )?;
-                output.push_str(line);
                 continue;
             }
             let base_prefix = format!(
@@ -725,7 +696,7 @@ fn format_text_with_arguments(
                     config,
                     wrap_active,
                     sentences_active,
-                    &mut output,
+                    &mut edits,
                 )?;
             }
             let paragraph = paragraph.get_or_insert_with(|| {
@@ -737,6 +708,7 @@ fn format_text_with_arguments(
                     None => (base_prefix.clone(), base_prefix),
                 };
                 Paragraph {
+                    span: start..offset,
                     regions: Vec::new(),
                     continuation,
                     prefix,
@@ -751,6 +723,7 @@ fn format_text_with_arguments(
                 space_before: true,
                 newline_before: paragraph_boundary(&paragraph.ending),
             });
+            paragraph.span.end = offset;
             paragraph.ending = ending.into();
             continue;
         }
@@ -787,7 +760,7 @@ fn format_text_with_arguments(
                     config,
                     wrap_active,
                     sentences_active,
-                    &mut output,
+                    &mut edits,
                 )?;
                 let list_marker = comment_list_marker(&source[text_start..content_end]);
                 let body_start = text_start + list_marker.map_or(0, str::len);
@@ -802,6 +775,7 @@ fn format_text_with_arguments(
                     format!("{}{} ", &content[..indent_len], marker)
                 };
                 paragraph = Some(Paragraph {
+                    span: start..offset,
                     regions: vec![Region {
                         range: body_start..content_end,
                         space_before: true,
@@ -865,9 +839,8 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
-            output.push_str(line);
             continue;
         }
         if item.is_some() || paragraph.as_ref().is_some_and(|p| p.comment) {
@@ -878,7 +851,7 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
         }
         let text_start = body_start + item.unwrap_or(0);
@@ -895,7 +868,6 @@ fn format_text_with_arguments(
             .map_err(crate::FormatError::Syntax)?
             .unwrap_or(true);
         if paragraph.is_none() && (!begins || !follows) {
-            output.push_str(line);
             continue;
         }
         let end_before = config
@@ -919,9 +891,8 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
-            output.push_str(line);
             continue;
         }
         let exterior_continuation = exterior_continuation.filter(|_| item.is_none());
@@ -940,6 +911,7 @@ fn format_text_with_arguments(
             source[start..body_start].to_owned()
         };
         let current = paragraph.get_or_insert_with(|| Paragraph {
+            span: start..offset,
             regions: Vec::new(),
             prefix: prefix.into(),
             continuation,
@@ -953,6 +925,7 @@ fn format_text_with_arguments(
             space_before: current.join_with_space,
             newline_before: paragraph_boundary(&current.ending),
         });
+        current.span.end = offset;
         current.join_with_space = generated_break.is_none_or(|(_, space)| space);
         current.ending = match generated_break {
             Some((marker, space)) => format!(
@@ -968,6 +941,7 @@ fn format_text_with_arguments(
             let whitespace = &source[text_start..boundary];
             let retained_start =
                 boundary - (whitespace.len() - whitespace.trim_end_matches([' ', '\t']).len());
+            current.span.end = retained_start;
             current.ending.clear();
             flush(
                 &mut paragraph,
@@ -976,9 +950,8 @@ fn format_text_with_arguments(
                 config,
                 wrap_active,
                 sentences_active,
-                &mut output,
+                &mut edits,
             )?;
-            output.push_str(&source[retained_start..offset]);
         }
     }
     flush(
@@ -988,8 +961,9 @@ fn format_text_with_arguments(
         config,
         wrap_active,
         sentences_active,
-        &mut output,
+        &mut edits,
     )?;
+    let output = edits.apply_ordered(source)?;
     if arguments
         && wrap_active
         && matches!(
@@ -1318,7 +1292,8 @@ fn format_text_arguments(
     } else {
         HashSet::new()
     };
-    let mut output = String::with_capacity(source.len());
+    let mut edits = EditPlan::new();
+    let mut previous_line = String::new();
     let mut copied = 0;
     let mut cursor = 0;
     let mut unblocked = false;
@@ -1383,11 +1358,7 @@ fn format_text_arguments(
                     let header = if let Some(newline) = pending.rfind('\n') {
                         Cow::Borrowed(&pending[newline + 1..])
                     } else {
-                        Cow::Owned(format!(
-                            "{}{}",
-                            output.rsplit('\n').next().unwrap_or(""),
-                            pending
-                        ))
+                        Cow::Owned(format!("{}{}", previous_line, pending))
                     };
                     let continuation = argument_continuation(source, body.start, blocks, config);
                     let replacement = wrap_text_argument(
@@ -1401,9 +1372,15 @@ fn format_text_arguments(
                     if replacement != source[body.clone()] {
                         unblocked |=
                             source[body.clone()].contains('\n') && !replacement.contains('\n');
-                        output.push_str(&source[copied..body.start]);
-                        output.push_str(&replacement);
+                        previous_line = if let Some((_, line)) = replacement.rsplit_once('\n') {
+                            line.to_owned()
+                        } else {
+                            let mut line = header.into_owned();
+                            line.push_str(&replacement);
+                            line
+                        };
                         copied = body.end;
+                        edits.replace(body, replacement);
                     }
                 }
             }
@@ -1424,8 +1401,7 @@ fn format_text_arguments(
             }
         }
     }
-    output.push_str(&source[copied..]);
-    Ok((output, unblocked))
+    Ok((edits.apply_ordered(source)?, unblocked))
 }
 
 fn argument_continuation(
@@ -1702,7 +1678,7 @@ fn flush(
     config: &crate::CompiledConfig,
     wrap_active: bool,
     sentences_active: bool,
-    output: &mut String,
+    edits: &mut EditPlan<'_>,
 ) -> Result<(), crate::FormatError> {
     let Some(paragraph) = paragraph.take() else {
         return Ok(());
@@ -1767,6 +1743,7 @@ fn flush(
             paragraph.continuation, config.config.sentences.indent
         )
     });
+    let mut output = String::with_capacity(paragraph.span.len());
     for (index, sentence) in sentences.iter().enumerate() {
         if index > 0 {
             output.push_str(
@@ -1816,10 +1793,13 @@ fn flush(
             preserve_lines,
             paragraph.comment,
             config,
-            output,
+            &mut output,
         )?;
     }
     output.push_str(&paragraph.ending);
+    if output != source[paragraph.span.clone()] {
+        edits.replace(paragraph.span, output);
+    }
     Ok(())
 }
 
@@ -2762,13 +2742,14 @@ fn has_comment(source: &str, range: Range<usize>, opaque: &[Range<usize>]) -> bo
     comment_start(source, range, opaque).is_some()
 }
 
-pub(crate) fn align_trailing_comments(
+pub(crate) fn align_comments_after_edits(
     source: &str,
     config: &crate::CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
+    mut edits: crate::edit_plan::EditPlan<'_>,
 ) -> Result<String, crate::FormatError> {
     if !source.contains('%') {
-        return Ok(source.into());
+        return edits.apply_ordered(source);
     }
     let parsed = parsing.snapshot(source, true, false)?;
     let mut groups = Vec::new();
@@ -2796,17 +2777,28 @@ pub(crate) fn align_trailing_comments(
         let next_line = source[marker..]
             .find('\n')
             .map_or(source.len(), |n| marker + n + 1);
-        let width = display_width(code, 0, config.config.indent.width);
+        let projected = edits.projected_span(source, line..gap.start);
+        let width = display_width(&projected, 0, config.config.indent.width);
         groups.push((line, next_line, indent, gap, width));
     }
-    align_comment_groups(source, &groups)
+    collect_comment_edits(source, &groups, &mut edits);
+    edits.apply_first_wins(source)
 }
 
 pub(crate) fn align_comment_groups(
     source: &str,
     groups: &[(usize, usize, &str, Range<usize>, usize)],
 ) -> Result<String, crate::FormatError> {
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
+    collect_comment_edits(source, groups, &mut edits);
+    edits.apply_ordered(source)
+}
+
+fn collect_comment_edits(
+    source: &str,
+    groups: &[(usize, usize, &str, Range<usize>, usize)],
+    edits: &mut crate::edit_plan::EditPlan<'_>,
+) {
     for group in groups.chunk_by(|a, b| a.1 == b.0 && a.2 == b.2) {
         if group.len() < 2 {
             continue;
@@ -2815,11 +2807,14 @@ pub(crate) fn align_comment_groups(
         for (_, _, _, gap, width) in group {
             let pad = target - width;
             if gap.len() != pad || source[gap.clone()].contains('\t') {
-                edits.push((gap.clone(), " ".repeat(pad)));
+                edits.replace_from(
+                    crate::edit_plan::EditOrigin::TrailingComment,
+                    gap.clone(),
+                    " ".repeat(pad),
+                );
             }
         }
     }
-    crate::layout::apply_edits(source, edits)
 }
 
 fn ends_control_word(text: &str) -> bool {

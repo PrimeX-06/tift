@@ -8,6 +8,51 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::config::CommandRule;
 
+pub(crate) fn context_command_data_ranges(
+    source: &str,
+    name: &str,
+    cursor: usize,
+    context: &super::InvocationContext<'_>,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if name == "plot" && context.has_package("pictex") {
+        // PiCTeX delimits each numeric coordinate with whitespace, including
+        // the last coordinate before the closing slash.
+        let coordinates = source[cursor..].trim_start_matches(|c: char| {
+            c.is_ascii_digit() || c.is_ascii_whitespace() || matches!(c, '+' | '-' | '.')
+        });
+        let slash = source.len() - coordinates.len();
+        let data = &source[cursor..slash];
+        if coordinates.starts_with('/')
+            && data.ends_with(char::is_whitespace)
+            && data.bytes().any(|b| b.is_ascii_digit())
+        {
+            return Some(std::iter::once(cursor..slash + 1).collect());
+        }
+        return None;
+    }
+    if !matches!(name, "obj" | "mor") || !context.has_package("dcpic") {
+        return None;
+    }
+    // DCpic compares node names as token lists. The object text doubles
+    // as its identifier when the optional identifier is absent.
+    if name == "obj" {
+        return crate::syntax::arguments::domain_ranges(source, cursor, "r() o m", "UUU");
+    }
+    let mut cursor = cursor;
+    let mut endpoints = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let start = crate::trivia::skip(source, cursor);
+        let (open, close) = match source.as_bytes().get(start)? {
+            b'(' => (b'(', b')'),
+            b'{' => (b'{', b'}'),
+            _ => return None,
+        };
+        cursor = crate::syntax::balanced_end(source, start, open, close)?;
+        endpoints.push(start..cursor);
+    }
+    Some(endpoints)
+}
+
 /// Record changed visual/science environment and command bindings, preserving
 /// TeX scope recovery. The built-in command and environment names are disjoint.
 #[derive(Default)]
@@ -315,7 +360,7 @@ pub(crate) fn header_signature(name: &str) -> Option<&'static str> {
         "pagebreakbox" => "",
         // asymptote.sty and gnuplottex.sty use raw line readers.
         "asy" | "gnuplot" => "o",
-        "asydef" => "",
+        "asydef" | "xy" => "",
         "gnuplotverbatimwrite" => "m",
         // mfpic.tex:1344--1346: two scales and four coordinate bounds.
         "mfpic" => "oommmm",

@@ -1,5 +1,7 @@
 pub(crate) mod arguments;
+mod context_verbatim;
 mod declarations;
+pub(crate) mod recovery;
 pub(crate) mod xparse;
 pub use declarations::{
     DeclarationIndex, infer_declaration_config, infer_declaration_config_indexed,
@@ -15,6 +17,8 @@ use conditions::{
 pub(crate) use crate::block_storage::SharedBlock;
 use crate::block_storage::{BlockName, NamePool, NameStore, OwnedNames, StructuralBlock};
 use crate::config::SyntaxConfig;
+use crate::lexical_index::{RawTokenStream, SourceTokenKind, SourceTokens};
+use crate::source_document::SourceDocument;
 use crate::{Config, FormatError};
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -1095,58 +1099,30 @@ pub(crate) fn env_after_command<'a>(
     ))
 }
 
-fn line_start(source: &str, pos: usize) -> usize {
+pub(crate) fn line_start(source: &str, pos: usize) -> usize {
     source[..pos].rfind('\n').map_or(0, |i| i + 1)
 }
-fn line_end(source: &str, pos: usize) -> usize {
+pub(crate) fn line_end(source: &str, pos: usize) -> usize {
     source[pos..]
         .find('\n')
         .map_or(source.len(), |i| pos + i + 1)
 }
 
-fn untranslated_character_sequence(source: &str) -> Option<usize> {
-    if !source.contains("^^") {
+fn untranslated_character_sequence_at(source: &str, start: usize) -> Option<Range<usize>> {
+    let sequence = source.get(start..)?.strip_prefix("^^")?;
+    if sequence.starts_with('I') || sequence.starts_with("09") {
         return None;
     }
-    let mut cursor = 0;
-    while cursor < source.len() {
-        if source.as_bytes()[cursor] == b'%' {
-            cursor = line_end(source, cursor);
-            continue;
-        }
-        if source[cursor..].starts_with("^^")
-            && !source[cursor..].starts_with("^^I")
-            && !source[cursor..].starts_with("^^09")
-            && source.as_bytes().get(cursor + 2).is_some_and(u8::is_ascii)
-        {
-            return Some(cursor);
-        }
-        if source.as_bytes()[cursor] == b'\\' {
-            if let Some((name, end)) = command_at(source, cursor)
-                && (name.trim_end_matches('*') == "verb"
-                    || crate::code_environments::INLINE_VERBATIM_COMMANDS
-                        .contains(&name.trim_end_matches('*'))
-                    || crate::code_package_syntax::INLINE_CODE_COMMANDS
-                        .contains(&name.trim_end_matches('*')))
-                && let Some(finish) = inline_end(source, name, end)
-            {
-                cursor = finish;
-                continue;
-            }
-            if matches!(source.as_bytes().get(cursor + 1), Some(b'%' | b'\\')) {
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        cursor += source[cursor..]
-            .chars()
-            .next()
-            .expect("source character")
-            .len_utf8();
+    let bytes = sequence.as_bytes();
+    let first = *bytes.first()?;
+    if bytes
+        .get(1)
+        .is_some_and(|second| first.is_ascii_hexdigit() && second.is_ascii_hexdigit())
+    {
+        Some(start..start + 4)
+    } else {
+        first.is_ascii().then_some(start..start + 3)
     }
-    None
 }
 
 /// Shared physical-line controls for TeX and BibTeX comment scanners.
@@ -1230,6 +1206,10 @@ pub(crate) fn inline_end(source: &str, name: &str, mut pos: usize) -> Option<usi
     if name.trim_end_matches('*') == "verb"
         || crate::code_environments::INLINE_VERBATIM_COMMANDS.contains(&name.trim_end_matches('*'))
     {
+        if name.trim_end_matches('*') == "verb" {
+            // LaTeX's \@sverb skips blank tokens before selecting the delimiter.
+            pos = source.len() - source[pos..].trim_start_matches([' ', '\t']).len();
+        }
         let delimiter = source[pos..].chars().next()?;
         if delimiter.is_whitespace() {
             return None;
@@ -1788,99 +1768,93 @@ pub(crate) fn macro_definitions_from_model(
             continue;
         }
         pos = token.span.start;
-        if source.as_bytes()[pos] == b'%' {
-            pos = line_end(source, pos);
+        let Some((name, end)) = token.control(source) else {
+            break;
+        };
+        while declarations.peek().is_some_and(|d| d.span.start < pos) {
+            declarations.next();
+        }
+        while environments.peek().is_some_and(|d| d.span.start < pos) {
+            environments.next();
+        }
+        if let Some(declaration) = environments.peek().filter(|d| d.span.start == pos) {
+            output.push(MacroDefinition {
+                name: name.into(),
+                start: pos,
+                end: declaration.span.end,
+                bodies: declaration.bodies.clone(),
+                environment: Some(declaration.name.clone()),
+                command: None,
+            });
+            pos = declaration.span.end;
+            environments.next();
             continue;
         }
-        if source.as_bytes()[pos] == b'\\' {
-            let Some((name, end)) = command_at(source, pos) else {
-                break;
+        if let Some(declaration) = declarations.peek().filter(|d| d.span.start == pos) {
+            output.push(MacroDefinition {
+                name: name.into(),
+                start: pos,
+                end: declaration.span.end,
+                bodies: vec![declaration.body.clone()],
+                environment: None,
+                command: Some(declaration.name.clone()),
+            });
+            pos = declaration.span.end;
+            declarations.next();
+            continue;
+        }
+        if name.trim_end_matches('*') == "newtheorem"
+            && let Some(declaration) = context_theorem_declaration(source, pos, name, end)
+        {
+            output.push(MacroDefinition {
+                name: name.into(),
+                start: pos,
+                end: declaration.span.end,
+                bodies: Vec::new(),
+                environment: Some(declaration.name),
+                command: None,
+            });
+            pos = declaration.span.end;
+            continue;
+        }
+        if (latex_macro_definition(name) || matches!(name, "def" | "gdef" | "edef" | "xdef"))
+            && let Some(range) = macro_body(source, name, end)
+        {
+            let first_end =
+                balanced_end(source, range.start, b'{', b'}').expect("macro body was balanced");
+            let mut bodies: Vec<Range<usize>> =
+                std::iter::once(range.start + 1..first_end - 1).collect();
+            let environment = if name.to_ascii_lowercase().contains("environment") {
+                let next = skip_trivia(source, first_end);
+                bodies.push(next + 1..range.end - 1);
+                let name_start = skip_trivia(source, end);
+                balanced_end(source, name_start, b'{', b'}')
+                    .map(|finish| source[name_start + 1..finish - 1].trim().to_owned())
+            } else {
+                None
             };
-            while declarations.peek().is_some_and(|d| d.span.start < pos) {
-                declarations.next();
-            }
-            while environments.peek().is_some_and(|d| d.span.start < pos) {
-                environments.next();
-            }
-            if let Some(declaration) = environments.peek().filter(|d| d.span.start == pos) {
-                output.push(MacroDefinition {
-                    name: name.into(),
-                    start: pos,
-                    end: declaration.span.end,
-                    bodies: declaration.bodies.clone(),
-                    environment: Some(declaration.name.clone()),
-                    command: None,
-                });
-                pos = declaration.span.end;
-                environments.next();
-                continue;
-            }
-            if let Some(declaration) = declarations.peek().filter(|d| d.span.start == pos) {
-                output.push(MacroDefinition {
-                    name: name.into(),
-                    start: pos,
-                    end: declaration.span.end,
-                    bodies: vec![declaration.body.clone()],
-                    environment: None,
-                    command: Some(declaration.name.clone()),
-                });
-                pos = declaration.span.end;
-                declarations.next();
-                continue;
-            }
-            if name.trim_end_matches('*') == "newtheorem"
-                && let Some(declaration) = context_theorem_declaration(source, pos, name, end)
-            {
-                output.push(MacroDefinition {
-                    name: name.into(),
-                    start: pos,
-                    end: declaration.span.end,
-                    bodies: Vec::new(),
-                    environment: Some(declaration.name),
-                    command: None,
-                });
-                pos = declaration.span.end;
-                continue;
-            }
-            if (latex_macro_definition(name) || matches!(name, "def" | "gdef" | "edef" | "xdef"))
-                && let Some(range) = macro_body(source, name, end)
-            {
-                let first_end =
-                    balanced_end(source, range.start, b'{', b'}').expect("macro body was balanced");
-                let mut bodies: Vec<Range<usize>> =
-                    std::iter::once(range.start + 1..first_end - 1).collect();
-                let environment = if name.to_ascii_lowercase().contains("environment") {
-                    let next = skip_trivia(source, first_end);
-                    bodies.push(next + 1..range.end - 1);
-                    let name_start = skip_trivia(source, end);
-                    balanced_end(source, name_start, b'{', b'}')
-                        .map(|finish| source[name_start + 1..finish - 1].trim().to_owned())
-                } else {
-                    None
-                };
-                let command = if environment.is_none() {
-                    let mut start = skip_trivia(source, end);
-                    if source.as_bytes().get(start) == Some(&b'{') {
-                        start = skip_trivia(source, start + 1);
-                    }
-                    command_at(source, start).map(|(name, _)| name.to_owned())
-                } else {
-                    None
-                };
-                output.push(MacroDefinition {
-                    name: name.into(),
-                    start: pos,
-                    end: range.end,
-                    bodies,
-                    environment,
-                    command,
-                });
-                pos = range.end;
-                continue;
-            }
-            pos = end;
+            let command = if environment.is_none() {
+                let mut start = skip_trivia(source, end);
+                if source.as_bytes().get(start) == Some(&b'{') {
+                    start = skip_trivia(source, start + 1);
+                }
+                command_at(source, start).map(|(name, _)| name.to_owned())
+            } else {
+                None
+            };
+            output.push(MacroDefinition {
+                name: name.into(),
+                start: pos,
+                end: range.end,
+                bodies,
+                environment,
+                command,
+            });
+            pos = range.end;
             continue;
         }
+        pos = end;
+        continue;
     }
     output
 }
@@ -2673,6 +2647,88 @@ fn context_declaration_command(command: &str) -> bool {
         )
 }
 
+#[doc(hidden)]
+pub fn input_package(operand: &str) -> Option<&'static str> {
+    match operand {
+        "pitex" | "pitex.tex" | "{pitex}" | "{pitex.tex}" => Some("pitex"),
+        "pdfToolbox" | "pdfToolbox.tex" | "{pdfToolbox}" | "{pdfToolbox.tex}" => Some("pdfToolbox"),
+        _ if matches!(
+            operand.trim_matches(['{', '}']),
+            "pgfmanual-en-macros" | "pgfmanual-en-macros.tex"
+        ) =>
+        {
+            Some("pgfmanual-en-macros")
+        }
+        _ => None,
+    }
+}
+
+#[doc(hidden)]
+pub fn project_export_reader(name: &str) -> bool {
+    context_declaration_command(name)
+        || name.starts_with("cs_")
+        || matches!(
+            name,
+            "NewCommandCopy"
+                | "RenewCommandCopy"
+                | "DeclareCommandCopy"
+                | "ltx@newif"
+                | "newife"
+                | "global"
+                | "long"
+                | "outer"
+                | "protected"
+                | "input"
+                | "include"
+                | "documentclass"
+                | "LoadClass"
+                | "LoadClassWithOptions"
+                | "usepackage"
+                | "RequirePackage"
+                | "RequirePackageWithOptions"
+        )
+}
+
+#[doc(hidden)]
+pub fn project_export_boundary(source: &str) -> bool {
+    source.match_indices('\\').all(|(start, _)| {
+        let Some((name, end)) = command_at(source, start) else {
+            return false;
+        };
+        let name = name.trim_end_matches('*');
+        if matches!(
+            name,
+            "NewCommandCopy" | "RenewCommandCopy" | "DeclareCommandCopy"
+        ) || name.starts_with("cs_")
+            && name.split_once(':').is_some_and(|(family, _)| {
+                matches!(family, "cs_new_eq" | "cs_set_eq" | "cs_gset_eq")
+            })
+        {
+            return command_copy(source, name, end).is_some();
+        }
+        if expl3_definition_variant(name).is_some() {
+            return expl3_definition_body(source, name, end).is_some();
+        }
+        if matches!(name, "newif" | "ltx@newif" | "newife") {
+            return command_at(source, skip_trivia(source, end)).is_some();
+        }
+        if matches!(
+            name,
+            "documentclass"
+                | "LoadClass"
+                | "LoadClassWithOptions"
+                | "usepackage"
+                | "RequirePackage"
+                | "RequirePackageWithOptions"
+        ) {
+            let mut cursor = end;
+            context_argument(source, &mut cursor, b'[', b']');
+            return context_argument(source, &mut cursor, b'{', b'}').is_some();
+        }
+        true
+    })
+}
+
 fn has_context_declaration(source: &str) -> bool {
     source.match_indices('\\').any(|(start, _)| {
         command_at(source, start).is_some_and(|(command, _)| context_declaration_command(command))
@@ -2696,29 +2752,6 @@ pub(crate) fn has_analysis_declaration_tokens(source: &str) -> bool {
     })
 }
 
-pub(crate) fn declared_environment_names(
-    source: &str,
-    config: &Config,
-) -> Result<HashSet<String>, FormatError> {
-    if ![
-        "environment",
-        "DocumentEnvironment",
-        "newtheorem",
-        "NewEnviron",
-        "RenewEnviron",
-        "declaretheorem",
-        "newboxtheorem",
-    ]
-    .iter()
-    .any(|name| source.contains(name))
-    {
-        return Ok(HashSet::new());
-    }
-    Ok(declared_environment_names_with_definitions(
-        &macro_definitions(source, config)?,
-    ))
-}
-
 pub(crate) fn declared_environment_names_with_definitions(
     definitions: &[MacroDefinition],
 ) -> HashSet<String> {
@@ -2733,19 +2766,6 @@ pub(crate) fn declared_environment_names_with_definitions(
         })
         .filter_map(|definition| definition.environment.clone())
         .collect()
-}
-
-pub(crate) fn declared_command_names(
-    source: &str,
-    config: &Config,
-) -> Result<HashSet<String>, FormatError> {
-    let definitions = macro_definitions(source, config)?;
-    let protected = protected_ranges(source, config)?;
-    Ok(declared_command_names_with_ranges(
-        source,
-        &protected,
-        &definitions,
-    ))
 }
 
 pub(crate) fn declared_command_names_with_ranges(
@@ -3043,12 +3063,7 @@ pub(crate) fn format_macro_definitions_with_context(
         return Ok(source.into());
     }
     let parsed = parsing.snapshot(source, false, false)?;
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
+    let analysis = parsed.analysis(&config.config);
     let definitions = macro_definitions_from_model(source, analysis.model());
     format_macro_definitions_parsed(source, config, definitions)
 }
@@ -3271,11 +3286,11 @@ fn format_macro_definitions_parsed(
             edits.push((body.clone(), text));
         }
     }
-    let mut output = source.to_owned();
-    for (range, text) in edits.into_iter().rev() {
-        output.replace_range(range, &text);
+    let mut plan = crate::edit_plan::EditPlan::new();
+    for (range, text) in edits {
+        plan.replace(range, text);
     }
-    Ok(output)
+    plan.apply_with_last_start_wins(source)
 }
 
 fn protected_special_end(
@@ -3341,11 +3356,52 @@ struct InferredEnvironmentProtection {
     active: Range<usize>,
 }
 
+fn may_reference_raw_reader(source: &str, config: &Config) -> bool {
+    if source.contains("^^") {
+        return true;
+    }
+    let environments: HashSet<_> = config
+        .protect
+        .environments
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let commands: HashSet<_> = config
+        .protect
+        .commands
+        .iter()
+        .map(|name| name.trim_end_matches('*'))
+        .collect();
+    source.match_indices('\\').any(|(at, _)| {
+        let Some((control, end)) = command_at(source, at) else {
+            return true;
+        };
+        let name = control.trim_end_matches('*');
+        commands.contains(name)
+            || environments.contains(name)
+            || name
+                .strip_prefix("end")
+                .is_some_and(|inner| environments.contains(inner))
+            || config.protect.dynamic_catcodes
+                && matches!(
+                    name,
+                    "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
+                )
+            || config.protect.expl3 && name == "ExplSyntaxOn"
+            || name == "begin"
+                && env_after_command(source, name, end)
+                    .is_none_or(|(env, _, _)| environments.contains(env))
+    })
+}
+
 fn inferred_environment_protection(
     source: &str,
     config: &Config,
     protected: &[Range<usize>],
 ) -> Vec<InferredEnvironmentProtection> {
+    if !may_reference_raw_reader(source, config) {
+        return Vec::new();
+    }
     // Expl3 changes the treatment of spaces and control names while retaining
     // ordinary declaration grammar. Expose those declarations, keeping raw
     // readers, disabled regions and independent catcode changes protected.
@@ -3362,7 +3418,7 @@ fn inferred_environment_protection(
     } else {
         protected
     };
-    let model = crate::source_model::SourceModel::with_ranges(source, config, protected);
+    let model = crate::source_model::SourceModel::for_definition_scan(source, config, protected);
     let definitions = macro_definitions_from_model(source, &model);
     let environments: HashSet<_> = definitions
         .iter()
@@ -3488,6 +3544,12 @@ fn inferred_environment_protection(
             }
         }
     }
+    if !environments
+        .iter()
+        .any(|name| dangerous.contains(&format!("environment:{name}")))
+    {
+        return Vec::new();
+    }
     let mut bindings = HashMap::new();
     let mut rules: Vec<InferredEnvironmentProtection> = Vec::new();
     let mut active = HashMap::new();
@@ -3562,7 +3624,7 @@ fn inferred_environment_protection(
             crate::source_model::SourceTokenKind::OpenGroup => (Some("}".to_owned()), None),
             crate::source_model::SourceTokenKind::CloseGroup => (None, Some("}".to_owned())),
             crate::source_model::SourceTokenKind::Control => {
-                let Some((name, end)) = command_at(source, at) else {
+                let Some((name, end)) = token.control(source) else {
                     continue;
                 };
                 cursor = end;
@@ -3642,9 +3704,63 @@ fn set_environment_protection(
     }
 }
 
+/// An interval traversed by the protection scanner in its ordinary reader.
+#[derive(Clone, Debug)]
+pub(crate) struct ReaderWindow {
+    pub(crate) span: Range<usize>,
+    active: Vec<char>,
+    code_punctuation: bool,
+}
+
+impl ReaderWindow {
+    pub(crate) fn same_state(&self, other: &Self) -> bool {
+        self.code_punctuation == other.code_punctuation
+            && self.active.len() == other.active.len()
+            && self.active.iter().all(|c| other.active.contains(c))
+    }
+
+    pub(crate) fn accepts(&self, text: &str) -> bool {
+        !text.contains(|c| {
+            matches!(c, '\\' | '%' | '^' | '`')
+                || (self.code_punctuation && c == '!')
+                || self.active.contains(&c)
+        })
+    }
+
+    fn record(windows: &mut Vec<Self>, span: Range<usize>, active: &HashSet<char>, code: bool) {
+        if let Some(last) = windows.last_mut()
+            && last.span.end == span.start
+            && last.code_punctuation == code
+            && last.active.len() == active.len()
+            && last.active.iter().all(|c| active.contains(c))
+        {
+            last.span.end = span.end;
+        } else {
+            windows.push(Self {
+                span,
+                active: active.iter().copied().collect(),
+                code_punctuation: code,
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RawReaderFacts<'a, 's> {
+    pub(crate) tokens: &'a std::cell::RefCell<RawTokenStream<'s>>,
+    pub(crate) loaders: Option<&'a crate::source_model::LoaderPositions>,
+}
+
+#[derive(Default)]
+struct ReaderScan<'a, 's> {
+    raw: Option<RawReaderFacts<'a, 's>>,
+    expl3: bool,
+    windows: Option<&'a mut Vec<ReaderWindow>>,
+}
+
 /// Source regions whose original bytes must survive all formatting passes.
 pub fn protected_ranges(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_impl(source, config, None, None, false)
+    protected_ranges_impl(source, config, None, None, ReaderScan::default())
 }
 
 #[doc(hidden)]
@@ -3653,7 +3769,7 @@ pub fn protected_ranges_with_syntax(
     config: &Config,
     compiled: &CompiledSyntax,
 ) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_impl(source, config, Some(compiled), None, false)
+    protected_ranges_impl(source, config, Some(compiled), None, ReaderScan::default())
 }
 
 pub(crate) fn protected_ranges_with_diagnostics(
@@ -3661,8 +3777,28 @@ pub(crate) fn protected_ranges_with_diagnostics(
     config: &Config,
     compiled: Option<&CompiledSyntax>,
 ) -> Result<(Vec<Range<usize>>, Vec<crate::Diagnostic>), FormatError> {
+    protection_snapshot(source, config, compiled, None, None)
+}
+
+pub(crate) fn protection_snapshot(
+    source: &str,
+    config: &Config,
+    compiled: Option<&CompiledSyntax>,
+    windows: Option<&mut Vec<ReaderWindow>>,
+    raw: Option<RawReaderFacts<'_, '_>>,
+) -> Result<(Vec<Range<usize>>, Vec<crate::Diagnostic>), FormatError> {
     let mut diagnostics = Vec::new();
-    let ranges = protected_ranges_impl(source, config, compiled, Some(&mut diagnostics), false)?;
+    let ranges = protected_ranges_impl(
+        source,
+        config,
+        compiled,
+        Some(&mut diagnostics),
+        ReaderScan {
+            raw,
+            expl3: false,
+            windows,
+        },
+    )?;
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
     diagnostics.dedup_by(|a, b| a.span == b.span && a.message == b.message);
     Ok((ranges, diagnostics))
@@ -3673,7 +3809,17 @@ pub(crate) fn protected_ranges_for_expl3_outer(
     config: &Config,
     compiled: &CompiledSyntax,
 ) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_impl(source, config, Some(compiled), None, true)
+    protected_ranges_impl(
+        source,
+        config,
+        Some(compiled),
+        None,
+        ReaderScan {
+            raw: None,
+            expl3: true,
+            windows: None,
+        },
+    )
 }
 
 fn protected_ranges_impl(
@@ -3681,7 +3827,7 @@ fn protected_ranges_impl(
     config: &Config,
     compiled: Option<&CompiledSyntax>,
     mut diagnostics: Option<&mut Vec<crate::Diagnostic>>,
-    protect_expl3_bodies: bool,
+    mut scan: ReaderScan<'_, '_>,
 ) -> Result<Vec<Range<usize>>, FormatError> {
     let owned;
     let compiled = if let Some(compiled) = compiled {
@@ -3701,17 +3847,33 @@ fn protected_ranges_impl(
         None,
         compiled,
         diagnostics.as_deref_mut(),
-        protect_expl3_bodies,
+        ReaderScan {
+            raw: scan.raw,
+            expl3: scan.expl3,
+            windows: scan.windows.as_deref_mut(),
+        },
     )?;
-    if ![
-        "environment",
-        "DocumentEnvironment",
-        "NewEnviron",
-        "RenewEnviron",
+    // Only environment definitions with bodies can start an inferred raw
+    // reader. Manuals often mention "environment" in ordinary prose.
+    let environment_definition = [
+        r"\newenvironment",
+        r"\renewenvironment",
+        r"\lynewenvironment",
+        r"\provideenvironment",
+        r"\NewDocumentEnvironment",
+        r"\RenewDocumentEnvironment",
+        r"\ProvideDocumentEnvironment",
+        r"\DeclareDocumentEnvironment",
+        r"\NewEnviron",
+        r"\RenewEnviron",
     ]
     .iter()
-    .any(|name| source.contains(name))
-    {
+    .any(|command| {
+        source.match_indices(command).any(|(at, _)| {
+            !is_protected(at, &ranges) || config.protect.expl3 && source.contains(r"\ExplSyntaxOn")
+        })
+    });
+    if !environment_definition {
         add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
         return Ok(ranges);
     }
@@ -3728,14 +3890,22 @@ fn protected_ranges_impl(
         None,
         compiled,
         diagnostics,
-        protect_expl3_bodies,
+        scan,
     )?;
     add_conditional_environment_protection(source, config, &mut ranges, compiled)?;
     Ok(ranges)
 }
 
 fn protected_ranges_basic(source: &str, config: &Config) -> Result<Vec<Range<usize>>, FormatError> {
-    protected_ranges_with_inferred_environments(source, config, &[], None, None, None, false)
+    protected_ranges_with_inferred_environments(
+        source,
+        config,
+        &[],
+        None,
+        None,
+        None,
+        ReaderScan::default(),
+    )
 }
 
 pub(crate) fn visual_header_bindings(
@@ -3752,7 +3922,7 @@ pub(crate) fn visual_header_bindings(
         Some(&mut bindings),
         None,
         None,
-        false,
+        ReaderScan::default(),
     )?;
     Ok(bindings)
 }
@@ -3785,6 +3955,7 @@ fn short_verbatim_declaration(source: &str, name: &str, end: usize) -> Option<(c
     if !matches!(
         name,
         "MakeShortVerb"
+            | "MakeSpecialShortVerb"
             | "DeleteShortVerb"
             | "DefineShortVerb"
             | "UndefineShortVerb"
@@ -3794,6 +3965,15 @@ fn short_verbatim_declaration(source: &str, name: &str, end: usize) -> Option<(c
         return None;
     }
     let mut start = skip_trivia(source, end);
+    if name == "MakeSpecialShortVerb" {
+        // newverbs takes the verbatim command itself before its delimiter.
+        let after = if source.as_bytes().get(start) == Some(&b'{') {
+            balanced_end(source, start, b'{', b'}')?
+        } else {
+            command_at(source, start)?.1
+        };
+        start = skip_trivia(source, after);
+    }
     if source.as_bytes().get(start) == Some(&b'[')
         && matches!(
             name,
@@ -3802,24 +3982,29 @@ fn short_verbatim_declaration(source: &str, name: &str, end: usize) -> Option<(c
     {
         start = skip_trivia(source, balanced_end(source, start, b'[', b']')?);
     }
-    if matches!(name, "lstMakeShortInline" | "lstDeleteShortInline") {
-        let delimiter = source[start..].chars().next()?;
-        return (!delimiter.is_whitespace() && !"\\{}%".contains(delimiter)).then_some((
-            delimiter,
-            name == "lstMakeShortInline",
-            start + delimiter.len_utf8(),
-        ));
-    }
-    let finish = balanced_end(source, start, b'{', b'}')?;
-    let text = source[start + 1..finish - 1].trim();
+    let (text, finish) = if source.as_bytes().get(start) == Some(&b'{') {
+        let finish = balanced_end(source, start, b'{', b'}')?;
+        (source[start + 1..finish - 1].trim(), finish)
+    } else {
+        let finish = if source.as_bytes().get(start) == Some(&b'\\') {
+            command_at(source, start)?.1
+        } else {
+            start + source[start..].chars().next()?.len_utf8()
+        };
+        (&source[start..finish], finish)
+    };
     let text = text.strip_prefix('\\').unwrap_or(text);
     let mut chars = text.chars();
     let delimiter = chars.next()?;
-    (chars.next().is_none() && !"\\{}%".contains(delimiter)).then_some((
-        delimiter,
-        matches!(name, "MakeShortVerb" | "DefineShortVerb"),
-        finish,
-    ))
+    (chars.next().is_none() && !delimiter.is_whitespace() && !"\\{}%".contains(delimiter))
+        .then_some((
+            delimiter,
+            matches!(
+                name,
+                "MakeShortVerb" | "MakeSpecialShortVerb" | "DefineShortVerb" | "lstMakeShortInline"
+            ),
+            finish,
+        ))
 }
 
 // Some branch-selecting macros return an opening primitive conditional. Keep
@@ -4437,6 +4622,12 @@ fn catcode_assignment(
 // Keep only the interval with altered tokenization. Explicit assignments are
 // tracked individually; a local group restores its incoming catcodes. If the
 // escape/group delimiters change or an assignment is dynamic, retain the suffix.
+#[derive(Default)]
+struct CatcodeScan<'a> {
+    closed_scope: bool,
+    literal_carets: Option<&'a mut Vec<usize>>,
+}
+
 fn dynamic_catcode_end(
     source: &str,
     name: &str,
@@ -4444,7 +4635,7 @@ fn dynamic_catcode_end(
     scope: Option<&str>,
     global: bool,
     kernel_active: bool,
-    closed_scope: &mut bool,
+    scan: &mut CatcodeScan<'_>,
 ) -> usize {
     let mut changed = HashMap::new();
     let mut cursor = end;
@@ -4493,6 +4684,13 @@ fn dynamic_catcode_end(
             .get(&(c as u32))
             .copied()
             .unwrap_or_else(|| default_catcode(c as u32));
+        if c == '^'
+            && code != 7
+            && source[cursor..].starts_with("^^")
+            && let Some(carets) = &mut scan.literal_carets
+        {
+            carets.push(cursor);
+        }
         if code == 14 {
             cursor = line_end(source, cursor);
             continue;
@@ -4727,7 +4925,7 @@ fn dynamic_catcode_end(
                     && scope == Some(terminator.as_str())
                 {
                     if c != '\\' {
-                        *closed_scope = true;
+                        scan.closed_scope = true;
                         return finish;
                     }
                     return cursor;
@@ -4748,7 +4946,7 @@ fn dynamic_catcode_end(
                 changed = nested.pop().expect("catcode scope").1;
             } else if nested.is_empty() && can_restore_scope && scope == Some("}") {
                 if c != '}' {
-                    *closed_scope = true;
+                    scan.closed_scope = true;
                     return cursor + c.len_utf8();
                 }
                 return cursor;
@@ -4802,25 +5000,552 @@ fn protected_ranges_with_inferred_environments(
     mut visual_headers: Option<&mut HashMap<usize, bool>>,
     compiled: Option<&CompiledSyntax>,
     mut diagnostics: Option<&mut Vec<crate::Diagnostic>>,
-    protect_expl3_bodies: bool,
+    scan: ReaderScan<'_, '_>,
 ) -> Result<Vec<Range<usize>>, FormatError> {
-    if config.protect.dynamic_catcodes
-        && let Some(at) = untranslated_character_sequence(source)
-    {
-        if let Some(diagnostics) = diagnostics.as_deref_mut() {
-            diagnostics.push(crate::Diagnostic {
-                severity: crate::Severity::Warning,
-                message:
-                    "TeX character translation requires a different token stream; source preserved"
-                        .into(),
-                span: at..at + 2,
-            });
+    if !source.contains("^^") {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    }
+
+    let document = SourceDocument::new(source);
+    // Classify literal payloads using their original delimiters. Translating
+    // the payload first could consume the closing character of a verbatim
+    // command, causing the virtual reader to reject otherwise valid input.
+    let document = if !document.translated_ranges().is_empty() {
+        let protected = protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            None,
+            compiled,
+            None,
+            ReaderScan {
+                raw: scan.raw,
+                expl3: scan.expl3,
+                windows: None,
+            },
+        )
+        .unwrap_or_default();
+        preserve_literal_translations(document, &protected)
+    } else {
+        document
+    };
+    let analysis = document.analysis_text();
+    if analysis == source {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    }
+
+    let Some(analysis_inferred_environments) = inferred_environments
+        .iter()
+        .map(|inferred| {
+            Some(InferredEnvironmentProtection {
+                name: inferred.name.clone(),
+                active: document.to_analysis_range(inferred.active.clone())?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    };
+
+    let mut analysis_headers = HashMap::new();
+    let mut analysis_diagnostics = Vec::new();
+    let mut analysis_windows = Vec::new();
+    let ranges = protected_ranges_with_inferred_environments_inner(
+        analysis,
+        config,
+        &analysis_inferred_environments,
+        visual_headers.is_some().then_some(&mut analysis_headers),
+        compiled,
+        diagnostics.is_some().then_some(&mut analysis_diagnostics),
+        ReaderScan {
+            raw: None,
+            expl3: scan.expl3,
+            windows: scan.windows.is_some().then_some(&mut analysis_windows),
+        },
+    )
+    .map_err(|error| translated_syntax_error(&document, error))?;
+
+    let Some(mut source_ranges) = ranges
+        .iter()
+        .cloned()
+        .map(|range| document.to_source_range(range))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    };
+
+    let mut translated_tokens = SourceTokens::mapped(&document, &ranges);
+    let literal_blocks = verbatim_blocks_with_ranges(analysis, &ranges);
+    let mut translated_token = translated_tokens.next();
+    let mut translation_diagnostics = Vec::new();
+    let mut translated_lines = Vec::new();
+    for translated in document.translated_ranges() {
+        while translated_token
+            .as_ref()
+            .is_some_and(|token| token.analysis.end <= translated.start)
+        {
+            translated_token = translated_tokens.next();
         }
-        return Ok(std::iter::once(0..source.len()).collect());
+        let Some(token) = translated_token.as_ref().filter(|token| {
+            token.analysis.start <= translated.start && translated.start < token.analysis.end
+        }) else {
+            continue;
+        };
+        let value = analysis.as_bytes()[translated.start];
+        if value == b'%'
+            && token.kind == SourceTokenKind::Comment
+            && token.analysis.start == translated.start
+        {
+            let mut comment = token.source.clone();
+            if source[comment.end..].starts_with("\r\n") {
+                comment.end += 2;
+            } else if source[comment.end..].starts_with('\n') {
+                comment.end += 1;
+            }
+            source_ranges.push(comment);
+            if config.protect.dynamic_catcodes {
+                let Some(sequence) = document.to_source_range(translated.clone()) else {
+                    return protected_ranges_with_inferred_environments_inner(
+                        source,
+                        config,
+                        inferred_environments,
+                        visual_headers,
+                        compiled,
+                        diagnostics,
+                        scan,
+                    );
+                };
+                translation_diagnostics.push(crate::Diagnostic {
+                    severity: crate::Severity::Warning,
+                    message: "TeX character translation line preserved for safe analysis".into(),
+                    span: sequence,
+                });
+            }
+            continue;
+        }
+        if token.kind == SourceTokenKind::Comment
+            || value == b'\t'
+            || !config.protect.dynamic_catcodes
+        {
+            continue;
+        }
+        if token.kind == SourceTokenKind::Opaque
+            && translation_is_in_literal(analysis, translated.start, &ranges, &literal_blocks)
+        {
+            continue;
+        }
+
+        let Some(sequence) = document.to_source_range(translated.clone()) else {
+            return protected_ranges_with_inferred_environments_inner(
+                source,
+                config,
+                inferred_environments,
+                visual_headers,
+                compiled,
+                diagnostics,
+                scan,
+            );
+        };
+        let line = line_start(source, sequence.start)..line_end(source, sequence.end);
+        if translated_lines.last() != Some(&line) {
+            translated_lines.push(line);
+        }
+        translation_diagnostics.push(crate::Diagnostic {
+            severity: crate::Severity::Warning,
+            message: "TeX character translation line preserved for safe analysis".into(),
+            span: sequence,
+        });
+    }
+
+    if !translated_lines.is_empty() {
+        protect_translated_structure(
+            &document,
+            config,
+            &ranges,
+            &translated_lines,
+            &mut source_ranges,
+        )?;
+        source_ranges.extend(translated_lines);
+    }
+
+    let Some(mapped_headers) = analysis_headers
+        .into_iter()
+        .map(|(offset, value)| Some((document.to_source_offset(offset)?, value)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    };
+
+    let Some(mapped_diagnostics) = analysis_diagnostics
+        .into_iter()
+        .map(|mut diagnostic| {
+            diagnostic.span = document.to_source_range(diagnostic.span.clone())?;
+            Some(diagnostic)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return protected_ranges_with_inferred_environments_inner(
+            source,
+            config,
+            inferred_environments,
+            visual_headers,
+            compiled,
+            diagnostics,
+            scan,
+        );
+    };
+
+    if let Some(headers) = visual_headers.as_mut() {
+        headers.extend(mapped_headers);
+    }
+    if let Some(windows) = scan.windows {
+        // An encoded delimiter may change the grammar inside its physical
+        // line. Keep the next wholly unchanged reader interval as a checkpoint.
+        windows.clear();
+        let translated = document.translated_ranges();
+        for mut window in analysis_windows {
+            let i = translated.partition_point(|r| r.end <= window.span.start);
+            if !translated.get(i).is_some_and(|r| r.start < window.span.end)
+                && let Some(raw) = document.to_source_range(window.span.clone())
+            {
+                window.span = raw;
+                windows.push(window);
+            }
+        }
+    }
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.extend(mapped_diagnostics);
+        diagnostics.extend(translation_diagnostics);
+    }
+
+    Ok(merge_reader_ranges(source_ranges))
+}
+
+/// Error messages can identify both the failing token and its opener.
+fn translated_syntax_error(document: &SourceDocument, error: FormatError) -> FormatError {
+    error.map_byte_offsets(|at| document.to_source_offset(at))
+}
+
+/// A raw line hidden for a TeX character translation may contain one end of
+/// a group, environment, conditional, or math block. Preserve its virtual
+/// partner as well, up to the byte where the outer parser regains its state.
+fn protect_translated_structure(
+    document: &SourceDocument,
+    config: &Config,
+    protected: &[Range<usize>],
+    source_lines: &[Range<usize>],
+    output: &mut Vec<Range<usize>>,
+) -> Result<(), FormatError> {
+    let translated = document.analysis_text();
+    let lines: Vec<_> = source_lines
+        .iter()
+        .filter_map(|line| document.to_analysis_range(line.clone()))
+        .collect();
+    let Ok(config) = crate::CompiledConfig::new(config.clone()) else {
+        return Ok(());
+    };
+    let analysis =
+        crate::source_analysis::SourceAnalysis::new(translated, &config.config, protected);
+    let tokens = lex_with_analysis(
+        translated,
+        &config.config,
+        &config.syntax,
+        protected,
+        &analysis,
+    )
+    .map_err(|error| translated_syntax_error(document, error))?;
+    let blocks = match blocks_from_tokens(translated, &config, protected, &analysis, &tokens) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            // An escaped character or a printed example can require preserving
+            // its line without introducing a virtual structural boundary.
+            let structural_translation = document.translated_ranges().iter().any(|range| {
+                if !overlaps(range, &lines) {
+                    return false;
+                }
+                let i = tokens.partition_point(|token| token.span.end <= range.start);
+                tokens.get(i).is_some_and(|token| match token.kind {
+                    TokenKind::BeginEnvironment
+                    | TokenKind::EndEnvironment
+                    | TokenKind::OpenBrace
+                    | TokenKind::CloseBrace
+                    | TokenKind::Math
+                    | TokenKind::SpecialBegin(_)
+                    | TokenKind::SpecialMiddle(_)
+                    | TokenKind::SpecialEnd(_) => true,
+                    TokenKind::Command => {
+                        command_at(translated, token.span.start).is_some_and(|(name, _)| {
+                            is_condition_command(name, &config.config)
+                                || matches!(
+                                    name,
+                                    "else"
+                                        | "or"
+                                        | "fi"
+                                        | "begingroup"
+                                        | "endgroup"
+                                        | "bgroup"
+                                        | "egroup"
+                                        | "loop"
+                                        | "repeat"
+                                )
+                        })
+                    }
+                    _ => false,
+                })
+            });
+            return if structural_translation {
+                Err(translated_syntax_error(document, error))
+            } else {
+                Ok(())
+            };
+        }
+    };
+    extend_hidden_boundaries(&blocks, &lines, |span| {
+        if let Some(raw) = document.to_source_range(span) {
+            output.push(raw);
+        }
+    });
+    Ok(())
+}
+
+fn extend_hidden_boundaries(
+    blocks: &[SharedBlock],
+    lines: &[Range<usize>],
+    mut preserve: impl FnMut(Range<usize>),
+) {
+    for block in blocks {
+        if block.begin.is_empty() || block.end.is_empty() {
+            continue;
+        }
+        let span = block.begin.start..block.end.end;
+        // A pair already contained in a single hidden line needs no extension.
+        let first = lines.partition_point(|line| line.end <= span.start);
+        if lines.get(first).is_none_or(|line| {
+            line.start >= span.end || (line.start <= span.start && span.end <= line.end)
+        }) {
+            continue;
+        }
+        if overlaps(&block.begin, lines)
+            || overlaps(&block.end, lines)
+            || block
+                .branches
+                .iter()
+                .any(|(_, branch)| overlaps(branch, lines))
+        {
+            preserve(span);
+        }
+    }
+}
+
+pub(crate) fn preserve_literal_translations(
+    document: SourceDocument,
+    protected: &[Range<usize>],
+) -> SourceDocument {
+    if !document.as_str().contains("^^") || document.translated_ranges().is_empty() {
+        return document;
+    }
+    let blocks = verbatim_blocks_with_ranges(document.as_str(), protected);
+    let source = document.as_str();
+    let mut caret_literals = Vec::new();
+    for range in protected {
+        let Some(("catcode", end)) = command_at(source, range.start) else {
+            continue;
+        };
+        if !source[range.clone()].contains("^^") {
+            continue;
+        }
+        // An executed, isolated assignment starts this lexical protection
+        // range. A locally redefined \active cannot supply the kernel constant.
+        let prefix = &source[..range.start];
+        let kernel_active = !prefix.contains(r"\active")
+            || !SourceTokens::new(prefix, &[]).any(|token| {
+                token
+                    .control(prefix)
+                    .is_some_and(|(name, _)| name == "active")
+            });
+        if let Some((character, code, _)) = literal_catcode_assignment(source, end, kernel_active)
+            && character == '^' as u32
+            && code != 7
+        {
+            dynamic_catcode_end(
+                &source[..range.end],
+                "catcode",
+                end,
+                None,
+                false,
+                kernel_active,
+                &mut CatcodeScan {
+                    closed_scope: false,
+                    literal_carets: Some(&mut caret_literals),
+                },
+            );
+        }
+    }
+    // A control word itself may acquire its escape or letters through ^^.
+    // Its verbatim reader then consumes the delimiter in the raw input.
+    let analysis = document.analysis_text();
+    let mut inline = Vec::new();
+    if document
+        .translated_ranges()
+        .iter()
+        .any(|r| b"\\verb*".contains(&analysis.as_bytes()[r.start]))
+        && analysis.contains("\\verb")
+    {
+        for token in SourceTokens::new(analysis, &[]) {
+            if let Some((name, end)) = token.control(analysis)
+                && name.trim_end_matches('*') == "verb"
+                && let Some(raw) = document.to_source_range(token.span.clone())
+                && raw.len() != token.span.len()
+                && let Some(at) = document.to_source_offset(end)
+                && let Some(end) = inline_end(document.as_str(), name, at)
+            {
+                inline.push(at..end);
+            }
+        }
+    }
+    let sequences: Vec<_> = document
+        .translated_ranges()
+        .iter()
+        .filter_map(|range| document.to_source_range(range.clone()))
+        .filter(|r| {
+            caret_literals.binary_search(&r.start).is_ok()
+                || overlaps(r, &inline)
+                || translation_is_in_literal(document.as_str(), r.start, protected, &blocks)
+        })
+        .collect();
+    document.with_literal_sequences(&sequences)
+}
+
+fn translation_is_in_literal(
+    source: &str,
+    position: usize,
+    protected: &[Range<usize>],
+    literal_blocks: &[SharedBlock],
+) -> bool {
+    if literal_blocks
+        .iter()
+        .any(|block| block.begin.start <= position && position < block.end.end)
+    {
+        return true;
+    }
+    let range_index = protected.partition_point(|range| range.end <= position);
+    let Some(range) = protected
+        .get(range_index)
+        .filter(|range| range.start <= position)
+    else {
+        return false;
+    };
+    let mut cursor = range.start;
+    let literal = &source[range.clone()];
+    if let Some((name, end)) = command_at(source, range.start)
+        && (name.starts_with("start") || matches!(name, "type" | "typ"))
+        && context_verbatim::document(source)
+        && context_verbatim::literal_reader_end(source, name, end)
+            .is_some_and(|finish| end <= position && position < finish && finish <= range.end)
+    {
+        return true;
+    }
+    if let Some(delimiter) = literal.chars().next()
+        && !delimiter.is_alphanumeric()
+        && !delimiter.is_whitespace()
+        && !matches!(delimiter, '\\' | '%' | '^' | '{' | '}')
+        && let Some(body) = literal
+            .strip_prefix(delimiter)
+            .and_then(|tail| tail.strip_suffix(delimiter))
+        && !body.contains(['\r', '\n'])
+        && !body.contains(delimiter)
+        && position >= range.start + delimiter.len_utf8()
+    {
+        return true;
+    }
+    while cursor < position {
+        let Some(relative) = source[cursor..position].find('\\') else {
+            break;
+        };
+        let command_start = cursor + relative;
+        if let Some((name, end)) = command_at(source, command_start) {
+            let base = name.trim_end_matches('*');
+            if (base == "verb"
+                || crate::code_package_syntax::INLINE_CODE_COMMANDS.contains(&base)
+                || crate::code_environments::INLINE_VERBATIM_COMMANDS.contains(&base))
+                && inline_end(source, name, end).is_some_and(|finish| position < finish)
+            {
+                return true;
+            }
+            cursor = end.max(command_start + 1);
+        } else {
+            cursor = command_start + 1;
+        }
+    }
+    false
+}
+
+fn protected_ranges_with_inferred_environments_inner(
+    source: &str,
+    config: &Config,
+    inferred_environments: &[InferredEnvironmentProtection],
+    mut visual_headers: Option<&mut HashMap<usize, bool>>,
+    compiled: Option<&CompiledSyntax>,
+    mut diagnostics: Option<&mut Vec<crate::Diagnostic>>,
+    mut scan: ReaderScan<'_, '_>,
+) -> Result<Vec<Range<usize>>, FormatError> {
+    let protect_expl3_bodies = scan.expl3;
+    if let Some(windows) = &mut scan.windows {
+        windows.clear();
     }
     if memchr::memchr2(b'\\', b'%', source.as_bytes()).is_none()
+        && !source.contains("^^")
         && !config.syntax.special.iter().any(|r| r.verbatim)
     {
+        if let Some(windows) = &mut scan.windows
+            && !source.is_empty()
+        {
+            windows.push(ReaderWindow {
+                span: 0..source.len(),
+                active: Vec::new(),
+                code_punctuation: false,
+            });
+        }
         return Ok(Vec::new());
     }
     let owned;
@@ -4831,8 +5556,18 @@ fn protected_ranges_with_inferred_environments(
         &owned
     };
     let special_matches = special_matches(source, config, compiled, true)?;
+    let translation_sequences = if config.protect.dynamic_catcodes && source.contains("^^") {
+        source
+            .match_indices("^^")
+            .filter_map(|(start, _)| untranslated_character_sequence_at(source, start))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut ranges = Vec::new();
     let mut pos = 0usize;
+    let mut translation_index = 0usize;
+    let mut legacy_lines = Vec::new();
     let mut directives = FormatDirectiveState::default();
     let mut noindent: Vec<(&str, usize)> = Vec::new();
     let noindent_markers: Vec<_> = config
@@ -4851,14 +5586,26 @@ fn protected_ranges_with_inferred_environments(
     let mut short_verbatim = HashSet::<char>::new();
     let mut document_short_verbatim = Vec::new();
     let mut delayed_key_ranges = std::collections::BTreeMap::new();
-    let mut package_context = crate::packages::ContextIndex::with_config(source, config);
-    if package_context.at(0).has_package("ltxdoc") || package_context.at(0).has_package("l3doc") {
+    let owned_positions;
+    let loader_positions = if let Some(raw) = scan.raw {
+        raw.loaders
+    } else {
+        owned_positions = crate::source_model::SourceModel::has_anchored_loader_events(config)
+            .then(|| crate::source_model::SourceModel::loader_positions(source, None));
+        owned_positions.as_ref()
+    };
+    let mut package_context = crate::packages::ContextIndex::with_config(config, loader_positions);
+    if ["ltxdoc", "l3doc", "ltxguide"]
+        .iter()
+        .any(|name| package_context.at(0).has_package(name))
+    {
         short_verbatim.insert('|');
     }
     let mut pending_branches = std::collections::BTreeMap::new();
     let mut branch_ends = std::collections::BinaryHeap::new();
     let mut xparse_bindings = arguments::SignatureBindings::default();
-    let command_imports = crate::source_model::SourceModel::command_imports(source, config);
+    let command_imports =
+        crate::source_model::SourceModel::command_imports(source, config, loader_positions);
     let mut command_imports = command_imports.iter().peekable();
     use crate::package_environments::VerbatimTerminator;
     let mut package_verbatim = HashMap::new();
@@ -4868,6 +5615,7 @@ fn protected_ranges_with_inferred_environments(
     let mut catcode_scopes: Vec<(Cow<'_, str>, bool, usize)> = Vec::new();
     let mut inline_tikz_start = None;
     let mut pitex_verbatim = HashSet::new();
+    let context_document = context_verbatim::document(source);
     let mut kkverb_delimiters = ("|".to_owned(), "|".to_owned());
     let mut knowledge_variants: HashMap<String, Vec<Vec<String>>> = HashMap::new();
     let mut knowledge_literal_styles = HashSet::<String>::new();
@@ -4878,6 +5626,9 @@ fn protected_ranges_with_inferred_environments(
     let mut foreach_groups = None;
     let mut pending_unless = false;
     let mut input_end = source.len();
+    let mut raw_tokens = scan.raw.map(|raw| raw.tokens.borrow_mut());
+    let mut raw_cursor = 0;
+    let mut at_delimits_verb = false;
     while pos < input_end {
         while command_imports.peek().is_some_and(|event| event.at <= pos) {
             for (name, command) in &command_imports.next().unwrap().commands {
@@ -4982,19 +5733,83 @@ fn protected_ranges_with_inferred_environments(
             pos = end;
             continue;
         }
-        if c == b'\\' {
-            let command = command_at(source, pos).map(|(name, end)| {
-                if let Some(suffix) = name.strip_prefix("verb")
-                    && suffix.starts_with(':')
-                    && !xparse_bindings.contains(false, name)
-                    && !config.syntax.commands.contains_key(name)
-                {
-                    ("verb", pos + 5)
+        if config.protect.dynamic_catcodes {
+            let sequence_start = if source[pos..].starts_with("\\^^") {
+                pos + 1
+            } else {
+                pos
+            };
+            if let Some(sequence) = untranslated_character_sequence_at(source, sequence_start) {
+                let start = line_start(source, pos);
+                let end = line_end(source, sequence.end);
+                // Keep an 8-bit spelling opaque without assuming its encoding.
+                // Scan the rest of its physical line so structural tokens can
+                // be paired before the line itself becomes protected.
+                let legacy =
+                    source.as_bytes().get(sequence.start + 2).is_some_and(
+                        |byte| matches!(byte, b'8'..=b'9' | b'a'..=b'f' | b'A'..=b'F'),
+                    ) && sequence.len() == 4;
+                if legacy {
+                    if legacy_lines.last() != Some(&(start..end)) {
+                        legacy_lines.push(start..end);
+                    }
+                    ranges.push(pos..sequence.end);
+                    pos = sequence.end;
                 } else {
-                    (name, end)
+                    ranges.push(start..end);
+                    pos = end;
                 }
-            });
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.push(crate::Diagnostic {
+                        severity: crate::Severity::Warning,
+                        message: "TeX character translation line preserved for safe analysis"
+                            .into(),
+                        span: sequence,
+                    });
+                }
+                continue;
+            }
+        }
+        if c == b'\\' {
+            // Reader jumps are monotone. A literal such as \verb|%| may end
+            // inside a raw comment, in which case only the uncovered command
+            // spelling needs to be read from the source again.
+            let command = raw_tokens
+                .as_deref_mut()
+                .and_then(|raw| raw.control_at(pos, &mut raw_cursor))
+                .or_else(|| command_at(source, pos))
+                .map(|(name, end)| {
+                    if let Some(suffix) = name.strip_prefix("verb")
+                        && (suffix.starts_with(':') || at_delimits_verb && suffix.starts_with('@'))
+                        && !xparse_bindings.contains(false, name)
+                        && !config.syntax.commands.contains_key(name)
+                    {
+                        ("verb", pos + 5)
+                    } else {
+                        (name, end)
+                    }
+                });
             if let Some((name, end)) = command {
+                match name {
+                    "makeatletter" => at_delimits_verb = false,
+                    "makeatother" | "documentclass" => {
+                        at_delimits_verb = catcode_scopes.is_empty()
+                            && active_conditions.is_empty()
+                            && branch_ends.is_empty()
+                            && !xparse_bindings.contains(false, name);
+                    }
+                    _ => {}
+                }
+                if context_document
+                    && !config.syntax.commands.contains_key(name)
+                    && !package_commands_redefined.contains(name)
+                    && !xparse_bindings.contains(false, name)
+                    && let Some(finish) = context_verbatim::reader_end(source, name, end)
+                {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
                 if name == "Ver"
                     && source[end..].starts_with('>')
                     && let Some(offset) = source[end + 1..].find("<Rev")
@@ -5013,8 +5828,9 @@ fn protected_ranges_with_inferred_environments(
                     pos = finish;
                     continue;
                 }
-                if package_context.at(pos).has_package("KKluaverb")
-                    || package_context.at(pos).has_package("kkluaverb")
+                if matches!(name, "KKverb" | "KKvSetDelims")
+                    && (package_context.at(pos).has_package("KKluaverb")
+                        || package_context.at(pos).has_package("kkluaverb"))
                 {
                     if name == "KKvSetDelims" {
                         let args = crate::layout::signature_argument_ranges(
@@ -5038,7 +5854,7 @@ fn protected_ranges_with_inferred_environments(
                                 continue;
                             }
                         }
-                    } else if name == "KKverb" && source[end..].starts_with(&kkverb_delimiters.0) {
+                    } else if source[end..].starts_with(&kkverb_delimiters.0) {
                         let body = end + kkverb_delimiters.0.len();
                         if let Some(offset) = source[body..].find(&kkverb_delimiters.1) {
                             let finish = body + offset + kkverb_delimiters.1.len();
@@ -5124,7 +5940,10 @@ fn protected_ranges_with_inferred_environments(
                         start = skip_trivia(source, finish);
                     }
                     if let Some(finish) = balanced_end(source, start, b'{', b'}')
-                        && matches!(source[start + 1..finish - 1].trim(), "ltxdoc" | "l3doc")
+                        && matches!(
+                            source[start + 1..finish - 1].trim(),
+                            "ltxdoc" | "l3doc" | "ltxguide"
+                        )
                     {
                         short_verbatim.insert('|');
                     }
@@ -5142,7 +5961,18 @@ fn protected_ranges_with_inferred_environments(
                     && let Some(binding) = arguments::foreach_binding(source, end, |at| {
                         foreach_groups
                             .get_or_insert_with(|| {
-                                crate::source_model::SourceModel::literal_group_ends(source)
+                                raw_tokens.as_deref_mut().map_or_else(
+                                    || {
+                                        crate::source_model::SourceModel::literal_group_ends(
+                                            SourceTokens::new(source, &[]),
+                                        )
+                                    },
+                                    |raw| {
+                                        crate::source_model::SourceModel::literal_group_ends(
+                                            raw.complete().iter().cloned(),
+                                        )
+                                    },
+                                )
                             })
                             .get(&at)
                             .copied()
@@ -5272,11 +6102,12 @@ fn protected_ranges_with_inferred_environments(
                             name,
                             &ranges,
                         )
-                        || crate::packages::visual_languages::is_verbatim(name)
+                        || (crate::packages::visual_languages::is_verbatim(name)
+                            || name == "xy" && package_context.at(pos).has_package("xy"))
                             && !config.syntax.environment_arguments.contains_key(name)
                             && !visual_overrides.contains(name))
                 {
-                    if name == "scontents" {
+                    if name == "scontents" || name == "codestore" && listing_header.is_some() {
                         let end =
                             crate::code_environments::nested_environment_end(source, finish, name)
                                 .ok_or_else(|| {
@@ -5318,7 +6149,10 @@ fn protected_ranges_with_inferred_environments(
                         || crate::code_environments::is_line_delimited_environment(name)
                         || crate::code_package_syntax::is_line_delimited_environment(name)
                         || terminator_kind == Some(VerbatimTerminator::IndentedLine);
-                    let end = if name == "ebnf" && listing_header.is_some() {
+                    let end = if name == "ebnf" && listing_header.is_some()
+                        || name == "xy" && package_context.at(pos).has_package("xy")
+                    {
+                        // Both DSLs read TeX tokens, including comments and balanced groups.
                         tokenized_environment_end(source, finish, name, true)
                     } else if crate::code_package_syntax::obeys_tex_command_boundaries(name) {
                         tokenized_environment_end(source, finish, name, false)
@@ -5599,6 +6433,7 @@ fn protected_ranges_with_inferred_environments(
                                 && let Some(body) = macro_body(source, name, end)
                             {
                                 let body = &source[body.start + 1..body.end - 1];
+                                xparse_bindings.observe_reader(&declaration.name, body);
                                 if crate::source_model::parameters_are_stored_in_context(
                                     body,
                                     &package_context.at(pos),
@@ -5629,6 +6464,19 @@ fn protected_ranges_with_inferred_environments(
                 ) && let Some((target, target_end)) =
                     command_at(source, skip_trivia(source, end))
                 {
+                    let copied = (!uncertain && base == "let")
+                        .then(|| {
+                            let mut at = skip_trivia(source, target_end);
+                            if source.as_bytes().get(at) == Some(&b'=') {
+                                at = skip_trivia(source, at + 1);
+                            }
+                            command_at(source, at).map(|(name, _)| name)
+                        })
+                        .flatten();
+                    let copied_verb = copied.is_some_and(|name| {
+                        !config.syntax.commands.contains_key(name)
+                            && xparse_bindings.copied_verb(name)
+                    });
                     let signature = if uncertain {
                         None
                     } else if matches!(base, "def" | "gdef" | "edef" | "xdef") {
@@ -5637,12 +6485,8 @@ fn protected_ranges_with_inferred_environments(
                                 arguments::parameter_signature(&source[target_end..body.start])
                             })
                             .and_then(|signature| xparse::Signature::parse(&signature))
-                    } else if base == "let" {
-                        let mut rhs = skip_trivia(source, target_end);
-                        if source.as_bytes().get(rhs) == Some(&b'=') {
-                            rhs = skip_trivia(source, rhs + 1);
-                        }
-                        command_at(source, rhs).and_then(|(name, _)| {
+                    } else {
+                        copied.and_then(|name| {
                             config
                                 .syntax
                                 .commands
@@ -5650,22 +6494,12 @@ fn protected_ranges_with_inferred_environments(
                                 .and_then(arguments::configured_signature)
                                 .or_else(|| xparse_bindings.get(false, name).cloned())
                         })
-                    } else {
-                        None
                     };
-                    let math = if !uncertain && base == "let" {
-                        let mut rhs = skip_trivia(source, target_end);
-                        if source.as_bytes().get(rhs) == Some(&b'=') {
-                            rhs = skip_trivia(source, rhs + 1);
-                        }
-                        command_at(source, rhs).and_then(|(name, _)| {
-                            (!config.syntax.commands.contains_key(name))
-                                .then(|| xparse_bindings.math_signature(name))
-                                .flatten()
-                        })
-                    } else {
-                        None
-                    };
+                    let math = copied.and_then(|name| {
+                        (!config.syntax.commands.contains_key(name))
+                            .then(|| xparse_bindings.math_signature(name))
+                            .flatten()
+                    });
                     xparse_bindings.assign(
                         false,
                         target.to_owned(),
@@ -5673,11 +6507,17 @@ fn protected_ranges_with_inferred_environments(
                         math,
                         global_catcode || matches!(base, "gdef" | "xdef"),
                     );
+                    if copied_verb {
+                        xparse_bindings.mark_copied_verb(target);
+                    }
                     if !uncertain
                         && matches!(base, "def" | "gdef" | "edef" | "xdef")
                         && let Some(body) = macro_body(source, base, end)
                     {
                         let body = &source[body.start + 1..body.end - 1];
+                        if matches!(base, "def" | "gdef") {
+                            xparse_bindings.observe_reader(target, body);
+                        }
                         if crate::source_model::parameters_are_stored(body) {
                             xparse_bindings.mark_literal(target);
                         } else if body.contains('#') {
@@ -5690,6 +6530,15 @@ fn protected_ranges_with_inferred_environments(
                     }
                 }
                 let configured = config.syntax.commands.get(base);
+                if configured.is_none()
+                    && let Some(finish) = xparse_bindings.delimited_end(source, end, base, || {
+                        package_context.at(pos).has_package("tokcycle")
+                    })
+                {
+                    ranges.push(pos..finish);
+                    pos = finish;
+                    continue;
+                }
                 if matches!(base, "url" | "nolinkurl")
                     && configured.is_none()
                     && !xparse_bindings.contains(false, base)
@@ -6358,11 +7207,15 @@ fn protected_ranges_with_inferred_environments(
                     pos = finish;
                     continue;
                 }
-                if config
-                    .protect
-                    .commands
-                    .iter()
-                    .any(|n| n == base || n == name)
+                // A local definition can give LaTeX's \verb an ordinary
+                // parameter list. Its original delimiter reader resumes when
+                // that definition goes out of scope.
+                if (base != "verb" || xparse_bindings.get(false, base).is_none())
+                    && config
+                        .protect
+                        .commands
+                        .iter()
+                        .any(|n| n == base || n == name)
                     || config.syntax.commands.get(base).is_some_and(|r| r.verbatim)
                 {
                     let finish = inline_end(source, name, end).ok_or_else(|| {
@@ -6385,7 +7238,7 @@ fn protected_ranges_with_inferred_environments(
                             "catcode" | "obeyspaces" | "obeylines" | "scantokens" | "endlinechar"
                         ) || crate::packages::code::catcode_value(executed_name).is_some())
                 {
-                    let mut closed_scope = false;
+                    let mut catcodes = CatcodeScan::default();
                     let finish = dynamic_catcode_end(
                         source,
                         executed_name,
@@ -6393,7 +7246,7 @@ fn protected_ranges_with_inferred_environments(
                         catcode_scopes.last().map(|scope| scope.0.as_ref()),
                         global_catcode,
                         !xparse_bindings.contains(false, "active"),
-                        &mut closed_scope,
+                        &mut catcodes,
                     );
                     if executed_name == "ExplSyntaxOn" {
                         // Literal factories in a preserved expl3 preamble still
@@ -6460,7 +7313,7 @@ fn protected_ranges_with_inferred_environments(
                         }) {
                         // Unknown catcodes can hide closing braces of outer scopes.
                         catcode_scopes.first().map_or(pos, |scope| scope.2)
-                    } else if closed_scope {
+                    } else if catcodes.closed_scope {
                         conditional_bindings.leave();
                         visual_overrides.leave();
                         xparse_bindings.leave();
@@ -6515,6 +7368,7 @@ fn protected_ranges_with_inferred_environments(
                 visual_overrides.leave();
                 catcode_scopes.pop();
             }
+            let reader_start = pos;
             pos += character.len_utf8();
             if config.syntax.special.is_empty() {
                 let limit = delayed_key_ranges
@@ -6533,7 +7387,7 @@ fn protected_ranges_with_inferred_environments(
                 };
                 // Stop at the first active delimiter in a single forward scan.
                 // Short-verbatim delimiters can be non-ASCII source characters.
-                let offset = if short_verbatim.is_empty() {
+                let structural_offset = if short_verbatim.is_empty() {
                     text.bytes().position(structural)
                 } else {
                     text.char_indices().find_map(|(offset, ch)| {
@@ -6541,7 +7395,37 @@ fn protected_ranges_with_inferred_environments(
                             .then_some(offset)
                     })
                 };
+                while translation_sequences
+                    .get(translation_index)
+                    .is_some_and(|sequence| sequence.start < pos)
+                {
+                    translation_index += 1;
+                }
+                let translation_offset = translation_sequences
+                    .get(translation_index)
+                    .filter(|sequence| sequence.start < pos + text.len())
+                    .map(|sequence| sequence.start - pos);
+                let offset = match (structural_offset, translation_offset) {
+                    (Some(structural), Some(translation)) => Some(structural.min(translation)),
+                    (Some(structural), None) => Some(structural),
+                    (None, Some(translation)) => Some(translation),
+                    (None, None) => None,
+                };
                 pos += offset.unwrap_or(text.len());
+                if let Some(windows) = &mut scan.windows
+                    && !directives.is_disabled()
+                    && noindent.is_empty()
+                    && active_conditions.is_empty()
+                    && branch_ends.is_empty()
+                    && !catcode_scopes.last().is_some_and(|scope| scope.1)
+                {
+                    ReaderWindow::record(
+                        windows,
+                        reader_start..pos,
+                        &short_verbatim,
+                        code_punctuation,
+                    );
+                }
             }
         }
     }
@@ -6549,6 +7433,33 @@ fn protected_ranges_with_inferred_environments(
     for (_, start) in noindent {
         ranges.push(start..source.len());
     }
+    if !legacy_lines.is_empty() {
+        let protected = merge_reader_ranges(ranges);
+        let options = crate::CompiledConfig::new(config.clone())
+            .map_err(|error| FormatError::Syntax(error.to_string()))?;
+        let analysis = crate::source_analysis::SourceAnalysis::new(source, config, &protected);
+        let tokens = lex_with_analysis(source, config, compiled, &protected, &analysis)?;
+        match blocks_from_tokens(source, &options, &protected, &analysis, &tokens) {
+            Ok(blocks) => {
+                let mut boundaries = Vec::new();
+                extend_hidden_boundaries(&blocks, &legacy_lines, |span| boundaries.push(span));
+                legacy_lines.extend(boundaries);
+            }
+            Err(error) => {
+                // Leave a diagnosed structural token visible to the ordinary
+                // recovery pass, including a stray brace on an encoded line.
+                if let Some(at) = error.byte_offset() {
+                    legacy_lines.retain(|line| !line.contains(&at));
+                }
+            }
+        }
+        ranges = protected;
+        ranges.extend(legacy_lines);
+    }
+    Ok(merge_reader_ranges(ranges))
+}
+
+fn merge_reader_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.sort_by_key(|r| r.start);
     let mut merged: Vec<Range<usize>> = Vec::new();
     for range in ranges {
@@ -6558,7 +7469,7 @@ fn protected_ranges_with_inferred_environments(
             merged.push(range);
         }
     }
-    Ok(merged)
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6654,6 +7565,8 @@ fn lex_with_constructed_commands(
     let mut output = Vec::with_capacity((source.len() / 32).min(65_536));
     let mut pos = 0usize;
     let mut protected_index = 0usize;
+    let source_tokens = model.map(|model| model.tokens());
+    let mut source_token_index = 0usize;
     let opaque = model.map_or(&[][..], |model| model.opaque_ranges());
     let mut opaque_index = 0usize;
     let mut special_stack: Vec<usize> = Vec::new();
@@ -6736,6 +7649,17 @@ fn lex_with_constructed_commands(
         }
         let kind = match source.as_bytes()[pos] {
             b'\\' => {
+                while source_tokens
+                    .and_then(|tokens| tokens.get(source_token_index))
+                    .is_some_and(|token| token.span.end <= pos)
+                {
+                    source_token_index += 1;
+                }
+                let control = source_tokens
+                    .and_then(|tokens| tokens.get(source_token_index))
+                    .filter(|token| token.span.start == pos)
+                    .and_then(|token| token.control(source))
+                    .or_else(|| command_at(source, pos));
                 if let Some(alias) = model.and_then(|model| model.boundary_at(pos)) {
                     pos = model
                         .and_then(|model| {
@@ -6743,9 +7667,7 @@ fn lex_with_constructed_commands(
                                 model.constructed_commands().get(&pos).map(|(_, end)| *end)
                             })
                         })
-                        .unwrap_or_else(|| {
-                            command_at(source, pos).expect("resolved alias token").1
-                        });
+                        .unwrap_or_else(|| control.expect("resolved alias token").1);
                     pending_text_mode = false;
                     if alias.begin {
                         TokenKind::BeginEnvironment
@@ -6753,7 +7675,7 @@ fn lex_with_constructed_commands(
                         TokenKind::EndEnvironment
                     }
                 } else if model.is_some_and(|model| model.inline_math_shift_at(pos)) {
-                    pos = command_at(source, pos).expect("math shift alias").1;
+                    pos = control.expect("math shift alias").1;
                     dollar_mode = if dollar_mode == Some(1) {
                         None
                     } else {
@@ -6761,7 +7683,9 @@ fn lex_with_constructed_commands(
                     };
                     pending_text_mode = false;
                     TokenKind::Math
-                } else if let Some((_, begin, end)) = env_at(source, pos) {
+                } else if let Some((_, begin, end)) =
+                    control.and_then(|(name, end)| env_after_command(source, name, end))
+                {
                     pos = end;
                     pending_text_mode = false;
                     if begin {
@@ -6770,7 +7694,7 @@ fn lex_with_constructed_commands(
                         TokenKind::EndEnvironment
                     }
                 } else {
-                    let (name, end) = command_at(source, pos).ok_or_else(|| {
+                    let (name, end) = control.ok_or_else(|| {
                         FormatError::Syntax(format!("incomplete control sequence at byte {pos}"))
                     })?;
                     if matches!(name, "bgroup" | "begingroup") {
@@ -7317,7 +8241,11 @@ fn parse_blocks_from_tokens<S: NameStore>(
         {
             continue;
         }
-        let Some((name, end)) = command_at(source, token.span.start) else {
+        let Some((name, end)) = analysis
+            .model()
+            .control_at(token.span.start)
+            .or_else(|| command_at(source, token.span.start))
+        else {
             continue;
         };
         if matches!(name, "ExplSyntaxOn" | "ExplSyntaxOff") {
@@ -7475,7 +8403,11 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 ));
             }
             TokenKind::Command => {
-                if let Some((name, _)) = command_at(source, token.span.start) {
+                if let Some((name, _)) = analysis
+                    .model()
+                    .control_at(token.span.start)
+                    .or_else(|| command_at(source, token.span.start))
+                {
                     match if analysis.model().opens_group_at(token.span.start) {
                         "begingroup"
                     } else {
@@ -7630,7 +8562,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         .syntax
                         .environment_arguments
                         .contains_key(name)
-                    && !analysis.declared_environments()?.contains(name)
+                    && !analysis.declared_environments().contains(name)
                     && let Some(&end) = environment_ends.get(&token.span.start)
                 {
                     let body = token.span.end..end;
@@ -7680,11 +8612,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     );
                 } else if let Some(signature) = crate::packages::header_signature(name)
                     .filter(|signature| xparse::extended(signature))
-                    .filter(|_| {
-                        !analysis
-                            .declared_environments()
-                            .is_ok_and(|names| names.contains(name))
-                    })
+                    .filter(|_| !analysis.declared_environments().contains(name))
                 {
                     let limit = environment_ends
                         .get(&token.span.start)
@@ -7754,13 +8682,16 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     })?;
                 let i = stack.remove(position);
                 if blocks[i].kind != BlockKind::Environment || blocks[i].name != name {
-                    return Err(FormatError::Syntax(format!(
-                        "mismatched \\end{{{name}}} at byte {}; innermost open {} {:?} starts at byte {}",
-                        token.span.start,
-                        blocks[i].kind.category(),
-                        blocks[i].name,
-                        blocks[i].begin.start
-                    )));
+                    return Err(FormatError::StructuralMismatch {
+                        closing: format!("mismatched \\end{{{name}}}"),
+                        opening: format!(
+                            "innermost open {} {:?} starts",
+                            blocks[i].kind.category(),
+                            blocks[i].name
+                        ),
+                        opener: blocks[i].begin.start,
+                        closer: token.span.clone(),
+                    });
                 }
                 blocks[i].body.end = token.span.start;
                 blocks[i].end = token.span.clone();
@@ -7839,6 +8770,19 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         if blocks[i].kind != BlockKind::Command {
                             return true;
                         }
+                        // The general lexer accepts underscores in control words for expl3.
+                        // In ordinary math the trailing underscore starts a subscript group.
+                        let name = blocks[i].name.as_str();
+                        if in_math
+                            && name
+                                .strip_suffix('_')
+                                .is_some_and(crate::math_layout::known_math_command)
+                            && !config.config.syntax.commands.contains_key(name)
+                            && !analysis.declared_commands().contains(name)
+                            && source[blocks[i].begin.clone()].ends_with('_')
+                        {
+                            return false;
+                        }
                         let Some(rule) = config
                             .config
                             .syntax
@@ -7847,9 +8791,9 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             .or_else(|| {
                                 crate::package_commands::builtin_command_rule(&blocks[i].name)
                                     .filter(|_| {
-                                        !analysis.declared_commands().is_ok_and(|names| {
-                                            names.contains(blocks[i].name.trim_end_matches('*'))
-                                        })
+                                        !analysis
+                                            .declared_commands()
+                                            .contains(blocks[i].name.trim_end_matches('*'))
                                     })
                             })
                         else {
@@ -7911,9 +8855,9 @@ fn parse_blocks_from_tokens<S: NameStore>(
                             .or_else(|| {
                                 crate::package_commands::builtin_command_rule(&blocks[i].name)
                                     .filter(|_| {
-                                        !analysis.declared_commands().is_ok_and(|names| {
-                                            names.contains(blocks[i].name.trim_end_matches('*'))
-                                        })
+                                        !analysis
+                                            .declared_commands()
+                                            .contains(blocks[i].name.trim_end_matches('*'))
                                     })
                             })
                             .is_some_and(|r| r.arguments.is_some())
@@ -7969,13 +8913,16 @@ fn parse_blocks_from_tokens<S: NameStore>(
                 };
                 if !correct {
                     let opening = source.as_bytes()[blocks[i].begin.start] as char;
-                    return Err(FormatError::Syntax(format!(
-                        "mismatched closing delimiter at byte {}; innermost open {} block starts with {:?} at byte {}",
-                        token.span.start,
-                        blocks[i].kind.category(),
-                        opening,
-                        blocks[i].begin.start
-                    )));
+                    return Err(FormatError::StructuralMismatch {
+                        closing: "mismatched closing delimiter".into(),
+                        opening: format!(
+                            "innermost open {} block starts with {:?}",
+                            blocks[i].kind.category(),
+                            opening
+                        ),
+                        opener: blocks[i].begin.start,
+                        closer: token.span.clone(),
+                    });
                 }
                 blocks[i].body.end = token.span.start;
                 blocks[i].end = token.span.clone();
@@ -8005,8 +8952,11 @@ fn parse_blocks_from_tokens<S: NameStore>(
                     .then(|| literal_csname(source, token.span.start))
                     .flatten();
                 let constructed = cached_constructed.or(literal_constructed.as_ref());
-                let (raw_name, raw_end) =
-                    command_at(source, token.span.start).expect("command token");
+                let (raw_name, raw_end) = analysis
+                    .model()
+                    .control_at(token.span.start)
+                    .or_else(|| command_at(source, token.span.start))
+                    .expect("command token");
                 if let Some(argument) = token_list_argument_range(source, raw_name, raw_end) {
                     case_list_delimiters.insert(argument.start);
                     case_list_delimiters.insert(argument.end - 1);
@@ -8195,7 +9145,19 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         })
                     };
                 let primitive = !conditional_bindings.assigned(base)
-                    && inferred_condition(base, source, token.span.end);
+                    && inferred_condition(base, source, token.span.end)
+                    && !(base == "ifend" && {
+                        let context = analysis.model().invocation_context_at(token.span.start);
+                        context.environment() == Some("struktogramm")
+                            && context.has_package("struktex")
+                    });
+                // Both datenumber tests leave a primitive \ifnum open for the caller.
+                let date_test = matches!(base, "ifleapyear" | "ifvaliddate")
+                    && !conditional_bindings.assigned(base)
+                    && analysis
+                        .model()
+                        .invocation_context_at(token.span.start)
+                        .has_package("datenumber");
                 if matches!(
                     meaning,
                     ConditionalMeaning::True
@@ -8204,6 +9166,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                         | ConditionalMeaning::Other
                 ) || known_conditions.contains(base) && !conditional_bindings.assigned(base)
                     || primitive
+                    || date_test
                     || matched(&config.syntax.condition)?
                 {
                     let i = add!(BlockKind::Condition, names.make(name), parent);
@@ -8272,7 +9235,7 @@ fn parse_blocks_from_tokens<S: NameStore>(
                                 || crate::packages::is_package_item(base, environment)
                         })
                         && !config.config.syntax.commands.contains_key(base)
-                        && !analysis.declared_commands()?.contains(base);
+                        && !analysis.declared_commands().contains(base);
                     let in_list = (explicit_item || package_item)
                         && environment.is_some_and(|name| list_environments.contains(name));
                     let kind = if in_list {
@@ -8591,8 +9554,8 @@ fn parse_blocks_from_tokens<S: NameStore>(
             headings.push((level, blocks[i].begin.start));
         }
     }
-    crate::foreach::add_blocks(source, tokens, &mut blocks, config, protected, analysis)?;
-    crate::tikz::add_blocks(source, tokens, &mut blocks, config, protected, analysis)?;
+    crate::foreach::add_blocks(source, tokens, &mut blocks, config, protected, analysis);
+    crate::tikz::add_blocks(source, tokens, &mut blocks, config, protected, analysis);
     Ok(blocks)
 }
 

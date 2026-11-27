@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+
+use crate::edit_plan::EditPlan;
 use crate::syntax::protected_ranges;
 use crate::{CompiledConfig, FileKind, FormatError};
 use serde::{Deserialize, Serialize};
@@ -95,21 +98,29 @@ pub fn compile(rules: &[ReplacementConfig]) -> Result<Vec<CompiledReplacement>, 
 }
 
 impl CompiledReplacement {
-    fn replace(&self, source: &str, remaining: &mut usize) -> Result<String, FormatError> {
+    fn propose_edits<'a>(
+        &'a self,
+        source: &str,
+        offset: usize,
+        remaining: &mut usize,
+        edits: &mut EditPlan<'a>,
+    ) -> Result<(), FormatError> {
         if *remaining == 0 {
-            return Ok(source.into());
+            return Ok(());
         }
-        let mut output = String::with_capacity(source.len());
-        let mut last = 0usize;
         match &self.pattern {
             Pattern::Literal(pattern) => {
                 for (pos, matched) in source.match_indices(pattern) {
                     if *remaining == 0 {
                         break;
                     }
-                    output.push_str(&source[last..pos]);
-                    output.push_str(&self.config.replace);
-                    last = pos + matched.len();
+                    Self::propose_match(
+                        source,
+                        offset,
+                        pos..pos + matched.len(),
+                        self.config.replace.as_str(),
+                        edits,
+                    );
                     *remaining -= 1;
                 }
             }
@@ -119,9 +130,15 @@ impl CompiledReplacement {
                         break;
                     }
                     let matched = capture.get(0).expect("capture zero");
-                    output.push_str(&source[last..matched.start()]);
-                    capture.expand(&self.config.replace, &mut output);
-                    last = matched.end();
+                    let mut replacement = String::new();
+                    capture.expand(&self.config.replace, &mut replacement);
+                    Self::propose_match(
+                        source,
+                        offset,
+                        matched.start()..matched.end(),
+                        replacement,
+                        edits,
+                    );
                     *remaining -= 1;
                 }
             }
@@ -132,15 +149,33 @@ impl CompiledReplacement {
                     }
                     let capture = capture.map_err(|e| FormatError::Replacement(e.to_string()))?;
                     let matched = capture.get(0).expect("capture zero");
-                    output.push_str(&source[last..matched.start()]);
-                    capture.expand(&self.config.replace, &mut output);
-                    last = matched.end();
+                    let mut replacement = String::new();
+                    capture.expand(&self.config.replace, &mut replacement);
+                    Self::propose_match(
+                        source,
+                        offset,
+                        matched.start()..matched.end(),
+                        replacement,
+                        edits,
+                    );
                     *remaining -= 1;
                 }
             }
         }
-        output.push_str(&source[last..]);
-        Ok(output)
+        Ok(())
+    }
+
+    fn propose_match<'a>(
+        source: &str,
+        offset: usize,
+        range: std::ops::Range<usize>,
+        replacement: impl Into<Cow<'a, str>>,
+        edits: &mut EditPlan<'a>,
+    ) {
+        let replacement = replacement.into();
+        if &source[range.clone()] != replacement.as_ref() {
+            edits.replace(offset + range.start..offset + range.end, replacement);
+        }
     }
 }
 
@@ -161,29 +196,40 @@ pub fn apply_for_kind(
     config: &CompiledConfig,
     when: When,
 ) -> Result<String, FormatError> {
+    apply_recording(source, kind, config, when, None)
+}
+
+pub(crate) fn apply_recording(
+    source: &str,
+    kind: FileKind,
+    config: &CompiledConfig,
+    when: When,
+    mut history: Option<&mut crate::edit_plan::EditHistory>,
+) -> Result<String, FormatError> {
     let mut text = source.to_owned();
     for rule in config.replacements.iter().filter(|r| r.config.when == when) {
         let mut remaining = rule.config.count.unwrap_or(usize::MAX);
+        let mut edits = EditPlan::new();
         if rule.config.scope == Scope::All {
-            text = rule.replace(&text, &mut remaining)?;
-            continue;
-        }
-        let ranges = if kind == FileKind::Bibtex {
-            crate::bibtex::protected_ranges(&text)?
-        } else if kind == FileKind::Bst {
-            crate::bst::protected_ranges(&text, true)
+            rule.propose_edits(&text, 0, &mut remaining, &mut edits)?;
         } else {
-            protected_ranges(&text, &config.config)?
-        };
-        let mut output = String::with_capacity(text.len());
-        let mut pos = 0usize;
-        for range in ranges {
-            output.push_str(&rule.replace(&text[pos..range.start], &mut remaining)?);
-            output.push_str(&text[range.clone()]);
-            pos = range.end;
+            let ranges = if kind == FileKind::Bibtex {
+                crate::bibtex::protected_ranges(&text)?
+            } else if kind == FileKind::Bst {
+                crate::bst::protected_ranges(&text, true)
+            } else {
+                protected_ranges(&text, &config.config)?
+            };
+            let mut pos = 0usize;
+            for range in ranges {
+                rule.propose_edits(&text[pos..range.start], pos, &mut remaining, &mut edits)?;
+                pos = range.end;
+            }
+            rule.propose_edits(&text[pos..], pos, &mut remaining, &mut edits)?;
         }
-        output.push_str(&rule.replace(&text[pos..], &mut remaining)?);
-        text = output;
+        if !edits.is_empty() {
+            text = edits.apply_recording(&text, history.as_deref_mut())?;
+        }
     }
     Ok(text)
 }

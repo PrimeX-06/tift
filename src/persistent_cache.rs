@@ -1,11 +1,10 @@
 //! Best-effort CLI result storage. Project configuration is prepared afresh
 //! before lookup; in-process analysis reuse is independent of this storage.
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tift::{CompiledConfig, Diagnostic, FileKind, FormatOutput, Severity};
@@ -15,7 +14,6 @@ const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct PersistentCache {
-    engine: OnceCell<Option<blake3::Hash>>,
     configs: HashMap<usize, Options>,
     groups: HashMap<(blake3::Hash, blake3::Hash), Arc<Group>>,
 }
@@ -132,6 +130,8 @@ impl PersistentCache {
             .ok()?;
             fingerprint.update(b"project-package-load-events");
             serde_json::to_writer(&mut fingerprint, &options.syntax.package_load_events).ok()?;
+            fingerprint.update(b"project-command-import-events");
+            serde_json::to_writer(&mut fingerprint, &options.syntax.command_import_events).ok()?;
             entry.insert(Options {
                 _config: Arc::clone(config),
                 fingerprint: fingerprint.finalize(),
@@ -140,21 +140,7 @@ impl PersistentCache {
             });
         }
         let options = self.configs.get(&identity).expect("prepared cache options");
-        let engine = self.engine.get_or_init(|| {
-            let executable = std::env::current_exe().ok()?;
-            let mut reader = fs::File::open(executable).ok()?;
-            let mut hash = blake3::Hasher::new();
-            let mut buffer = [0; 64 * 1024];
-            loop {
-                let length = reader.read(&mut buffer).ok()?;
-                if length == 0 {
-                    break;
-                }
-                hash.update(&buffer[..length]);
-            }
-            Some(hash.finalize())
-        });
-        let engine = engine.as_ref()?;
+        let engine = engine_hash()?;
         let kind = match kind {
             FileKind::Tex => 0,
             FileKind::Style => 1,
@@ -393,7 +379,17 @@ fn field(hash: &mut blake3::Hasher, value: &[u8]) {
     hash.update(value);
 }
 
-fn default_directory() -> Option<PathBuf> {
+pub(super) fn engine_hash() -> Option<blake3::Hash> {
+    static ENGINE: OnceLock<Option<blake3::Hash>> = OnceLock::new();
+    *ENGINE.get_or_init(|| {
+        let mut reader = fs::File::open(std::env::current_exe().ok()?).ok()?;
+        let mut hash = blake3::Hasher::new();
+        std::io::copy(&mut reader, &mut hash).ok()?;
+        Some(hash.finalize())
+    })
+}
+
+pub(super) fn default_directory() -> Option<PathBuf> {
     let variable = |name| {
         std::env::var_os(name)
             .filter(|value| !value.is_empty())

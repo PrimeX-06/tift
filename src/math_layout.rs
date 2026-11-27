@@ -11,6 +11,7 @@ mod relations;
 mod symbols;
 pub(crate) use symbols::known_command as known_math_command;
 
+use crate::edit_plan::EditPlan;
 use crate::{CompiledConfig, FileKind, FormatError, code_layout, syntax};
 use modes::MathModes;
 use symbols::{DelimiterRole, MathClass};
@@ -126,7 +127,7 @@ pub(crate) fn format_math_with_context(
         let model = parsed
             .metadata
             .exposed_model(source, &config.config, &protected);
-        let mut output = String::new();
+        let mut edits = crate::edit_plan::EditPlan::new();
         let mut cursor = 0;
         for declaration in model.declarations() {
             if declaration.body.start < cursor
@@ -141,16 +142,14 @@ pub(crate) fn format_math_with_context(
                 continue;
             };
             if formatted != body {
-                output.push_str(&source[cursor..declaration.body.start]);
-                output.push_str(&formatted);
+                edits.replace(declaration.body.clone(), formatted);
                 cursor = declaration.body.end;
             }
         }
-        if cursor > 0 {
-            output.push_str(&source[cursor..]);
-            Some(output)
-        } else {
+        if edits.is_empty() {
             None
+        } else {
+            Some(edits.apply_ordered(source)?)
         }
     } else {
         None
@@ -186,7 +185,7 @@ fn format_math_snapshot(
         config,
         modes: &modes,
         protected: &protected,
-        edits: Vec::new(),
+        edits: EditPlan::new(),
         visited: HashSet::new(),
         opaque: BTreeMap::new(),
         depth: 0,
@@ -297,7 +296,7 @@ fn format_documented_math(source: &str, config: &CompiledConfig) -> Result<Strin
         config: documentation_config,
         modes: &modes,
         protected: &protected,
-        edits: Vec::new(),
+        edits: EditPlan::new(),
         visited: HashSet::new(),
         opaque: BTreeMap::new(),
         depth: 0,
@@ -322,108 +321,82 @@ fn math_protection(
     } else {
         Ok(parsing.snapshot(source, false, false)?.protected.clone())
     }?;
-    if config.config.protect.macro_bodies && config.config.code.expl3 {
-        // Definition bodies are formatted independently above. Keep their
-        // stored environments and conditional fragments out of the outer
-        // mathematical execution stream, even when no arity can be inferred.
-        let mut cursor = 0;
-        let mut existing = protected.clone();
-        existing.sort_by_key(|range| range.start);
-        while cursor < source.len() {
-            let index = existing.partition_point(|range| range.end <= cursor);
-            if let Some(range) = existing.get(index).filter(|range| range.start <= cursor) {
-                cursor = range.end;
-                continue;
-            }
-            if source.as_bytes()[cursor] == b'%' {
-                cursor += source[cursor..]
-                    .find('\n')
-                    .map_or(source.len() - cursor, |offset| offset + 1);
-            } else if let Some((name, end)) = syntax::command_at(source, cursor) {
-                if let Some(body) = syntax::expl3_definition_body(source, name, end) {
-                    cursor = body.end;
-                    protected.push(body);
-                } else {
-                    cursor = end;
-                }
-            } else {
-                cursor += source[cursor..].chars().next().unwrap().len_utf8();
-            }
-        }
+    // Ordinary math documents need neither the expl3 declaration reader nor
+    // the SVN metadata reader. Both readers operate on literal commands.
+    let definitions = config.config.protect.macro_bodies
+        && config.config.code.expl3
+        && (source.contains(r"\cs_") || source.contains(r"\prg_"));
+    let metadata = source.contains("SVN") || source.contains(r"\GetIdInfo");
+    if !definitions && !metadata {
+        return Ok(protected);
     }
-    protect_delimited_file_metadata(source, &mut protected);
-    Ok(code_layout::merged(protected))
-}
 
-/// `expl3`'s file metadata reader consumes `$...$` as a delimited argument.
-/// Those dollars are data even though they use the same delimiters as inline
-/// mathematics, so keep the whole argument out of the math scanner.
-fn protect_delimited_file_metadata(source: &str, protected: &mut Vec<Range<usize>>) {
-    let existing_protection = protected.clone();
+    let original_count = protected.len();
     let mut cursor = 0;
     let mut protection_index = 0;
-    while cursor < source.len() {
-        while existing_protection
+    while let Some(next) = memchr::memchr2(b'\\', b'%', &source.as_bytes()[cursor..]) {
+        let start = cursor + next;
+        let existing = &protected[..original_count];
+        while existing
             .get(protection_index)
-            .is_some_and(|range| range.end <= cursor)
+            .is_some_and(|r| r.end <= start)
         {
             protection_index += 1;
         }
-        if let Some(range) = existing_protection
-            .get(protection_index)
-            .filter(|range| range.start <= cursor)
-        {
+        if let Some(range) = existing.get(protection_index).filter(|r| r.start <= start) {
             cursor = range.end;
             continue;
         }
-        if source.as_bytes()[cursor] == b'%' {
-            cursor = source[cursor..]
+        if source.as_bytes()[start] == b'%' {
+            cursor = source[start..]
                 .find('\n')
-                .map_or(source.len(), |end| cursor + end + 1);
+                .map_or(source.len(), |lf| start + lf + 1);
             continue;
         }
-        if let Some((name, end)) = command_at(source, cursor) {
-            if matches!(
-                name,
-                "ProvidesPackageSVN" | "ProvidesClassSVN" | "ProvidesFileSVN"
-            ) {
-                // svn-prov reads the mandatory argument as an RCS keyword,
-                // with an optional filename before it. Its dollars, dates
-                // and hyphens must survive byte for byte.
-                let mut start = crate::trivia::skip(source, end);
-                if source.as_bytes().get(start) == Some(&b'[')
-                    && let Some(close) = syntax::balanced_end(source, start, b'[', b']')
-                {
-                    start = crate::trivia::skip(source, close);
-                }
-                if let Some(close) = syntax::balanced_end(source, start, b'{', b'}') {
-                    protected.push(start..close);
-                    cursor = close;
-                    continue;
-                }
-            }
-            if name == "GetIdInfo" {
-                let delimiter = skip_space(source, end, source.len());
-                if source.as_bytes().get(delimiter) == Some(&b'$') {
-                    let mut finish = delimiter + 1;
-                    while finish < source.len() {
-                        if source.as_bytes()[finish] == b'$' && !syntax::is_escaped(source, finish)
-                        {
-                            protected.push(delimiter..finish + 1);
-                            cursor = finish + 1;
-                            break;
-                        }
-                        finish += source[finish..].chars().next().map_or(1, char::len_utf8);
-                    }
-                    if cursor > end {
-                        continue;
-                    }
-                }
-            }
-            cursor = end;
+        let Some((name, end)) = syntax::command_at(source, start) else {
+            break;
+        };
+        let hidden = if definitions && (name.starts_with("cs_") || name.starts_with("prg_")) {
+            syntax::expl3_definition_body(source, name, end)
+        } else if metadata {
+            file_metadata_argument(source, name, end)
         } else {
-            cursor += source[cursor..].chars().next().map_or(1, char::len_utf8);
+            None
+        };
+        if let Some(range) = hidden {
+            cursor = range.end;
+            protected.push(range);
+        } else {
+            cursor = end;
         }
+    }
+    if protected.len() != original_count {
+        protected = code_layout::merged(protected);
+    }
+    Ok(protected)
+}
+
+/// SVN keywords and expl3 file IDs can contain dollar signs which the
+/// metadata readers consume as data.
+fn file_metadata_argument(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
+    match name {
+        "ProvidesPackageSVN" | "ProvidesClassSVN" | "ProvidesFileSVN" => {
+            let mut start = crate::trivia::skip(source, end);
+            if source.as_bytes().get(start) == Some(&b'[') {
+                let close = syntax::balanced_end(source, start, b'[', b']')?;
+                start = crate::trivia::skip(source, close);
+            }
+            Some(start..syntax::balanced_end(source, start, b'{', b'}')?)
+        }
+        "GetIdInfo" => {
+            let start = skip_space(source, end, source.len());
+            source[start..].strip_prefix('$')?;
+            let close = memchr::memchr_iter(b'$', &source.as_bytes()[start + 1..])
+                .map(|offset| start + 1 + offset)
+                .find(|&at| !syntax::is_escaped(source, at))?;
+            Some(start..close + 1)
+        }
+        _ => None,
     }
 }
 
@@ -638,7 +611,7 @@ struct Editor<'a> {
     config: &'a CompiledConfig,
     modes: &'a MathModes,
     protected: &'a [Range<usize>],
-    edits: Vec<(Range<usize>, Cow<'static, str>)>,
+    edits: EditPlan<'static>,
     visited: HashSet<(usize, usize)>,
     opaque: BTreeMap<usize, usize>,
     depth: usize,
@@ -689,7 +662,7 @@ impl Editor<'_> {
                 " " => Cow::Borrowed(" "),
                 value => Cow::Owned(value.into()),
             };
-            self.edits.push((range, value));
+            self.edits.replace(range, value);
         }
     }
 
@@ -1259,33 +1232,23 @@ impl Editor<'_> {
         self.finish_with_mapping::<true>(original)
     }
 
-    fn finish_with_mapping<const MAPPED: bool>(mut self, original: &str) -> (String, PositionMap) {
-        // Stable sorting retains insertion order for equal starts. The last
-        // edit at a start wins, as in the original ordered map.
-        self.edits.sort_by_key(|(range, _)| range.start);
-        let mut output = String::with_capacity(original.len());
-        let mut positions = PositionMap {
-            edits: Vec::with_capacity(if MAPPED { self.edits.len() } else { 0 }),
-        };
-        let mut cursor = 0;
-        let mut edits = self.edits.into_iter().peekable();
-        while let Some((range, value)) = edits.next() {
-            let (start, end) = (range.start, range.end);
-            if edits.peek().is_some_and(|(next, _)| next.start == start) {
-                continue;
-            }
-            if start < cursor {
-                continue;
-            }
-            output.push_str(&original[cursor..start]);
-            output.push_str(&value);
-            if MAPPED {
-                positions.edits.push((start..end, output.len()));
-            }
-            cursor = end;
+    fn finish_with_mapping<const MAPPED: bool>(self, original: &str) -> (String, PositionMap) {
+        let plan = self.edits;
+        if MAPPED {
+            let (output, mappings) = plan
+                .apply_with_last_start_wins_and_mappings(original)
+                .expect("math edits are valid source ranges");
+            let edits = mappings
+                .into_iter()
+                .map(|(source, output)| (source, output.end))
+                .collect();
+            (output, PositionMap { edits })
+        } else {
+            let output = plan
+                .apply_with_last_start_wins(original)
+                .expect("math edits are valid source ranges");
+            (output, PositionMap { edits: Vec::new() })
         }
-        output.push_str(&original[cursor..]);
-        (output, positions)
     }
 }
 
@@ -1340,7 +1303,7 @@ fn layout_displays(
         config,
         modes,
         protected,
-        edits: Vec::new(),
+        edits: EditPlan::new(),
         visited: HashSet::new(),
         opaque: BTreeMap::new(),
         depth: 0,
@@ -1459,18 +1422,16 @@ fn layout_displays(
             replacements.push((region.body.clone(), replacement))
         }
     }
-    let mut output = String::with_capacity(source.len());
+    let mut edits = crate::edit_plan::EditPlan::new();
     let mut cursor = 0;
     for (range, replacement) in replacements {
         if range.start < cursor {
             continue;
         }
-        output.push_str(&source[cursor..range.start]);
-        output.push_str(&replacement);
+        edits.replace(range.clone(), replacement);
         cursor = range.end;
     }
-    output.push_str(&source[cursor..]);
-    Ok(output)
+    edits.apply_ordered(source)
 }
 
 fn indent_width(text: &str, tab_width: usize) -> usize {

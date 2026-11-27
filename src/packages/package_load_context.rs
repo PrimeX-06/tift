@@ -2,6 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+pub(crate) fn input_package_at(source: &str, end: usize) -> Option<(&'static str, usize)> {
+    let cursor = crate::trivia::skip(source, end);
+    let input = source[cursor..]
+        .split(|ch: char| ch.is_whitespace() || ch == '%')
+        .next()?;
+    crate::syntax::input_package(input).map(|package| (package, cursor + input.len()))
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextIndex {
     packages: HashMap<String, Vec<PackageState>>,
@@ -51,15 +59,57 @@ impl InvocationContext<'_> {
 }
 
 impl ContextIndex {
-    pub(crate) fn with_config(source: &str, config: &crate::Config) -> Self {
+    pub(crate) fn remove_inner_environments(&mut self, body: &std::ops::Range<usize>) {
+        self.environments
+            .retain(|(at, _)| *at <= body.start || *at >= body.end);
+    }
+
+    pub(crate) fn insert_inner_environments(
+        &mut self,
+        at: usize,
+        local: &Self,
+        parent: Option<&str>,
+    ) {
+        let start = self.environments.partition_point(|(pos, _)| *pos <= at);
+        self.environments.splice(
+            start..start,
+            local
+                .environments
+                .iter()
+                .map(|(pos, name)| (at + pos, name.clone().or_else(|| parent.map(str::to_owned)))),
+        );
+    }
+
+    pub(crate) fn project_positions(&mut self, change: &crate::source_document::SourceChange) {
+        for events in self.packages.values_mut() {
+            for event in events {
+                event.at = change.position(event.at);
+                event.definite = event.definite.map(|at| change.position(at));
+            }
+        }
+        for (at, _) in &mut self.environments {
+            *at = change.position(*at);
+        }
+        self.imports = self
+            .imports
+            .drain()
+            .map(|(at, value)| (change.position(at), value))
+            .collect();
+    }
+    pub(crate) fn with_config(
+        config: &crate::Config,
+        loader_positions: Option<&crate::source_model::LoaderPositions>,
+    ) -> Self {
         let mut context = Self::default();
         if config.syntax.package_load_events.is_empty() {
             return context;
         }
-        let loader_position = crate::source_model::SourceModel::loader_position_lookup(source);
         for event in &config.syntax.package_load_events {
             if let Some(loader) = &event.loader {
-                if let Some(at) = loader_position(loader) {
+                if let Some(at) = loader_positions
+                    .and_then(|positions| positions.get(loader))
+                    .map(|span| span.start)
+                {
                     context
                         .imports
                         .entry(at)
@@ -141,27 +191,10 @@ impl ContextIndex {
                 self.load(&package, start, certain && loaded);
             }
         }
-        if name == "input" {
-            let cursor = crate::trivia::skip(source, end);
-            let input = source[cursor..]
-                .split(|c: char| c.is_whitespace() || c == '%')
-                .next()
-                .unwrap_or("");
-            if matches!(input, "pitex" | "pitex.tex" | "{pitex}" | "{pitex.tex}") {
-                self.load("pitex", cursor + input.len(), certain);
-            }
-            if matches!(
-                input.trim_matches(['{', '}']),
-                "pgfmanual-en-macros" | "pgfmanual-en-macros.tex"
-            ) {
-                self.load("pgfmanual-en-macros", cursor + input.len(), certain);
-            }
-            if matches!(
-                input,
-                "pdfToolbox" | "pdfToolbox.tex" | "{pdfToolbox}" | "{pdfToolbox.tex}"
-            ) {
-                self.load("pdfToolbox", cursor + input.len(), certain);
-            }
+        if name == "input"
+            && let Some((package, at)) = input_package_at(source, end)
+        {
+            self.load(package, at, certain);
         }
         if matches!(
             name,
@@ -173,10 +206,12 @@ impl ContextIndex {
                 | "LoadClassWithOptions"
         ) {
             let mut cursor = crate::trivia::skip(source, end);
+            let mut options = "";
             if source.as_bytes().get(cursor) == Some(&b'[') {
                 let Some(finish) = crate::syntax::balanced_end(source, cursor, b'[', b']') else {
                     return;
                 };
+                options = &source[cursor + 1..finish - 1];
                 cursor = crate::trivia::skip(source, finish);
             }
             let Some(finish) = crate::syntax::balanced_end(source, cursor, b'{', b'}') else {
@@ -189,6 +224,18 @@ impl ContextIndex {
                         .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
                 {
                     self.load(package, finish, certain);
+                    if package == "codedescribe" {
+                        let mut listing = true;
+                        for option in options.split(',') {
+                            let (key, value) = option.split_once('=').unwrap_or((option, "true"));
+                            if matches!(key.trim(), "nolisting" | "no listing") {
+                                listing = value.trim() == "false";
+                            }
+                        }
+                        if listing {
+                            self.load("codelisting", finish, certain);
+                        }
+                    }
                 }
             }
         } else if let Some((environment, begin, finish)) =

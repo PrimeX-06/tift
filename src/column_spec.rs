@@ -10,33 +10,26 @@ mod tabularray;
 const MAX_COLUMNS: usize = 4096;
 const MAX_DEPTH: usize = 32;
 
-pub(crate) fn format_preambles(
+pub(crate) fn preamble_edits(
     source: &str,
     config: &crate::CompiledConfig,
     parsing: &mut crate::parse_context::ParseContext<'_>,
-) -> Result<String, crate::FormatError> {
+) -> Result<crate::edit_plan::RuleEdits, crate::FormatError> {
     use super::ColumnSpecLayout;
     use crate::syntax;
     use unicode_width::UnicodeWidthStr;
     if !source.contains("\\begin") {
-        return Ok(source.into());
+        return Ok(Default::default());
     }
     let parsed = parsing.snapshot(source, true, false)?;
     let tokens = parsed
         .tokens
         .as_deref()
         .expect("column specification tokens");
-    let analysis = crate::source_analysis::SourceAnalysis::with_memo(
-        source,
-        &config.config,
-        &parsed.protected,
-        std::rc::Rc::clone(&parsed.metadata),
-    );
-    let environments =
-        syntax::environment_ranges_with_tokens(source, tokens, &parsed.protected, &config.config)?;
+    let analysis = parsed.analysis(&config.config);
+    let environments = parsed.environment_ranges(&config.config)?;
     let mut declared = None;
-    let mut declared_environments = None;
-    let mut edits = Vec::new();
+    let mut plan = crate::edit_plan::RuleEdits::default();
     let newline = if source.contains("\r\n") {
         "\r\n"
     } else {
@@ -58,13 +51,7 @@ pub(crate) fn format_preambles(
         {
             continue;
         }
-        if declared_environments.is_none() {
-            declared_environments = Some(analysis.declared_environments()?);
-        }
-        if declared_environments
-            .as_ref()
-            .is_some_and(|names| names.contains(&env.name))
-        {
+        if analysis.declared_environments().contains(&env.name) {
             continue;
         }
         let header_end = crate::layout::environment_header_end(
@@ -75,6 +62,8 @@ pub(crate) fn format_preambles(
             &analysis,
         );
         let header = &source[env.body.start..header_end];
+        let line = source[..env.begin.start].rfind('\n').map_or(0, |at| at + 1);
+        plan.reads.push(line..header_end);
         let Some(Some(selected)) = header_columns(&env.name, header) else {
             continue;
         };
@@ -133,9 +122,9 @@ pub(crate) fn format_preambles(
         } else {
             replacement.push_str(&text[previous..]);
         }
-        edits.push((body, replacement));
+        plan.edits.replace(body, replacement);
     }
-    crate::layout::apply_edits(source, edits)
+    Ok(plan)
 }
 
 fn has_format_directive(source: &str) -> bool {

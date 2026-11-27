@@ -64,7 +64,7 @@ pub(super) fn render(
     if entries.is_empty() {
         return Ok(source);
     }
-    let mut edits = Vec::new();
+    let mut edits = crate::edit_plan::EditPlan::new();
     for group in entries.chunk_by(|a, b| {
         let gap = &source[a.entry.end..b.entry.start];
         a.indent == b.indent
@@ -75,12 +75,12 @@ pub(super) fn render(
         for entry in group {
             let pad = widest - entry.left_width;
             if entry.width + pad <= limit {
-                edits.push((
+                edits.replace(
                     entry.entry.clone(),
                     format!("{}{}{}", entry.left, " ".repeat(pad + 1), entry.right),
-                ));
+                );
             }
         }
     }
-    crate::layout::apply_edits(&source, edits)
+    edits.apply_first_wins(&source)
 }
