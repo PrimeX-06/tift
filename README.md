@@ -48,23 +48,23 @@ tift 0.2.2 took **27 ms** to check the *Web Scraping with R* slides, **185 ms** 
 
 | LaTeX project | Input files | Median (ms) | Range (ms) |
 | --- | ---: | ---: | ---: |
-| emcee | 1 | 57 | 47–67 |
-| Lomb–Scargle | 1 | 67 | 66–72 |
-| Tidy Data | 1 | 144 | 139–155 |
-| Think Python | 1 | 185 | 183–367 |
-| lshort-zh-cn | 17 | 181 | 171–368 |
-| Roots of Language | 10 | 566 | 554–665 |
-| Lung tomography thesis | 10 | 364 | 354–392 |
-| Web Scraping with R | 1 | 27 | 26–47 |
-| TeXConf 2022 slides | 1 | 41 | 40–52 |
-| Résumé | 1 | 48 | 46–94 |
-| Statistical cookbook | 2 | 172 | 162–184 |
+| [emcee](https://github.com/dfm/emcee/tree/ff3dc94006167397e4ee2814fea9cb9532caeecc/document) | 1 | 57 | 47–67 |
+| [Lomb–Scargle](https://github.com/jakevdp/PracticalLombScargle/tree/5f4ca27deefa7d4edc68da3c92d34f484c5bc98e) | 1 | 67 | 66–72 |
+| [Tidy Data](https://github.com/hadley/tidy-data/tree/5623c7a302977e8c88f623a08556d5c08e940d8c) | 1 | 144 | 139–155 |
+| [Think Python](https://github.com/AllenDowney/ThinkPython2/tree/cf3d99c002933e1829e4aa89109d2e1dae809de0/book) | 1 | 185 | 183–367 |
+| [lshort-zh-cn](https://github.com/CTeX-org/lshort-zh-cn/tree/3b6fbb2f88f81eb12a405db0988e53702cac10ee/src) | 17 | 181 | 171–368 |
+| [Roots of Language](https://github.com/langsci/91/tree/bca083ed2f5f30dd4c2d6587366e8e0f649285c3) | 10 | 566 | 554–665 |
+| [Lung tomography thesis](https://github.com/habi/PhD-Thesis/tree/2453f652da5d90887e494d01727e8c3cc474f567) | 10 | 364 | 354–392 |
+| [Web Scraping with R](https://github.com/eduardszoecs/talk_webscrapingr/tree/61587ea5dca920edf0d71ddfc12c9c4bda77b53c) | 1 | 27 | 26–47 |
+| [TeXConf 2022 slides](https://github.com/t-tk/upmendex-package/tree/6850a15281169e1976a2e9dd20fea7fe331052c9/doc/present/src) | 1 | 41 | 40–52 |
+| [Résumé](https://github.com/billryan/resume/tree/eadc3955cf006254dc8f2419e971fbe3f5bab413) | 1 | 48 | 46–94 |
+| [Statistical cookbook](https://github.com/mavam/stat-cookbook/tree/09bd804a5251911088d55f8ce787a991b8b4ba15) | 2 | 172 | 162–184 |
 
 | BibTeX bibliography | Input files | Median (ms) | Range (ms) |
 | --- | ---: | ---: | ---: |
-| Lomb–Scargle references | 1 | 16 | 14–27 |
-| Grammatical Theory references | 1 | 24 | 19–34 |
-| WALS Online | 1 | 36 | 32–44 |
+| [Lomb–Scargle references](https://github.com/jakevdp/PracticalLombScargle/blob/5f4ca27deefa7d4edc68da3c92d34f484c5bc98e/PracticalLombScargle.bib) | 1 | 16 | 14–27 |
+| [Grammatical Theory references](https://github.com/langsci/25/blob/59eec1d2f610ef92a57aee8dddba66df82047677/gt.bib) | 1 | 24 | 19–34 |
+| [WALS Online](https://github.com/cldf-datasets/wals/blob/81298aa26d01fdc11b769bcc7fa87ad9e43d7ccd/cldf/sources.bib) | 1 | 36 | 32–44 |
 
 Each row is one `tift --check` invocation in the original project directory, with one worker and tift's configuration files and cache disabled. After one warm-up per workload, the [benchmark runner](performance/authored_works.py) ran seven measured passes in varying order on a Core i9-14900HX. The range is the fastest to slowest of those seven checks. Downloading and unpacking the pinned sources are outside the timer.
 
