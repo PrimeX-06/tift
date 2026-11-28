@@ -37,7 +37,7 @@
 /benches/
 !/performance/
 /performance/*
-!/performance/openai_math.py
+!/performance/authored_works.py
 /scripts/
 /reports/
 AGENTS.md

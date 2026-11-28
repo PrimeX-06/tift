@@ -1,21 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
-- Speed up the first format of multi-file books by limiting declaration analysis to commands that can affect later files and reusing snapshots across ordinary chapters.
-- Preserve the boundary between the document and trailing notes after `\end{document}`, including terminators with spaces or comments. Keep embedded files and DocStrip code on separate lines from their closing delimiters.
-- Honor the parent document's XeTeX input encoding for unsaved editor buffers and report replacement-stage diagnostics at their original source positions.
-- Resolve an existing file with a comma in its name when following `\input` or `\include`, including names supplied by a macro.
-- Preserve cross-line groups, math and environments that use TeX `^^` character translations. Read encoding declarations in files that mix CR, LF and CRLF line endings.
-- Format independent files as their project dependencies become available. Reuse source, token and semantic indexes across layout stages.
-- Preserve short verbatim examples in documentation classes and listings, including delimiters adjacent to TeX character translations.
-- Preserve printed spaces in VDM listings, stored code examples, and macros that read verbatim text up to a caller-supplied delimiter.
-- Keep Xy-pic diagrams, multiline math subscripts, and tables with short verbatim text stable on repeated formatting.
-- Format the surrounding document when a mismatched pair of delimiters can be isolated. Diagnostics identify the preserved source range.
-- Preserve unused arguments of simple TeX and LaTeX macros without treating their contents as executable environments. This also covers `\missingfigure` after an explicit `\usepackage[disable]{todonotes}`.
-- Continue formatting after nested, balanced environment wrappers, including `holtpolt` math commands defined in local style files.
-- Keep the unused branch of a statically resolved `ifdraft` call verbatim. Resume formatting after balanced list wrappers such as `duckuments`, and restore outer macro definitions when `altverse`'s `\Vbreak` restarts a paragraph environment.
-- Traverse deeply nested project inputs without overflowing the thread stack. `--trace` reports project indexing work and per-file timings in inclusion order as each file finishes.
+- Reuse declaration snapshots across chapters and share source indexes across formatting stages. Queue independent files for formatting as soon as their dependencies are ready.
+- Honor line-based comment environments declared in local style files. In *Think Python*, repeated formatting preserves the `htmlonly` block and keeps its delimiters in column one.
+- Recognize simple optional defaults in `xargs` commands defined inline or in an input file. This fixes a false unclosed-table diagnostic for `\punifd` in the statistics cookbook when the call omits its optional arguments.
+- Traverse deeply nested inputs without overflowing the stack. Resolve `\input` and `\include` filenames containing commas, including names supplied by macros.
+- Honor the parent document's XeTeX input encoding in unsaved editor buffers and read encoding declarations in files with mixed line endings.
+- Preserve unused macro arguments and inactive `ifdraft` branches. Continue formatting after balanced environment wrappers such as `holtpolt` and `duckuments`, and restore outer definitions when `altverse` restarts an environment.
+- Keep trailing notes separate from `\end{document}` and closing delimiters on their own lines in embedded files and DocStrip code. Preserve printed spaces in listings and verbatim examples.
+- Handle TeX `^^` character translations in groups, math and environments that span lines. Keep Xy-pic diagrams, multiline subscripts and tables with short verbatim text stable on repeated formatting.
+- Report replacement diagnostics at their original source positions. For isolated delimiter mismatches, identify the preserved range and format the surrounding text. `--trace` reports project indexing work and per-file timings in inclusion order.
 
 ## 0.2.1
 
@@ -28,8 +23,6 @@
 - Preserve spacing around sized math delimiters and handle a minus sign after a conditional or divisibility bar when wrapping equations.
 - Support atomic in-place writes to long Windows paths and reduce repeated scanning of TeX commands and arguments.
 
-[Download tift 0.2.1](https://github.com/PrimeX-06/tift/releases/tag/v0.2.1) or install with `cargo install tift --version 0.2.1 --locked --registry crates-io`.
-
 ## 0.2.0
 
 - Format lines added or edited since a Git revision with `--changed-since <REV>`. Run `tift --diff --changed-since HEAD` to preview formatting across staged and unstaged edits. New, non-ignored input files are formatted in full.
@@ -37,8 +30,6 @@
 - Keep references such as `Section \ref{sec:intro}`, `Eq. \eqref{eq:main}`, and `page \pageref{app:data}` together when they fit on a line. Preserve arara directive lines when wrapping comments.
 - Preserve spaces in inline verbatim code inside BibTeX field values.
 - Try different indentation widths or tabs in the browser Playground and see the formatted output update as you edit.
-
-[Download tift 0.2.0](https://github.com/PrimeX-06/tift/releases/tag/v0.2.0) or install with `cargo install tift --version 0.2.0 --locked --registry crates-io`.
 
 ## 0.1.9
 
@@ -48,24 +39,15 @@
 - Keep consecutive same-row booktabs `\cmidrule` commands together by default. Set `breaks.split-cmidrules = true` for one rule per line.
 - When wrapping prose, prefer nearby sentence endings and keep reference names and common number–unit pairs together. Enable `wrap.avoid-lone-last-word` to keep a short final pair of English words together. Wrapped comment lists use hanging indents.
 
-[Download tift 0.1.9](https://github.com/PrimeX-06/tift/releases/tag/v0.1.9) or install with `cargo install tift --version 0.1.9 --locked --registry crates-io`.
-
 ## 0.1.8
 
-- Align each equation pair in `align`, `alignat`, `aligned`, and related environments with a right-aligned left side and a left-aligned right side. Use the three native column directions in `eqnarray`.
-
-- Align trailing equation labels in supported multi-equation displays by default, within the configured column budget.
-
-- Measure table cells in Unicode display columns and align equals signs in selected multiline command options by default.
-
-- Account for `\multicolumn` spans by default when aligning table source, including tables with uniform justification.
+- Align equation pairs and trailing labels in `align`, `alignat`, `aligned`, and related displays within the configured column budget. Use the three native column directions in `eqnarray`.
+- Align tables using Unicode display widths and `\multicolumn` spans. Align equals signs in selected multiline command options by default.
 - Finish nonempty, editable files with a newline by default. Set `output.final-newline = "preserve"` to retain the original end of file.
 - Configure comment wrapping and alignment with `comments.wrap` and `comments.align-trailing`. Set file endings in `[output]`, the blank-line limit with `whitespace.blank-lines`, and replacement matching with `replacements[].match`.
 - Format embedded bibliographies in `filecontents` and `filecontents*` using the same settings as standalone BibTeX files. Set `bibtex.format-filecontents = false` to preserve the embedded source.
 - Align literal whitespace-separated PGFPlots tables by default. Set `breaks.pgfplots-tables = false` to preserve inline data or `breaks.pgfplots-named-tables = false` for named tables.
 - Add source layout options for bibliography lists and concatenations, repeated command arguments, TikZ paths, and plotting coordinates.
-
-Download a binary from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.8) or install with `cargo install tift --version 0.1.8 --locked --registry crates-io`. See the [configuration reference](https://github.com/PrimeX-06/tift/wiki/Configuration) for the current keys.
 
 ## 0.1.7
 
@@ -73,27 +55,11 @@ Download a binary from the [GitHub Release](https://github.com/PrimeX-06/tift/re
 - Collapse repeated spaces in ordinary BibTeX field values while preserving expression syntax, string definitions, and literal fields such as URLs and DOIs.
 - Try LaTeX and BibTeX formatting in the [browser Playground](https://primex-06.github.io/tift/#playground), with taller source and output panels on desktop and mobile.
 
-Download the archive for Windows, Linux, or macOS from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.7), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
-
-```sh
-cargo install tift --version 0.1.7 --locked --registry crates-io
-```
-
-[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
-
 ## 0.1.6
 
 - Expand syntax and formatting coverage for expl3 literal data, hook callbacks, opaque source regions, and deeply nested environments.
 - Improve repeated-format performance by reusing activity scans, borrowing expl3 call metadata, reducing opaque-marker allocations, and indexing cross-argument boundaries.
 - Add regression coverage and release-mode benchmarks for syntax stability and real-corpus throughput.
-
-Download the archive for Windows, Linux, or macOS from the [GitHub Release](https://github.com/PrimeX-06/tift/releases/tag/v0.1.6), extract the executable, and add its directory to `PATH`. Cargo installation requires Rust 1.99.1 or later.
-
-```sh
-cargo install tift --version 0.1.6 --locked --registry crates-io
-```
-
-[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
 
 ## 0.1.5
 
@@ -103,14 +69,6 @@ cargo install tift --version 0.1.6 --locked --registry crates-io
 - Refine BibTeX cleanup and normalization, and expand support for document, reference, key-definition, and code-listing commands.
 - Improve project context, configuration handling, and persistent-cache behavior for the expanded syntax and encoding support.
 
-Download the archive for your platform, extract the executable, and add its directory to `PATH`. The archive includes a sample configuration. Cargo installation requires Rust 1.99.1 or later.
-
-```sh
-cargo install tift --version 0.1.5 --locked --registry crates-io
-```
-
-[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
-
 ## 0.1.4
 
 - Configure horizontal formula spacing separately from display line breaks. Keep existing lines, join eligible display bodies onto one line, or wrap to a separate math width with optional operator priorities.
@@ -118,14 +76,6 @@ cargo install tift --version 0.1.5 --locked --registry crates-io
 - Preserve literal bodies in more code and pseudocode environments, including `algorithmic`, and recognize more custom listing declarations from minted, PythonTeX, codehigh, and tcolorbox.
 - Expand support for document and scientific commands, including date and exercise settings, CJK authoring, equation helpers, mathpartir proofs, and physics2 matrices. Literal options and metadata retain their contents.
 - Keep the hanging indentation of list prose when a long item title wraps. Reduce repeated parsing during indentation and math formatting.
-
-Download the archive for your platform, extract the executable, and add its directory to `PATH`. The archive includes a sample configuration. Cargo installation requires Rust 1.99.1 or later.
-
-```sh
-cargo install tift --version 0.1.4 --locked --registry crates-io
-```
-
-[User guide](https://github.com/PrimeX-06/tift/wiki) · [Configuration](https://github.com/PrimeX-06/tift/wiki/Configuration) · [Editor setup](https://github.com/PrimeX-06/tift/wiki/Editor-Integration)
 
 ## 0.1.3
 

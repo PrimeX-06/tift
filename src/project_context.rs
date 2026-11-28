@@ -22,6 +22,8 @@ use telemetry::{ProjectMetrics, ProjectReports, ProjectTrace};
 #[path = "project_context/protection_run.rs"]
 mod protection_run;
 use protection_run::ProtectionRun;
+#[path = "project_context/dynamic_inputs.rs"]
+mod dynamic_inputs;
 
 const LARGE_PROJECT_PREFIX: usize = 32 * 1024;
 const MAX_INPUT_DEPTH: usize = 128;
@@ -239,7 +241,41 @@ impl ProjectSnapshot {
                     graph.cache_root = Some(root.clone());
                 }
                 let source = self.sources.import(root, None)?;
-                let expand = |schedule: Option<&dyn Fn(Arc<ProtectionRun>)>| {
+                let forecast = Arc::new(OnceLock::new());
+                let parallel =
+                    rayon::current_thread_index().is_some() && rayon::current_num_threads() >= 3;
+                let predict =
+                    parallel && graph.cache_root.is_none() && source.candidates.len() >= 8;
+                let predict_config = &base.config;
+                let traced = self.reports.is_some();
+                let predict = predict.then(|| {
+                    let selected = graph.selected.clone();
+                    let mut planner = context.clone();
+                    let predictor_source = Arc::clone(&source);
+                    move || {
+                        let started = traced.then(Instant::now);
+                        let run = super::recover_panic(|| {
+                            ProtectionRun::predict(
+                                root,
+                                &predictor_source,
+                                &selected,
+                                predict_config,
+                                &mut planner,
+                            )
+                        })
+                        .ok()
+                        .flatten();
+                        if let Some(start) = started {
+                            eprintln!(
+                                "trace: project-prediction: elapsed={:.3} ms",
+                                start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        run
+                    }
+                });
+                let expand = |schedule: Option<&dyn Fn(Arc<ProtectionRun>)>, forecast| {
+                    graph.forecast = forecast;
                     let result = context.expand_inputs(
                         root,
                         source,
@@ -260,17 +296,36 @@ impl ProjectSnapshot {
                             }
                         },
                     );
+                    if let Some(forecast) = &graph.forecast {
+                        let _ = forecast.set(None);
+                    }
+                    graph.take_forecast();
                     if let Some(run) = &graph.protection_run {
                         run.cancel();
                     }
                     result
                 };
-                if rayon::current_thread_index().is_some() && rayon::current_num_threads() >= 3 {
+                if parallel {
                     rayon::in_place_scope_fifo(|scope| {
-                        expand(Some(&|run| scope.spawn_fifo(move |_| run.fill())))
+                        let has_prediction = predict.is_some();
+                        if let Some(mut predict) = predict {
+                            let publication = Arc::clone(&forecast);
+                            scope.spawn_fifo(move |_| {
+                                let plan = predict();
+                                if publication.set(plan.clone()).is_ok()
+                                    && let Some(run) = plan
+                                {
+                                    run.fill();
+                                }
+                            });
+                        }
+                        expand(
+                            Some(&|run| scope.spawn_fifo(move |_| run.fill())),
+                            has_prediction.then_some(forecast),
+                        )
                     })?;
                 } else {
-                    expand(None)?;
+                    expand(None, None)?;
                 }
                 let fingerprint = (self.cache_enabled && base.config.cache.enabled)
                     .then(|| graph.full_hash.of(&graph.source));
@@ -367,7 +422,7 @@ struct PreparedGraph {
     fingerprint: Option<blake3::Hash>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProjectContext {
     sources: Arc<Sources>,
     /// Canonical identities are stable for this invocation's source snapshot.
@@ -375,7 +430,7 @@ struct ProjectContext {
     normalized_paths: HashMap<(PathBuf, PathBuf), PathBuf>,
     /// Dependency probes share this invocation's immutable source snapshot.
     /// Missing candidates are rechecked by the next ProjectContext.
-    input_paths: HashMap<PathBuf, Option<PathBuf>>,
+    input_paths: Arc<Mutex<HashMap<PathBuf, Option<PathBuf>>>>,
 }
 
 #[derive(Clone)]
@@ -461,12 +516,14 @@ struct InputGraph {
     declaration_index: syntax::DeclarationIndex,
     alias_index: tift::source_model::ProjectAliasIndex,
     protection_run: Option<Arc<ProtectionRun>>,
+    forecast: Option<Arc<OnceLock<Option<Arc<ProtectionRun>>>>>,
     export_index: tift::source_model::ProjectExportIndex,
     inferred_exports: Option<(usize, DeclarationSnapshot)>,
     // Literal binding targets, including definitions with unknown signatures.
     // Their calls may invalidate later dynamic names and must stay in history.
     binding_targets: HashSet<String>,
     literal_inputs_index: Option<LiteralInputState>,
+    dynamic_protection: dynamic_inputs::DynamicInputProtection,
     declarations: Option<Arc<DeclarationSnapshot>>,
     pending_snapshot: Option<(usize, Arc<DeclarationSnapshot>)>,
     export_boundary_end: usize,
@@ -518,6 +575,7 @@ impl FileState {
         syntax.inferred_environment_aliases.clear();
         syntax.environment_alias_events.clear();
         syntax.environment_argument_events.clear();
+        syntax.verbatim_environment_events.clear();
         syntax.package_load_events.clear();
         syntax.command_import_events.clear();
         let updates = self
@@ -525,6 +583,15 @@ impl FileState {
             .iter()
             .map(|change| (change.at, change.loader.clone(), &change.delta));
         for (at, loader, delta) in std::iter::once((0, None, self.entry.as_ref())).chain(updates) {
+            if !delta.4.is_empty() {
+                syntax
+                    .verbatim_environment_events
+                    .push(tift::config::VerbatimEnvironmentEvent {
+                        at,
+                        loader: loader.clone(),
+                        environments: delta.4.clone(),
+                    });
+            }
             syntax
                 .environment_alias_events
                 .push(tift::config::EnvironmentAliasEvent {
@@ -606,6 +673,12 @@ struct DeclarationMemo {
     independent_append_safe: bool,
     reader_settled: bool,
     compiled: Option<Arc<syntax::CompiledSyntax>>,
+}
+
+struct PreparedPrefix {
+    options: Arc<Config>,
+    reusable: bool,
+    preview: Option<syntax::DeclarationIndex>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -878,6 +951,14 @@ impl ProjectInputs {
 type DeclarationSnapshot = tift::source_model::ProjectExports;
 
 impl InputGraph {
+    fn take_forecast(&mut self) {
+        if let Some(plan) = self.forecast.as_ref().and_then(|forecast| forecast.get()) {
+            if let Some(run) = plan {
+                self.protection_run = Some(Arc::clone(run));
+            }
+            self.forecast = None;
+        }
+    }
     fn checkpoint(&mut self, kind: u8, suffix: &str, config: &Config) -> Option<String> {
         if self.source.len() < LARGE_PROJECT_PREFIX {
             return None;
@@ -926,6 +1007,14 @@ impl InputGraph {
     }
 
     fn declaration_snapshot(&mut self, config: &Config) -> Arc<DeclarationSnapshot> {
+        self.declaration_snapshot_with_preview(config, None)
+    }
+
+    fn declaration_snapshot_with_preview(
+        &mut self,
+        config: &Config,
+        preview: Option<&syntax::DeclarationIndex>,
+    ) -> Arc<DeclarationSnapshot> {
         if let Some(snapshot) = &self.declarations {
             return Arc::clone(snapshot);
         }
@@ -947,9 +1036,24 @@ impl InputGraph {
             let started = self.metrics.as_ref().map(|_| Instant::now());
             let exports = match self.inferred_exports.take() {
                 Some((end, exports)) if end == self.source.len() => exports,
+                _ if let Some(exports) = self.protection_run.as_ref().and_then(|run| {
+                    run.exports(
+                        &self.source,
+                        &self.declaration_index,
+                        &mut self.export_index,
+                    )
+                }) =>
+                {
+                    if let Some(metrics) = &mut self.metrics {
+                        metrics.export_ahead_hits += 1;
+                    }
+                    exports.clone()
+                }
                 _ => {
                     let protection = if self.source.compact.is_none() {
-                        self.declaration_index.protected_prefix(&self.source)
+                        preview
+                            .unwrap_or(&self.declaration_index)
+                            .protected_prefix(&self.source)
                     } else {
                         None
                     };
@@ -1010,11 +1114,16 @@ impl InputGraph {
         prefix: &str,
         base: &Config,
         options: &Arc<Config>,
+        file: &ImportSource,
+        candidate: usize,
     ) -> Option<String> {
         let original_length = self.source.len();
         self.source.full.push_str(prefix);
         let end = self.source.len();
         let previous = self.literal_inputs_index.take();
+        let disabled = previous
+            .as_ref()
+            .is_some_and(|previous| previous.index.expand("", previous.end).is_none());
         let result = (|| {
             let index = if let Some(mut previous) = previous.filter(|previous| {
                 previous.end <= end
@@ -1030,7 +1139,13 @@ impl InputGraph {
                 }) {
                     previous.index
                 } else {
-                    let ranges = syntax::protected_ranges(&self.source, options).ok()?;
+                    let ranges = self.dynamic_protection.ranges(
+                        &self.source,
+                        options,
+                        file,
+                        candidate,
+                        disabled,
+                    )?;
                     tift::literal_expansion::LiteralExpansionIndex::build(
                         &self.source,
                         base,
@@ -1038,7 +1153,13 @@ impl InputGraph {
                     )
                 }
             } else {
-                let ranges = syntax::protected_ranges(&self.source, options).ok()?;
+                let ranges = self.dynamic_protection.ranges(
+                    &self.source,
+                    options,
+                    file,
+                    candidate,
+                    disabled,
+                )?;
                 tift::literal_expansion::LiteralExpansionIndex::build(&self.source, base, &ranges)
             };
             let expanded = index.expand(expression, end);
@@ -1097,7 +1218,14 @@ impl InputGraph {
         if !source.is_empty() && !stable {
             self.declarations = None;
         }
-        if stable && source.len() >= 256 {
+        if stable
+            && source.len()
+                >= if whitespace {
+                    256
+                } else {
+                    LARGE_PROJECT_PREFIX
+                }
+        {
             if let Some(metrics) = &mut self.metrics {
                 metrics.append_calls += 1;
                 metrics.appended_bytes += source.len();
@@ -1240,6 +1368,19 @@ impl InputGraph {
     }
 
     fn append_line(&mut self, source: &str) {
+        if source.len() >= 256
+            && self.source.compact.is_none()
+            && self
+                .protection_run
+                .as_ref()
+                .and_then(|run| run.suffix_state(&self.source, source, true))
+                .is_some()
+        {
+            self.declarations = None;
+            self.append(source);
+            self.append("\n");
+            return;
+        }
         let neutral = self
             .last_options
             .as_ref()
@@ -1249,6 +1390,21 @@ impl InputGraph {
                 memo.revision == self.revision
                     && memo.whitespace(source, self.source.ends_with('\n'))
             });
+        if reusable
+            && source.is_empty()
+            && self.declarations.is_none()
+            && self
+                .inferred_exports
+                .as_ref()
+                .is_some_and(|(end, _)| *end == self.source.len())
+            && syntax::project_export_boundary(&self.source[self.export_boundary_end..])
+        {
+            let (_, exports) = self.inferred_exports.take().unwrap();
+            self.declarations = Some(Arc::new(exports));
+            if self.source.ends_with('\n') {
+                self.export_boundary_end = self.source.len();
+            }
+        }
         self.append_segment(source, reusable);
         self.append("\n");
         if reusable {
@@ -1315,10 +1471,49 @@ impl InputGraph {
                 self.restore_index(config);
                 let started = self.metrics.as_ref().map(|_| Instant::now());
                 let mut reader_elapsed = None;
-                let result = if location == DeclarationBoundary::RootEnd {
+                let predicted = self
+                    .source
+                    .compact
+                    .is_none()
+                    .then(|| {
+                        self.protection_run.as_ref()?.infer_at(
+                            &self.source,
+                            &self.declaration_index,
+                            &mut self.export_index,
+                        )
+                    })
+                    .flatten();
+                if predicted.is_none()
+                    && self.source.compact.is_none()
+                    && let Some(ranges) = self
+                        .protection_run
+                        .as_ref()
+                        .and_then(|run| run.shared_at(&self.source))
+                {
+                    self.declaration_index.supply_protection(
+                        &self.source,
+                        config,
+                        Arc::clone(ranges),
+                    );
+                }
+                let result = if let Some(state) = predicted {
+                    self.declaration_index = state.reader.clone();
+                    if let Some(exports) = &state.exports {
+                        self.inferred_exports = Some((self.source.len(), exports.clone()));
+                    }
+                    let mut options = state.options.clone();
+                    if location == DeclarationBoundary::RootEnd {
+                        options
+                            .syntax
+                            .inferred_environment_aliases
+                            .clone_from(&config.syntax.inferred_environment_aliases);
+                    }
+                    Ok((options, state.independent, state.boundary))
+                } else if location == DeclarationBoundary::RootEnd {
                     self.declaration_index
                         .infer_without_exported_aliases(self.source.inference(), config)
-                } else if location == DeclarationBoundary::BeforeSeparator
+                } else if (self.source.compact.is_some() || self.protection_run.is_none())
+                    && location == DeclarationBoundary::BeforeSeparator
                     && self.declarations.is_none()
                     && self.source.len() >= LARGE_PROJECT_PREFIX
                     && rayon::current_thread_index().is_some()
@@ -1388,10 +1583,10 @@ impl InputGraph {
                     }
                     result
                 } else {
-                    syntax::infer_declaration_config_indexed(
+                    self.declaration_index.infer_with_alias_index(
                         self.source.inference(),
                         config,
-                        &mut self.declaration_index,
+                        &mut self.alias_index,
                     )
                 };
                 let work = self.declaration_index.scan_work();
@@ -1471,9 +1666,30 @@ impl InputGraph {
         suffix: &str,
         path: &Path,
         config: &Config,
-    ) -> Result<(Arc<Config>, bool), String> {
+        dynamic: bool,
+    ) -> Result<PreparedPrefix, String> {
         if let Some(metrics) = &mut self.metrics {
             metrics.prefix_calls += 1;
+        }
+        if suffix.len() >= 256
+            && self.source.compact.is_none()
+            && let Some(state) = self
+                .protection_run
+                .as_ref()
+                .and_then(|run| run.suffix_state(&self.source, suffix, false))
+        {
+            let mut options = state.options.clone();
+            if !dynamic {
+                options
+                    .syntax
+                    .inferred_environment_aliases
+                    .clone_from(&config.syntax.inferred_environment_aliases);
+            }
+            return Ok(PreparedPrefix {
+                options: Arc::new(options),
+                reusable: false,
+                preview: None,
+            });
         }
         if let Some(memo) = &self.last_options
             && memo.revision == self.revision
@@ -1481,7 +1697,11 @@ impl InputGraph {
             let neutral = memo.neutral(suffix);
             if suffix.is_empty() || neutral || memo.whitespace(suffix, self.source.ends_with('\n'))
             {
-                return Ok((Arc::clone(&memo.options), neutral));
+                return Ok(PreparedPrefix {
+                    options: Arc::clone(&memo.options),
+                    reusable: neutral,
+                    preview: None,
+                });
             }
         }
         let preview_started = self.metrics.as_ref().map(|_| Instant::now());
@@ -1491,7 +1711,7 @@ impl InputGraph {
         }
         // Preview the next input's prefix without copying the cumulative graph.
         // The memo is untouched, and truncation restores its immutable revision.
-        let key = self.checkpoint(3, suffix, config);
+        let key = self.checkpoint(if dynamic { 3 } else { 6 }, suffix, config);
         if let Some(options) = key
             .as_ref()
             .and_then(|key| self.cache.as_ref()?.get::<InferredSyntax>(key))
@@ -1499,18 +1719,51 @@ impl InputGraph {
             if let (Some(started), Some(metrics)) = (preview_started, &mut self.metrics) {
                 metrics.prefix_elapsed += started.elapsed();
             }
-            return Ok((Arc::new(options.apply(config)), false));
+            return Ok(PreparedPrefix {
+                options: Arc::new(options.apply(config)),
+                reusable: false,
+                preview: None,
+            });
         }
         self.restore_index(config);
         let length = self.source.inference().len();
         self.source.inference_mut().push_str(suffix);
 
         let mut preview_index = self.declaration_index.clone();
-        let inferred = syntax::infer_declaration_config_indexed(
-            self.source.inference(),
-            config,
-            &mut preview_index,
-        )
+        let predicted = self
+            .source
+            .compact
+            .is_none()
+            .then(|| self.protection_run.as_ref()?.inference(&self.source))
+            .flatten();
+        if predicted.is_none()
+            && self.source.compact.is_none()
+            && let Some(ranges) = self
+                .protection_run
+                .as_ref()
+                .and_then(|run| run.shared_at(&self.source))
+        {
+            preview_index.supply_protection(&self.source, config, Arc::clone(ranges));
+        }
+        let inferred = if let Some(state) = predicted {
+            preview_index = state.reader.clone();
+            let mut options = state.options.clone();
+            if !dynamic {
+                options
+                    .syntax
+                    .inferred_environment_aliases
+                    .clone_from(&config.syntax.inferred_environment_aliases);
+            }
+            Ok((options, state.independent, state.boundary))
+        } else if dynamic {
+            syntax::infer_declaration_config_indexed(
+                self.source.inference(),
+                config,
+                &mut preview_index,
+            )
+        } else {
+            preview_index.infer_without_exported_aliases(self.source.inference(), config)
+        }
         .map(|(options, _, _)| options)
         .or_else(|error| {
             if self.source.compact.is_some() {
@@ -1535,8 +1788,47 @@ impl InputGraph {
             metrics.prefix_elapsed += started.elapsed();
         }
         inferred
-            .map(|options| (Arc::new(options), false))
+            .map(|options| PreparedPrefix {
+                options: Arc::new(options),
+                reusable: false,
+                preview: self.source.compact.is_none().then_some(preview_index),
+            })
             .map_err(|error| format!("{}: project declarations: {error}", path.display()))
+    }
+
+    fn prepare_loader_prefix(
+        &mut self,
+        suffix: &str,
+        path: &Path,
+        config: &Config,
+        dynamic: bool,
+        command: &str,
+    ) -> Result<PreparedPrefix, String> {
+        if !dynamic
+            && suffix.len() >= 64
+            && self.source.compact.is_none()
+            && let Some(run) = &self.protection_run
+        {
+            let previous = self.source.len();
+            self.source.full.push_str(suffix);
+            let result = run.shared_at(&self.source).and_then(|ranges| {
+                let mut reader = self.declaration_index.clone();
+                reader.supply_protection(&self.source, config, Arc::clone(ranges));
+                reader.literal_loader_shadowed(&self.source, config, command)
+            });
+            self.source.full.truncate(previous);
+            if result == Some(false) {
+                if let Some(metrics) = &mut self.metrics {
+                    metrics.prefix_calls += 1;
+                }
+                return Ok(PreparedPrefix {
+                    options: Arc::new(config.clone()),
+                    reusable: false,
+                    preview: None,
+                });
+            }
+        }
+        self.prepare_prefix(suffix, path, config, dynamic)
     }
 
     fn literal_inputs(&self, source: &str) -> Result<ParsedInputs, String> {
@@ -1691,6 +1983,7 @@ impl ProjectContext {
             graph,
         )];
         while let Some(frame) = stack.last_mut() {
+            graph.take_forecast();
             if let Some(pending) = &mut frame.pending {
                 if let Some((child, input)) = pending.children.next() {
                     let before_separator = frame.capture && pending.children.len() == 0;
@@ -1794,13 +2087,30 @@ impl ProjectContext {
             // environments whose definitions have not been imported yet.
             let options = graph.infer(path, config)?;
             let plain = input.plain_file(source, command);
-            let Some(document_start) = frame.loaders.locate(graph, input_source, index, &options)
+            let started = graph.metrics.as_ref().map(|_| Instant::now());
+            let located = graph
+                .protection_run
+                .as_ref()
+                .and_then(|run| run.loader(graph.source.len(), input_source, input, &options));
+            let Some(document_start) = located
+                .unwrap_or_else(|| frame.loaders.locate(graph, input_source, index, &options))
             else {
                 continue;
             };
-            let (inferred, reusable_prefix) =
-                graph.prepare_prefix(&source[cursor..input.span.start], path, config)?;
-            if inferred.syntax.commands.contains_key(command) {
+            if let Some(start) = started {
+                eprintln!(
+                    "trace: project-loader: elapsed={:.3} ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let prefix = graph.prepare_loader_prefix(
+                &source[cursor..input.span.start],
+                path,
+                config,
+                dynamic,
+                command,
+            )?;
+            if prefix.options.syntax.commands.contains_key(command) {
                 continue;
             }
             if let Some(schedule) = schedule
@@ -1809,6 +2119,7 @@ impl ProjectContext {
                 && frame.loaders.verified
                 && frame.loaders.end >= index + 3
                 && graph.protection_run.is_none()
+                && graph.forecast.is_none()
                 && graph.source.len() >= LARGE_PROJECT_PREFIX
                 && !graph
                     .cache
@@ -1832,7 +2143,9 @@ impl ProjectContext {
                     &input.name,
                     &source[cursor..input.span.start],
                     config,
-                    &inferred,
+                    &prefix.options,
+                    input_source,
+                    index,
                 );
                 self.loader_paths(
                     name.as_deref().unwrap_or(""),
@@ -1848,16 +2161,16 @@ impl ProjectContext {
                 graph.preamble_end =
                     document_start.map(|start| graph.source.len() + start.saturating_sub(cursor));
             }
-            graph.append_segment(&source[cursor..input.span.start], reusable_prefix);
+            graph.append_segment(&source[cursor..input.span.start], prefix.reusable);
             let before = if frame.capture || graph.source.len() < LARGE_PROJECT_PREFIX {
-                Some(graph.declaration_snapshot(config))
+                Some(graph.declaration_snapshot_with_preview(config, prefix.preview.as_ref()))
             } else {
                 graph.declarations.clone()
             };
             graph.append_prepared_input(
                 &source[input.span.clone()],
-                reusable_prefix,
-                reusable_prefix
+                prefix.reusable,
+                prefix.reusable
                     && plain
                     && (command == "include" || syntax::input_package(&input.name).is_none())
                     && before
@@ -1919,14 +2232,29 @@ impl InputFrame {
         let Some(before) = before else {
             return;
         };
+        if self.capture
+            && self.next < self.file.candidates.len()
+            && graph.source.compact.is_none()
+            && graph.source.len() >= LARGE_PROJECT_PREFIX
+            && graph.declarations.is_none()
+            && graph.pending_snapshot.is_none()
+            && graph
+                .last_options
+                .as_ref()
+                .is_some_and(|memo| memo.revision != graph.revision)
+        {
+            let _ = graph.infer(&self.path, config);
+        }
         let after = self
             .loaders
             .snapshot_before_next(&self.file, self.next, graph, config);
         if !self.capture || Arc::ptr_eq(&before, &after) {
             return;
         }
-        let (before_aliases, before_arguments, before_packages, before_commands) = before.as_ref();
-        let (after_aliases, after_arguments, after_packages, after_commands) = after.as_ref();
+        let (before_aliases, before_arguments, before_packages, before_commands, before_verbatim) =
+            before.as_ref();
+        let (after_aliases, after_arguments, after_packages, after_commands, after_verbatim) =
+            after.as_ref();
         let commands = after_commands
             .iter()
             .filter(|(name, command)| before_commands.get(*name) != Some(command))
@@ -1942,7 +2270,13 @@ impl InputFrame {
         self.imports.push(LoaderChange {
             at: input.span.end,
             loader: self.file.loader_at(input.span.start).cloned(),
-            delta: (aliases, arguments, packages, commands),
+            delta: (
+                aliases,
+                arguments,
+                packages,
+                commands,
+                changed_bindings(before_verbatim, after_verbatim),
+            ),
         });
     }
 
@@ -1968,7 +2302,7 @@ impl InputFrame {
         if !graph.files.contains_key(path) {
             // Retain the exact first-inclusion state. Incomplete file tails
             // keep lazy restoration; a later source may complete their reader.
-            if self.capture || path != root {
+            if self.capture || path != root && graph.source.len() < LARGE_PROJECT_PREFIX {
                 let location = if path == root {
                     DeclarationBoundary::RootEnd
                 } else if self.before_separator {
@@ -2062,8 +2396,10 @@ impl ProjectContext {
                 // this invocation's snapshot, even if a prior probe missed it.
                 let result = if self.sources.contains(&candidate) {
                     Some(candidate)
-                } else if let Some(cached) = self.input_paths.get(&candidate) {
-                    cached.clone().or_else(|| {
+                } else if let Some(cached) =
+                    { self.input_paths.lock().unwrap().get(&candidate).cloned() }
+                {
+                    cached.or_else(|| {
                         let path = self
                             .normalized_paths
                             .get(&(candidate.clone(), PathBuf::new()))
@@ -2074,7 +2410,10 @@ impl ProjectContext {
                 } else {
                     let path = self.normalized_path(&candidate)?;
                     let result = (self.sources.contains(&path) || path.is_file()).then_some(path);
-                    self.input_paths.insert(candidate, result.clone());
+                    self.input_paths
+                        .lock()
+                        .unwrap()
+                        .insert(candidate, result.clone());
                     result
                 };
                 if result.is_some() {
@@ -2395,6 +2734,10 @@ fn input_candidates(source: &str) -> impl Iterator<Item = Input> + '_ {
             }
         })
         .filter_map(|start| input_at(source, start))
+}
+
+pub(super) fn parallel_prefixes(source: &str) -> bool {
+    source.len() >= LARGE_PROJECT_PREFIX && input_candidates(source).nth(7).is_some()
 }
 
 fn ignored_resource_input(input: &Input, command: &str, config: &SyntaxConfig) -> bool {

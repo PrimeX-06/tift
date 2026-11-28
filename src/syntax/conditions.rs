@@ -162,16 +162,19 @@ impl ConditionalBindings {
     }
 
     pub(super) fn observe(&mut self, source: &str, name: &str, end: usize, config: &Config) {
-        self.observe_with_uncertainty(source, name, end, config, false);
+        self.observe_with_body(source, name, end, config, false, || {
+            super::macro_body(source, name, end)
+        });
     }
 
-    pub(super) fn observe_with_uncertainty(
+    pub(super) fn observe_with_body(
         &mut self,
         source: &str,
         name: &str,
         end: usize,
         config: &Config,
         uncertain: bool,
+        body: impl FnOnce() -> Option<Range<usize>>,
     ) {
         let base = super::unstarred(name);
         if base == "global" {
@@ -215,7 +218,7 @@ impl ConditionalBindings {
             }
             if let Some((target_name, target_end)) = command_at(source, target) {
                 let mut meaning = ConditionalMeaning::Ordinary;
-                if let Some(body) = super::macro_body(source, base, end)
+                if let Some(body) = body()
                     && super::opens_final_condition(&source[body.start + 1..body.end - 1])
                 {
                     meaning = ConditionalMeaning::Other;

@@ -26,6 +26,7 @@ pub(crate) struct SemanticIndex {
     pub(crate) exported: BTreeMap<String, EnvironmentAlias>,
     pub(crate) exported_unknown: HashSet<String>,
     pub(crate) exported_environments: BTreeMap<String, Option<EnvironmentArguments>>,
+    pub(crate) exported_verbatim: BTreeMap<String, Option<crate::config::VerbatimTerminator>>,
     pub(crate) exported_commands: BTreeMap<String, ImportedCommand>,
     pub(crate) registry: HashMap<String, SyntaxRule>,
     pub(crate) invocations: HashMap<usize, SyntaxRule>,

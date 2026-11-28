@@ -452,12 +452,7 @@ pub(crate) struct VerbatimDeclaration {
     pub terminator: VerbatimTerminator,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VerbatimTerminator {
-    AnyPosition,
-    UnindentedLine,
-    IndentedLine,
-}
+pub(crate) use crate::config::VerbatimTerminator;
 
 fn argument(source: &str, cursor: &mut usize, open: u8, close: u8) -> Option<Range<usize>> {
     let start = trivia_end(source, *cursor);

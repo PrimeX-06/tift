@@ -170,7 +170,10 @@ impl PersistentCache {
             fingerprint.update(b"project-environment-argument-events");
             serde_json::to_writer(
                 &mut fingerprint,
-                &options.syntax.environment_argument_events,
+                &(
+                    &options.syntax.environment_argument_events,
+                    &options.syntax.verbatim_environment_events,
+                ),
             )
             .ok()?;
             fingerprint.update(b"project-package-load-events");

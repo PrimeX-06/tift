@@ -670,6 +670,11 @@ fn execute(args: &Args) -> Result<i32, String> {
         None => selected.into_iter().map(read).collect(),
     };
     let pool = match files.as_slice() {
+        [Ok((project_context::ProjectDependency::Root(root), file))]
+            if root == &file.identity && project_context::parallel_prefixes(&file.input.text) =>
+        {
+            worker_pool(threads, 4)?
+        }
         [Ok((dependency, _))] => single_input_pool(threads, dependency)?,
         _ => pool,
     };

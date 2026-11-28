@@ -846,12 +846,22 @@ fn primitive_literal_argument_end(source: &str, name: &str, end: usize) -> Optio
 }
 
 fn definition_header_end(source: &str, name: &str, end: usize) -> Option<usize> {
+    definition_header_with_body(source, name, end, || macro_body(source, name, end))
+}
+
+fn definition_header_with_body(
+    source: &str,
+    name: &str,
+    end: usize,
+    body: impl FnOnce() -> Option<Range<usize>>,
+) -> Option<usize> {
     if let Some(body) = expl3_definition_body(source, name, end) {
         return Some(body.start);
     }
     (latex_macro_definition(name) || matches!(name, "def" | "gdef" | "edef" | "xdef"))
-        .then(|| macro_body(source, name, end).map(|body| body.start))
+        .then(body)
         .flatten()
+        .map(|body| body.start)
 }
 
 fn literal_csname(source: &str, start: usize) -> Option<(String, usize)> {
@@ -1300,6 +1310,10 @@ pub(crate) fn parameter_text_end(source: &str, mut pos: usize) -> Option<usize> 
 }
 
 fn macro_body(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
+    macro_body_parts(source, name, end).map(|(span, _)| span)
+}
+
+fn macro_body_parts(source: &str, name: &str, end: usize) -> Option<(Range<usize>, usize)> {
     let name = name.trim_end_matches('*');
     let mut pos = skip_trivia(source, end);
     if matches!(name, "@namedef" | "csdef" | "csgdef" | "csedef" | "csxdef") {
@@ -1326,7 +1340,8 @@ fn macro_body(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
             pos = skip_trivia(source, balanced_end(source, pos, b'{', b'}')?);
         }
     }
-    let mut finish = balanced_end(source, pos, b'{', b'}')?;
+    let first_end = balanced_end(source, pos, b'{', b'}')?;
+    let mut finish = first_end;
     if fixed_command_factory_signature(name).is_some() {
         let options = skip_trivia(source, finish);
         if source.as_bytes().get(options) == Some(&b'[') {
@@ -1341,7 +1356,7 @@ fn macro_body(source: &str, name: &str, end: usize) -> Option<Range<usize>> {
             finish = balanced_end(source, final_code, b'[', b']')?;
         }
     }
-    Some(pos..finish)
+    Some((pos..finish, first_end))
 }
 
 fn raw_command_body(source: &str, end: usize, count: Option<usize>) -> Option<Range<usize>> {
@@ -1914,7 +1929,7 @@ fn next_declaration_token(source: &str, start: usize, limit: usize) -> usize {
         .map_or(limit, |offset| start + offset)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct ContextDeclaration {
     name: String,
     environment: bool,
@@ -1945,6 +1960,32 @@ fn context_signature(source: &str, specification: Range<usize>) -> Option<String
     Some(signature.compact().unwrap_or_else(|| text.to_owned()))
 }
 
+fn xargs_command_signature(source: &str, cursor: &mut usize) -> Option<String> {
+    let arity = context_argument(source, cursor, b'[', b']')?;
+    let &[digit @ b'1'..=b'9'] = source[arity].trim().as_bytes() else {
+        return None;
+    };
+    let mut slots = vec!['m'; usize::from(digit - b'0')];
+    if let Some(options) = context_argument(source, cursor, b'[', b']') {
+        for option in source[options].split(',') {
+            let (position, default) = option.split_once('=')?;
+            let &[position @ b'1'..=b'9'] = position.trim().as_bytes() else {
+                return None;
+            };
+            let slot = slots.get_mut(usize::from(position - b'1'))?;
+            let literal = default
+                .trim()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric());
+            if *slot == 'o' || !literal {
+                return None;
+            }
+            *slot = 'o';
+        }
+    }
+    Some(slots.into_iter().collect())
+}
+
 fn context_macro_declaration(
     source: &str,
     start: usize,
@@ -1962,6 +2003,17 @@ fn context_macro_declaration_with_config(
     config: Option<&Config>,
 ) -> Option<ContextDeclaration> {
     let body = macro_body(source, command, end)?;
+    context_macro_declaration_with_body(source, start, command, end, config, body)
+}
+
+fn context_macro_declaration_with_body(
+    source: &str,
+    start: usize,
+    command: &str,
+    end: usize,
+    config: Option<&Config>,
+    body: Range<usize>,
+) -> Option<ContextDeclaration> {
     let mut cursor = end;
     let environment = command.to_ascii_lowercase().contains("environment")
         || matches!(command, "NewEnviron" | "RenewEnviron");
@@ -1996,7 +2048,11 @@ fn context_macro_declaration_with_config(
     });
     // The balanced body establishes completion even when explicit syntax makes
     // interpreting this declaration's argument specification unnecessary.
-    let specification = if configured_signature || command.trim_end_matches('*').ends_with('x') {
+    let specification = if configured_signature {
+        None
+    } else if matches!(unstarred(command), "newcommandx" | "renewcommandx") {
+        xargs_command_signature(source, &mut cursor)
+    } else if unstarred(command).ends_with('x') {
         None
     } else if let Some(signature) = fixed_command_factory_signature(command) {
         Some(signature.to_owned())
@@ -2082,12 +2138,12 @@ pub(crate) fn source_command_declaration(
     if let Some(declaration) = expl3_command_declaration(source, start, command, end) {
         return Some(declaration);
     }
-    let parsed = context_macro_declaration(source, start, command, end)?;
+    let (body, first_end) = macro_body_parts(source, command, end)?;
+    let parsed =
+        context_macro_declaration_with_body(source, start, command, end, None, body.clone())?;
     if parsed.environment {
         return None;
     }
-    let body = macro_body(source, command, end)?;
-    let first_end = balanced_end(source, body.start, b'{', b'}')?;
     Some(crate::source_model::Declaration {
         name: parsed.name,
         span: parsed.span,
@@ -2230,9 +2286,9 @@ pub(crate) fn source_environment_declaration(
     if latex_macro_definition(base)
         && (base.to_ascii_lowercase().contains("environment") || collected)
     {
-        let parsed = context_macro_declaration(source, start, base, end)?;
-        let body = macro_body(source, base, end)?;
-        let first_end = balanced_end(source, body.start, b'{', b'}')?;
+        let (body, first_end) = macro_body_parts(source, base, end)?;
+        let parsed =
+            context_macro_declaration_with_body(source, start, base, end, None, body.clone())?;
         let mut bodies: Vec<_> = std::iter::once(body.start + 1..first_end - 1).collect();
         if collected {
             let final_start = skip_trivia(source, first_end);
@@ -3852,6 +3908,7 @@ pub(crate) struct RawReaderFacts<'a, 's> {
 #[derive(Default)]
 struct ReaderScan<'a, 's> {
     raw: Option<RawReaderFacts<'a, 's>>,
+    tape: Option<&'a protection_tape::TapeFacts>,
     expl3: bool,
     windows: Option<&'a mut Vec<ReaderWindow>>,
 }
@@ -3929,6 +3986,7 @@ pub(crate) fn protection_snapshot(
         ReaderScan {
             raw,
             expl3: false,
+            tape: None,
             windows,
         },
     )?;
@@ -3950,6 +4008,7 @@ pub(crate) fn protected_ranges_for_expl3_outer(
         ReaderScan {
             raw: None,
             expl3: true,
+            tape: None,
             windows: None,
         },
     )
@@ -3994,6 +4053,7 @@ fn protected_ranges_indexed(
         ReaderScan {
             raw: scan.raw,
             expl3: scan.expl3,
+            tape: scan.tape,
             windows: scan.windows.as_deref_mut(),
         },
     )?;
@@ -4021,7 +4081,10 @@ fn protected_ranges_indexed(
         |index| index.has_branch(source, &ranges),
     ) {
         if let (Some(grammar), Some(markers)) = (compiled, candidates) {
-            let limit = markers.closing.token_start_limit(source, grammar);
+            let limit = markers.branch_limit(source, grammar);
+            if limit == 0 {
+                return Ok(ranges);
+            }
             add_conditional_environment_protection_until(
                 source,
                 config,
@@ -5217,6 +5280,7 @@ fn protected_ranges_with_inferred_environments(
             ReaderScan {
                 raw: scan.raw,
                 expl3: scan.expl3,
+                tape: scan.tape,
                 windows: None,
             },
         )
@@ -5272,6 +5336,7 @@ fn protected_ranges_with_inferred_environments(
         ReaderScan {
             raw: None,
             expl3: scan.expl3,
+            tape: None,
             windows: scan.windows.is_some().then_some(&mut analysis_windows),
         },
     )
@@ -5890,8 +5955,22 @@ fn protected_ranges_with_inferred_environments_inner(
     let mut command_imports = command_imports.iter().peekable();
     use crate::package_environments::VerbatimTerminator;
     let mut package_verbatim = HashMap::new();
-    let mut package_commands_redefined = HashSet::new();
-    let mut scoped_environments = HashMap::new();
+    let mut verbatim_imports = config
+        .syntax
+        .verbatim_environment_events
+        .iter()
+        .filter_map(|event| {
+            let at = crate::source_model::SourceModel::import_offset(
+                source,
+                event.at,
+                event.loader.as_ref(),
+                loader_positions,
+            )?;
+            Some((at, &event.environments))
+        })
+        .peekable();
+    let mut package_commands_redefined = protection_tape::RedefinedCommands::default();
+    let mut scoped_environments = protection_tape::ScopedEnvironments::default();
     let mut visual_overrides = crate::packages::visual_languages::Overrides::default();
     let mut conditional_bindings = ConditionalBindings::default();
     let mut catcode_scopes: Vec<(CatcodeTerminator<'_>, bool, usize)> = Vec::new();
@@ -5911,7 +5990,19 @@ fn protected_ranges_with_inferred_environments_inner(
     let mut raw_tokens = scan.raw.map(|raw| raw.tokens.borrow_mut());
     let mut raw_cursor = 0;
     let mut at_delimits_verb = false;
+    let passive = scan
+        .tape
+        .filter(|_| scan.windows.is_none() && config.syntax.special.is_empty());
     while pos < input_end {
+        while verbatim_imports.peek().is_some_and(|(at, _)| *at <= pos) {
+            for (name, terminator) in verbatim_imports.next().unwrap().1 {
+                if let Some(terminator) = terminator {
+                    package_verbatim.insert(name.clone(), *terminator);
+                } else {
+                    package_verbatim.remove(name);
+                }
+            }
+        }
         while command_imports.peek().is_some_and(|event| event.at <= pos) {
             for (name, command) in &command_imports.next().unwrap().commands {
                 if !config.syntax.commands.contains_key(name) {
@@ -5954,6 +6045,26 @@ fn protected_ranges_with_inferred_environments_inner(
             continue;
         }
         let c = source.as_bytes()[pos];
+        if c != b'\\'
+            && let Some(finish) = passive.and_then(|facts| facts.passive.end(pos, input_end))
+            && short_verbatim.is_empty()
+            && !pending_unless
+            && inline_tikz_start.is_none()
+            && noindent.is_empty()
+            && !directives.is_disabled()
+            && case_list_delimiters.is_empty()
+            && delayed_key_ranges.range(pos..finish).next().is_none()
+            && macro_ranges
+                .last()
+                .is_none_or(|range| range.start < pos || range.start >= finish)
+            && command_imports
+                .peek()
+                .is_none_or(|event| event.at >= finish)
+            && verbatim_imports.peek().is_none_or(|(at, _)| *at >= finish)
+        {
+            pos = finish;
+            continue;
+        }
         let character = source[pos..].chars().next().expect("source character");
         if c == b'!'
             && package_context.at(pos).has_package("codedescribe")
@@ -6243,7 +6354,9 @@ fn protected_ranges_with_inferred_environments_inner(
                     && !config.syntax.commands.contains_key(name)
                     && !package_commands_redefined.contains(name)
                     && let Some(binding) = arguments::foreach_binding(source, end, |at| {
-                        foreach_groups.end(source, at, raw_tokens.as_deref_mut())
+                        scan.tape
+                            .and_then(|facts| facts.group_end(at, source.len()))
+                            .or_else(|| foreach_groups.end(source, at, raw_tokens.as_deref_mut()))
                     })
                 {
                     for variable in binding.names {
@@ -6256,9 +6369,7 @@ fn protected_ranges_with_inferred_environments_inner(
                 let base = unstarred(name);
                 if !config.syntax.commands.contains_key(base)
                     && !package_commands_redefined.contains(base)
-                    && let Some(environment) = *scoped_environments
-                        .entry(name)
-                        .or_insert_with(|| crate::packages::scoped_environment_for_command(name))
+                    && let Some(environment) = scoped_environments.get(name)
                 {
                     package_context.observe_environment(
                         environment,
@@ -6575,6 +6686,16 @@ fn protected_ranges_with_inferred_environments_inner(
             }
             if let Some((name, end)) = command {
                 let base = conditions::canonical_condition_control(unstarred(name));
+                let mut body = None;
+                let mut declaration_body = || {
+                    body.get_or_insert_with(|| {
+                        scan.tape.map_or_else(
+                            || macro_body(source, name, end),
+                            |facts| facts.body(source, name, end),
+                        )
+                    })
+                    .clone()
+                };
                 let global_catcode = conditional_bindings.has_global_prefix();
                 if matches!(base, "knowledgenewvariant" | "knowledgestyle")
                     && package_context.at(pos).has_package("knowledge")
@@ -6710,7 +6831,9 @@ fn protected_ranges_with_inferred_environments_inner(
                     case_list_delimiters.insert(argument.end - 1);
                 }
                 if latex_macro_definition(name) {
-                    if let Some(declaration) = context_macro_declaration(source, pos, name, end) {
+                    if let Some(declaration) = declaration_body().and_then(|body| {
+                        context_macro_declaration_with_body(source, pos, name, end, None, body)
+                    }) {
                         let provide = base.starts_with("provide") || base.starts_with("Provide");
                         let exists = xparse_bindings
                             .contains(declaration.environment, &declaration.name)
@@ -6739,7 +6862,7 @@ fn protected_ranges_with_inferred_environments_inner(
                             );
                             if !uncertain
                                 && !declaration.environment
-                                && let Some(body) = macro_body(source, name, end)
+                                && let Some(body) = declaration_body()
                                 && let Some(kind) = crate::packages::code::forwarded_inline_kind(
                                     &source[body.start + 1..body.end - 1],
                                 )
@@ -6752,7 +6875,7 @@ fn protected_ranges_with_inferred_environments_inner(
                             }
                             if !uncertain
                                 && !declaration.environment
-                                && let Some(body) = macro_body(source, name, end)
+                                && let Some(body) = declaration_body()
                             {
                                 let body = &source[body.start + 1..body.end - 1];
                                 xparse_bindings.observe_reader(&declaration.name, body);
@@ -6832,7 +6955,7 @@ fn protected_ranges_with_inferred_environments_inner(
                     let signature = if uncertain {
                         None
                     } else if matches!(base, "def" | "gdef" | "edef" | "xdef") {
-                        macro_body(source, base, end)
+                        declaration_body()
                             .and_then(|body| {
                                 arguments::parameter_signature(&source[target_end..body.start])
                             })
@@ -6877,7 +7000,7 @@ fn protected_ranges_with_inferred_environments_inner(
                     }
                     if !uncertain
                         && matches!(base, "def" | "gdef" | "edef" | "xdef")
-                        && let Some(body) = macro_body(source, base, end)
+                        && let Some(body) = declaration_body()
                     {
                         let body = &source[body.start + 1..body.end - 1];
                         if matches!(base, "def" | "gdef") {
@@ -7069,7 +7192,14 @@ fn protected_ranges_with_inferred_environments_inner(
                     );
                 }
 
-                conditional_bindings.observe_with_uncertainty(source, name, end, config, uncertain);
+                conditional_bindings.observe_with_body(
+                    source,
+                    name,
+                    end,
+                    config,
+                    uncertain,
+                    &mut declaration_body,
+                );
                 if matches!(base, "endinput" | "bye")
                     && active_conditions.is_empty()
                     && catcode_scopes.is_empty()
@@ -7681,7 +7811,7 @@ fn protected_ranges_with_inferred_environments_inner(
                     && (latex_macro_definition(base)
                         || matches!(base, "def" | "gdef" | "edef" | "xdef" | "newcolumntype"))
                 {
-                    if let Some(range) = macro_body(source, name, end) {
+                    if let Some(range) = declaration_body() {
                         macro_ranges.push(range);
                     }
                 } else if let Some(rule) =
@@ -7692,7 +7822,7 @@ fn protected_ranges_with_inferred_environments_inner(
                 }
                 pos = primitive_test_end(source, name, end)
                     .or_else(|| next_character_test_end(source, name, end))
-                    .or_else(|| definition_header_end(source, name, end))
+                    .or_else(|| definition_header_with_body(source, name, end, declaration_body))
                     .unwrap_or(end);
                 continue;
             }

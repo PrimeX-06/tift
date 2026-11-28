@@ -15,7 +15,7 @@ tift keeps the source of a shared paper easy to review. Equations and table colu
 
 ## Install
 
-Download the archive for Windows, Linux, or macOS, extract the executable, and add its directory to `PATH`. [Download tift 0.2.1](https://github.com/PrimeX-06/tift/releases/tag/v0.2.1)
+Download the archive for Windows, Linux, or macOS, extract the executable, and add its directory to `PATH`. [Download tift 0.2.2](https://github.com/PrimeX-06/tift/releases/tag/v0.2.2)
 
 With Rust 1.99.1 or later, you can also install tift using Cargo.
 
@@ -41,25 +41,35 @@ You can also pass a bibliography (`references.bib`) or a BibTeX style file (`jou
 
 ## Performance
 
-tift 0.2.1 took **26.6 ms** to check a TeX file on Windows 11 (median, including CLI startup). Across all 7,720 files, **90.5%** finished within 50 ms.
-
-```mermaid
-xychart-beta
-    title "Single-file check times"
-    x-axis ["≤25 ms", ">25–50 ms", ">50–100 ms", ">100 ms"]
-    y-axis "Files" 0 --> 5000
-    bar [3058, 3925, 398, 339]
-```
+tift 0.2.2 took **27 ms** to check the *Web Scraping with R* slides, **185 ms** for the single-file *Think Python* book, and **566 ms** for ten files from *Roots of Language*. These are single-threaded medians on Windows 11, including CLI startup. All 14 workloads completed (49 input files from 13 repositories).
 
 <details>
-<summary>Benchmark setup and reproduction</summary>
+<summary>All 14 results and how to reproduce them</summary>
 
-The benchmark covers the TeX sources of 721 papers. It excludes nine files from a paper missing `astra-plain.bst`. [Benchmark corpus](https://github.com/openai/math/tree/adc7f1241b42e322a6451854ab7e4b4c146bf78a)
+| LaTeX project | Input files | Median (ms) | Range (ms) |
+| --- | ---: | ---: | ---: |
+| emcee | 1 | 57 | 47–67 |
+| Lomb–Scargle | 1 | 67 | 66–72 |
+| Tidy Data | 1 | 144 | 139–155 |
+| Think Python | 1 | 185 | 183–367 |
+| lshort-zh-cn | 17 | 181 | 171–368 |
+| Roots of Language | 10 | 566 | 554–665 |
+| Lung tomography thesis | 10 | 364 | 354–392 |
+| Web Scraping with R | 1 | 27 | 26–47 |
+| TeXConf 2022 slides | 1 | 41 | 40–52 |
+| Résumé | 1 | 48 | 46–94 |
+| Statistical cookbook | 2 | 172 | 162–184 |
 
-Each file’s time is the median of three separate CLI runs with one worker, default settings, and the tift cache disabled on Windows 11 (Core i9-14900HX). All 7,720 files completed without formatter errors.
+| BibTeX bibliography | Input files | Median (ms) | Range (ms) |
+| --- | ---: | ---: | ---: |
+| Lomb–Scargle references | 1 | 16 | 14–27 |
+| Grammatical Theory references | 1 | 24 | 19–34 |
+| WALS Online | 1 | 36 | 32–44 |
+
+Each row is one `tift --check` invocation in the original project directory, with one worker and tift's configuration files and cache disabled. After one warm-up per workload, the [benchmark runner](performance/authored_works.py) ran seven measured passes in varying order on a Core i9-14900HX. The range is the fastest to slowest of those seven checks. Downloading and unpacking the pinned sources are outside the timer.
 
 ```sh
-python performance/openai_math.py --tift path/to/tift --all-files --runs 3
+python performance/authored_works.py --mode formal --tift path/to/tift
 ```
 
 </details>
@@ -77,7 +87,7 @@ mode = "wrap"
 columns = 88
 ```
 
-tift loads the file automatically when you format the project. [Annotated configuration for 0.2.1](https://github.com/PrimeX-06/tift/blob/v0.2.1/examples/tift.toml)
+tift loads the file automatically when you format the project. [Annotated configuration for 0.2.2](https://github.com/PrimeX-06/tift/blob/v0.2.2/examples/tift.toml)
 
 ## Editor
 

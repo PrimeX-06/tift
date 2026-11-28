@@ -100,6 +100,7 @@ pub struct Conditional {
 #[derive(Debug, Clone)]
 pub(crate) enum Replacement {
     Boundary(EnvironmentAlias),
+    VerbatimEnvironment(crate::config::VerbatimTerminator),
     WrappedEnvironment(String),
     RestartEnvironment(String),
     RestartArgument,
@@ -233,6 +234,8 @@ enum ExportTables {
     All,
 }
 
+mod export_reuse;
+
 #[derive(Default)]
 struct ExportReaderPositions {
     readers: Vec<usize>,
@@ -240,8 +243,33 @@ struct ExportReaderPositions {
     groups: PrefixGroupPairs,
 }
 
+fn opaque_verbatim_declarations(
+    source: &str,
+    token: &SourceToken,
+) -> Option<Vec<crate::package_environments::VerbatimDeclaration>> {
+    if token.kind != SourceTokenKind::Opaque {
+        return None;
+    }
+    let mut cursor = token.span.start;
+    let mut declarations = Vec::new();
+    while cursor < token.span.end {
+        let (command, end) = syntax::command_at(source, cursor)?;
+        let declaration = crate::package_environments::verbatim_declaration(source, command, end)?;
+        if declaration.end > token.span.end {
+            return None;
+        }
+        cursor = declaration.end;
+        declarations.push(declaration);
+    }
+    Some(declarations)
+}
+
 impl ExportReaderPositions {
     fn observe(&mut self, source: &str, index: usize, token: &SourceToken) {
+        if opaque_verbatim_declarations(source, token).is_some() {
+            self.readers.push(index);
+            return;
+        }
         let Some((name, _)) = token.control(source) else {
             return;
         };
@@ -334,6 +362,7 @@ pub type ProjectExports = (
     BTreeMap<String, Option<EnvironmentArguments>>,
     BTreeMap<String, bool>,
     BTreeMap<String, crate::config::ImportedCommand>,
+    BTreeMap<String, Option<crate::config::VerbatimTerminator>>,
 );
 
 /// Alias snapshots over successive exact prefixes under a fixed configuration.
@@ -383,6 +412,7 @@ pub struct ProjectExportIndex {
     lexical: AppendLexicalIndex,
     protection: syntax::ExportProtectionCursor,
     positions: ExportReaderPositions,
+    projection: export_reuse::ExportProjection,
     raw_loaders: Vec<usize>,
     last_lexed_bytes: usize,
     may_construct: bool,
@@ -471,6 +501,7 @@ impl ProjectExportIndex {
         };
         self.pending_restart = None;
         let (tokens, keep) = self.lexical.project(source, ranges, restart);
+        let (tokens, keep) = self.projection.update(source, config, tokens, keep);
         self.positions.truncate(keep);
         for (index, token) in tokens.iter().enumerate().skip(keep) {
             self.positions.observe(source, index, token);
@@ -755,6 +786,14 @@ impl SourceModel {
     }
 
     pub(crate) fn has_anchored_loader_events(config: &Config) -> bool {
+        if config
+            .syntax
+            .verbatim_environment_events
+            .iter()
+            .any(|event| event.loader.is_some())
+        {
+            return true;
+        }
         config
             .syntax
             .package_load_events
@@ -877,24 +916,35 @@ impl SourceModel {
             .iter()
             .filter_map(|event| {
                 let mut event = event.clone();
-                if let Some(loader) = &event.loader {
-                    let loader = loader_positions?.get(loader)?;
-                    let end = loader.end;
-                    let mut cursor = skip(source, end);
-                    if source.as_bytes().get(cursor) == Some(&b'[') {
-                        cursor = skip(source, syntax::balanced_end(source, cursor, b'[', b']')?);
-                    }
-                    event.at = if source.as_bytes().get(cursor) == Some(&b'{') {
-                        syntax::balanced_end(source, cursor, b'{', b'}')?
-                    } else {
-                        source[cursor..]
-                            .find(|c: char| c.is_whitespace() || "%{}".contains(c))
-                            .map_or(source.len(), |n| cursor + n)
-                    };
-                }
+                event.at =
+                    Self::import_offset(source, event.at, event.loader.as_ref(), loader_positions)?;
                 Some(event)
             })
             .collect()
+    }
+
+    pub(crate) fn import_offset(
+        source: &str,
+        at: usize,
+        loader: Option<&(String, usize)>,
+        positions: Option<&LoaderPositions>,
+    ) -> Option<usize> {
+        let Some(loader) = loader else {
+            return Some(at);
+        };
+        let mut cursor = skip(source, positions?.get(loader)?.end);
+        if source.as_bytes().get(cursor) == Some(&b'[') {
+            cursor = skip(source, syntax::balanced_end(source, cursor, b'[', b']')?);
+        }
+        if source.as_bytes().get(cursor) == Some(&b'{') {
+            syntax::balanced_end(source, cursor, b'{', b'}')
+        } else {
+            Some(
+                source[cursor..]
+                    .find(|c: char| c.is_whitespace() || "%{}".contains(c))
+                    .map_or(source.len(), |n| cursor + n),
+            )
+        }
     }
 
     pub(crate) fn with_ranges(source: &str, config: &Config, ranges: &[Range<usize>]) -> Self {
@@ -1470,6 +1520,7 @@ impl SemanticIndex {
             self.exported_environments,
             self.context.export_packages(),
             self.exported_commands,
+            self.exported_verbatim,
         )
     }
 
@@ -1491,6 +1542,7 @@ impl SemanticIndex {
             exported: BTreeMap::new(),
             exported_unknown: HashSet::new(),
             exported_environments: BTreeMap::new(),
+            exported_verbatim: BTreeMap::new(),
             exported_commands: BTreeMap::new(),
             registry: HashMap::new(),
             invocations: HashMap::new(),
@@ -1521,17 +1573,17 @@ impl SemanticReader<'_> {
     ) {
         let record_invocations = !matches!(purpose, IndexPurpose::IndexedExports { .. });
         let export_reader = |token: &SourceToken| {
-            token.control(self.source).is_some_and(|(name, end)| {
-                let name = name.trim_end_matches('*');
-                self.semantic.constructed.contains_key(&token.span.start)
-                    || match name {
-                        "include" => false,
-                        "input" => {
-                            crate::packages::context::input_package_at(self.source, end).is_some()
+            opaque_verbatim_declarations(self.source, token).is_some()
+                || token.control(self.source).is_some_and(|(name, end)| {
+                    let name = name.trim_end_matches('*');
+                    self.semantic.constructed.contains_key(&token.span.start)
+                        || match name {
+                            "include" => false,
+                            "input" => crate::packages::context::input_package_at(self.source, end)
+                                .is_some(),
+                            _ => syntax::project_export_reader(name),
                         }
-                        _ => syntax::project_export_reader(name),
-                    }
-            })
+                })
         };
         let stop_after = if matches!(purpose, IndexPurpose::Document)
             || !config.syntax.command_import_events.is_empty()
@@ -1847,6 +1899,34 @@ impl SemanticReader<'_> {
                 continue;
             }
             let Some((control, end)) = token.control(self.source) else {
+                if let Some(declarations) = opaque_verbatim_declarations(self.source, token) {
+                    for declaration in declarations {
+                        for name in declaration.names {
+                            assign(
+                                &mut bindings,
+                                &mut scopes,
+                                &format!("environment:{name}"),
+                                Binding {
+                                    replacement: if certain {
+                                        Replacement::VerbatimEnvironment(declaration.terminator)
+                                    } else {
+                                        Replacement::Unknown
+                                    },
+                                    candidate: false,
+                                    signature: None,
+                                    condition: None,
+                                    literal_arguments: false,
+                                    literal_slots: 0,
+                                    stored_slots: 0,
+                                    math_signature: None,
+                                    global: false,
+                                },
+                                global_prefix,
+                            );
+                        }
+                    }
+                    global_prefix = false;
+                }
                 pos += 1;
                 continue;
             };
@@ -2966,6 +3046,12 @@ impl SemanticReader<'_> {
         }
         for name in bindings.keys() {
             if let Some(environment) = name.strip_prefix("environment:") {
+                if let Replacement::VerbatimEnvironment(terminator) = bindings[name].replacement {
+                    self.semantic
+                        .exported_verbatim
+                        .insert(environment.to_owned(), Some(terminator));
+                    continue;
+                }
                 self.semantic
                     .exported_environments
                     .insert(environment.to_owned(), bindings[name].signature.clone());

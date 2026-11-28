@@ -65,6 +65,7 @@ pub struct DeclarationIndex {
     protection_config: Option<Arc<ProtectionConfig>>,
     source_len: usize,
     protection: Option<ProtectionSnapshot>,
+    supplied: Option<Arc<SuppliedProtection>>,
     markers: super::protection_tape::MarkerCursor,
     state: DeclarationScanState,
     output: Option<Arc<InferredSettings>>,
@@ -81,6 +82,36 @@ struct ProtectionSnapshot {
     digest: blake3::Hash,
     ranges: Arc<Vec<Range<usize>>>,
     plain_append: bool,
+}
+
+struct SuppliedProtection {
+    end: usize,
+    digest: blake3::Hash,
+    config: Arc<ProtectionConfig>,
+    ranges: Arc<Vec<Range<usize>>>,
+}
+
+impl ProtectionSnapshot {
+    fn reader_prefix_matches(&self, source: &str, ranges: &[Range<usize>]) -> bool {
+        let prefix = &ranges[..ranges.partition_point(|range| range.start < self.end)];
+        if prefix == self.ranges.as_slice() {
+            return true;
+        }
+        let Some((old_tail, old_prefix)) = self.ranges.split_last() else {
+            return false;
+        };
+        let Some((tail, preceding)) = prefix.split_last() else {
+            return false;
+        };
+        old_tail.end == self.end
+            && tail.start == old_tail.start
+            && tail.end > self.end
+            && preceding == old_prefix
+            && !context_factory_range(&source[..self.end], old_tail)
+            && !token_data_range(&source[..self.end], old_tail)
+            && !context_factory_range(source, tail)
+            && !token_data_range(source, tail)
+    }
 }
 
 struct InferredSettings {
@@ -143,7 +174,8 @@ fn plain_protection_text(text: &str) -> bool {
 }
 
 fn has_reader_events(syntax: &SyntaxConfig) -> bool {
-    !syntax.package_load_events.is_empty()
+    !syntax.verbatim_environment_events.is_empty()
+        || !syntax.package_load_events.is_empty()
         || !syntax.command_import_events.is_empty()
         || !syntax.environment_alias_events.is_empty()
         || !syntax.environment_argument_events.is_empty()
@@ -263,6 +295,110 @@ struct DeclarationScanState {
 }
 
 impl DeclarationIndex {
+    /// Project loader membership at an exactly validated cut. `None` requires the full preview.
+    #[doc(hidden)]
+    pub fn literal_loader_shadowed(
+        &self,
+        source: &str,
+        config: &Config,
+        loader: &str,
+    ) -> Option<bool> {
+        let configured = config.syntax.commands.contains_key(loader);
+        let previous = self.protection.as_ref().filter(|_| {
+            self.protection_config
+                .as_ref()
+                .is_some_and(|base| base.matches(config))
+        });
+        let previous_shadow = || {
+            configured
+                || self
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.commands.contains_key(loader))
+        };
+        if let Some(previous) = previous
+            && previous.end == source.len()
+            && previous.digest == blake3::hash(source.as_bytes())
+        {
+            return Some(previous_shadow());
+        }
+        let offer = self.supplied.as_ref()?;
+        if offer.end != source.len()
+            || !offer.config.matches(config)
+            || offer.digest != blake3::hash(source.as_bytes())
+        {
+            return None;
+        }
+        let mut text = source;
+        let mut shadowed = configured;
+        if let Some(previous) = previous
+            && self.reusable
+            && self.source_len == previous.end
+            && self.can_extend_reader(source, config)
+            && self
+                .state
+                .selected
+                .keys()
+                .all(|(environment, _)| !environment)
+            && blake3::hash(&source.as_bytes()[..previous.end]) == previous.digest
+            && previous.reader_prefix_matches(source, &offer.ranges)
+        {
+            text = &source[previous.end..];
+            shadowed = previous_shadow();
+        }
+        for start in memchr::memchr_iter(b'\\', text.as_bytes()) {
+            let Some((command, end)) = command_at(text, start) else {
+                continue;
+            };
+            if !context_declaration_command(command) {
+                continue;
+            }
+            let base = super::unstarred(command);
+            let mut target = skip_trivia(text, end);
+            if super::classic_command_definition(base) {
+                if text.as_bytes().get(target) == Some(&b'{') {
+                    target = skip_trivia(text, target + 1);
+                }
+            } else if !matches!(base, "def" | "gdef" | "edef" | "xdef" | "let" | "futurelet") {
+                return None;
+            }
+            let (name, _) = command_at(text, target)?;
+            if name == loader || name == "csname" {
+                return None;
+            }
+        }
+        Some(shadowed)
+    }
+
+    fn can_extend_reader(&self, source: &str, config: &Config) -> bool {
+        self.source_len < source.len()
+            && declaration_reuse_config_supported(config)
+            && !has_reader_events(&config.syntax)
+    }
+
+    /// Offer the successful declaration protection for these exact source bytes and settings.
+    /// Each clone can consume the offer on its next inference, independently of its reader state.
+    #[doc(hidden)]
+    pub fn supply_protection(
+        &mut self,
+        source: &str,
+        config: &Config,
+        ranges: Arc<Vec<Range<usize>>>,
+    ) {
+        let config = self
+            .protection_config
+            .as_ref()
+            .filter(|base| base.matches(config))
+            .cloned()
+            .unwrap_or_else(|| Arc::new(config.into()));
+        self.supplied = Some(Arc::new(SuppliedProtection {
+            end: source.len(),
+            digest: blake3::hash(source.as_bytes()),
+            config,
+            ranges,
+        }));
+    }
+
     #[doc(hidden)]
     pub fn infer_without_exported_aliases(
         &mut self,
@@ -377,6 +513,7 @@ fn infer_declaration_config_impl(
     mut index: Option<&mut DeclarationIndex>,
     exports: Option<ExportRequest<'_>>,
 ) -> Result<(Config, bool, DeclarationReuseBoundary), FormatError> {
+    let supplied = index.as_mut().and_then(|index| index.supplied.take());
     if let Some(index) = index.as_mut()
         && index
             .protection_config
@@ -424,9 +561,15 @@ fn infer_declaration_config_impl(
                 .get(snapshot.end..)
                 .is_some_and(|suffix| !suffix.is_empty() && plain_protection_text(suffix))
     });
+    let supplied = supplied.filter(|offer| {
+        offer.end == source.len() && Some(offer.digest) == digest && offer.config.matches(config)
+    });
+    let needs_protection_scan = supplied.is_none() && !protection_incremental;
     let indexed = index.is_some();
     let protection = |index: &mut Option<&mut DeclarationIndex>| {
-        if protection_incremental {
+        if let Some(offer) = &supplied {
+            Ok(Arc::clone(&offer.ranges))
+        } else if protection_incremental {
             Ok(Arc::clone(&previous.as_ref().unwrap().ranges))
         } else if let Some(index) = index.as_mut() {
             if source.len() < 32 * 1024 {
@@ -475,8 +618,7 @@ fn infer_declaration_config_impl(
     if !has_declaration {
         if let Some(index) = index.as_mut() {
             index.last_protection_scan_bytes =
-                usize::from(!protection_incremental && (validate_protection || reuse))
-                    * source.len();
+                usize::from(needs_protection_scan && (validate_protection || reuse)) * source.len();
         }
         // The original no-declaration inference only validates protection
         // when requested by its established gate. Conservative false metadata
@@ -496,15 +638,12 @@ fn infer_declaration_config_impl(
             });
         if let Some(index) = index {
             index.protection = protected.map(snapshot);
+            index.output = None;
         }
         return Ok((config.clone(), false, boundary));
     }
     if let Some(index) = index.as_mut() {
-        index.last_protection_scan_bytes = if protection_incremental {
-            0
-        } else {
-            source.len()
-        };
+        index.last_protection_scan_bytes = usize::from(needs_protection_scan) * source.len();
     }
     let protected = protection(&mut index)?;
     let boundary = if reuse {
@@ -518,21 +657,19 @@ fn infer_declaration_config_impl(
     let incremental = index.as_ref().is_some_and(|index| {
         was_reusable
             && previous.is_some()
-            && index.source_len < source.len()
-            && declaration_reuse_config_supported(config)
-            && !has_reader_events(&config.syntax)
+            && index.can_extend_reader(source, config)
             && (protection_incremental
-                || protected
-                    .iter()
-                    .take_while(|range| range.start < index.source_len)
-                    .eq(previous.as_ref().unwrap().ranges.iter()))
+                || previous
+                    .as_ref()
+                    .unwrap()
+                    .reader_prefix_matches(source, &protected))
     });
     let mut cursor = if incremental {
         index.as_ref().unwrap().source_len
     } else {
         0
     };
-    let cached_output = if incremental {
+    let cached_output = if previous.is_some() {
         index.as_mut().unwrap().output.take()
     } else {
         None
@@ -569,7 +706,11 @@ fn infer_declaration_config_impl(
         crate::source_model::SourceModel::reader_positions(&source[reader_start..])
             .map(|at| at + reader_start)
             .peekable();
-    let mut protected_index = 0usize;
+    let mut protected_index = if incremental {
+        protected.partition_point(|range| range.end <= cursor)
+    } else {
+        0
+    };
     while cursor < source.len() {
         while protected
             .get(protected_index)
@@ -894,7 +1035,13 @@ fn infer_declaration_config_impl(
         && !continuation_groups
             .iter()
             .any(|unknown_branch| *unknown_branch);
-    let cached_output = cached_output.filter(|_| !declarations_changed);
+    let cached_output = cached_output.filter(|_| {
+        !declarations_changed
+            || !incremental
+                && index.as_ref().is_some_and(|index| {
+                    index.state.selected == selected && index.state.ambiguous == ambiguous
+                })
+    });
     let mut output = if let Some(cached) = &cached_output {
         cached.apply(config)
     } else {

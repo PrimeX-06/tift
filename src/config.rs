@@ -752,6 +752,8 @@ pub struct SyntaxConfig {
     #[serde(skip)]
     pub environment_argument_events: Vec<EnvironmentArgumentEvent>,
     #[serde(skip)]
+    pub verbatim_environment_events: Vec<VerbatimEnvironmentEvent>,
+    #[serde(skip)]
     pub package_load_events: Vec<PackageLoadEvent>,
     #[serde(skip)]
     pub command_import_events: Vec<CommandImportEvent>,
@@ -812,6 +814,7 @@ impl Default for SyntaxConfig {
             environment_alias_events: Vec::new(),
             inferred_environment_arguments: BTreeMap::new(),
             environment_argument_events: Vec::new(),
+            verbatim_environment_events: Vec::new(),
             package_load_events: Vec::new(),
             command_import_events: Vec::new(),
             special: Vec::new(),
@@ -876,6 +879,20 @@ pub struct EnvironmentArgumentEvent {
     pub at: usize,
     pub loader: Option<(String, usize)>,
     pub arguments: BTreeMap<String, Option<EnvironmentArguments>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VerbatimTerminator {
+    AnyPosition,
+    UnindentedLine,
+    IndentedLine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VerbatimEnvironmentEvent {
+    pub at: usize,
+    pub loader: Option<(String, usize)>,
+    pub environments: BTreeMap<String, Option<VerbatimTerminator>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
