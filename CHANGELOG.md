@@ -2,15 +2,10 @@
 
 ## 0.2.2
 
-- Reuse declaration snapshots across chapters and share source indexes across formatting stages. Queue independent files for formatting as soon as their dependencies are ready.
-- Honor line-based comment environments declared in local style files. In *Think Python*, repeated formatting preserves the `htmlonly` block and keeps its delimiters in column one.
-- Recognize simple optional defaults in `xargs` commands defined inline or in an input file. This fixes a false unclosed-table diagnostic for `\punifd` in the statistics cookbook when the call omits its optional arguments.
-- Traverse deeply nested inputs without overflowing the stack. Resolve `\input` and `\include` filenames containing commas, including names supplied by macros.
-- Honor the parent document's XeTeX input encoding in unsaved editor buffers and read encoding declarations in files with mixed line endings.
-- Preserve unused macro arguments and inactive `ifdraft` branches. Continue formatting after balanced environment wrappers such as `holtpolt` and `duckuments`, and restore outer definitions when `altverse` restarts an environment.
-- Keep trailing notes separate from `\end{document}` and closing delimiters on their own lines in embedded files and DocStrip code. Preserve printed spaces in listings and verbatim examples.
-- Handle TeX `^^` character translations in groups, math and environments that span lines. Keep Xy-pic diagrams, multiline subscripts and tables with short verbatim text stable on repeated formatting.
-- Report replacement diagnostics at their original source positions. For isolated delimiter mismatches, identify the preserved range and format the surrounding text. `--trace` reports project indexing work and per-file timings in inclusion order.
+- Large books and theses start formatting sooner. Deeply nested chapter files no longer cause a stack overflow.
+- Formatting again preserves custom comment blocks defined in local style files. It also keeps spacing in code listings and fixes unwanted changes to some equations and tables on a second pass.
+- Fixed false “unclosed table” errors in documents that use custom commands with optional arguments. When a delimiter error is confined to one part of a file, tift points to that part and formats the rest.
+- When you format an unsaved chapter in your editor, tift now respects the input encoding set by the parent XeTeX document.
 
 ## 0.2.1
 
